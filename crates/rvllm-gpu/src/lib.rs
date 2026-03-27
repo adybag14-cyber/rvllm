@@ -16,7 +16,7 @@ pub mod cuda_allocator;
 pub mod kernel_loader;
 pub mod device;
 mod ffi;
-#[cfg(feature = "mock-gpu")]
+#[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
 pub mod mock;
 pub mod nccl;
 pub mod pinned_memory;
@@ -39,7 +39,7 @@ pub mod prelude {
     pub use crate::cuda_allocator::CudaGpuAllocator;
     #[cfg(feature = "cuda")]
     pub use crate::kernel_loader::{launch_config, KernelLoader};
-    #[cfg(feature = "mock-gpu")]
+    #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
     pub use crate::mock::MockGpuAllocator;
     pub use crate::nccl::{NcclComm, NcclDataType, NcclGroup, NcclReduceOp, NcclUniqueId};
     pub use crate::pinned_memory::{PinnedBuffer, PinnedPool};

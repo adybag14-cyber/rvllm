@@ -1,7 +1,7 @@
 //! cuBLAS GEMM operations for linear algebra.
 
 use cudarc::cublas::sys::cublasOperation_t;
-use cudarc::cublas::CudaBlas;
+use cudarc::cublas::{CudaBlas, Gemm as _, GemmConfig, Gemv as _, GemvConfig};
 use cudarc::driver::{CudaDevice, CudaSlice};
 use std::sync::Arc;
 
@@ -53,19 +53,19 @@ impl CublasHandle {
         unsafe {
             self.blas
                 .gemm(
-                    cublasOperation_t::CUBLAS_OP_T, // B transposed (row->col)
-                    cublasOperation_t::CUBLAS_OP_N, // A as-is in cuBLAS view
-                    n as i32,
-                    m as i32,
-                    k as i32,
-                    alpha,
-                    b,
-                    n as i32, // ldb = n (row stride of B in row-major)
-                    a,
-                    k as i32, // lda = k (row stride of A in row-major)
-                    beta,
-                    c,
-                    n as i32, // ldc = n (row stride of C in row-major)
+                    GemmConfig {
+                        transa: cublasOperation_t::CUBLAS_OP_T,
+                        transb: cublasOperation_t::CUBLAS_OP_N,
+                        m: n as i32,
+                        n: m as i32,
+                        k: k as i32,
+                        alpha,
+                        lda: n as i32,
+                        ldb: k as i32,
+                        beta,
+                        ldc: n as i32,
+                    },
+                    b, a, c,
                 )
                 .map_err(|e| crate::LLMError::GpuError(format!("cuBLAS sgemm failed: {e}")))?;
         }
@@ -100,19 +100,19 @@ impl CublasHandle {
         unsafe {
             self.blas
                 .gemm(
-                    cublasOperation_t::CUBLAS_OP_T,
-                    cublasOperation_t::CUBLAS_OP_N,
-                    n as i32,
-                    m as i32,
-                    k as i32,
-                    alpha,
-                    b,
-                    n as i32,
-                    a,
-                    k as i32,
-                    beta,
-                    c,
-                    n as i32,
+                    GemmConfig {
+                        transa: cublasOperation_t::CUBLAS_OP_T,
+                        transb: cublasOperation_t::CUBLAS_OP_N,
+                        m: n as i32,
+                        n: m as i32,
+                        k: k as i32,
+                        alpha,
+                        lda: n as i32,
+                        ldb: k as i32,
+                        beta,
+                        ldc: n as i32,
+                    },
+                    b, a, c,
                 )
                 .map_err(|e| crate::LLMError::GpuError(format!("cuBLAS hgemm failed: {e}")))?;
         }
@@ -163,17 +163,17 @@ impl CublasHandle {
         unsafe {
             self.blas
                 .gemv(
-                    cublasOperation_t::CUBLAS_OP_T,
-                    n as i32, // rows of A in column-major = cols of A in row-major
-                    m as i32, // cols of A in column-major = rows of A in row-major
-                    alpha,
-                    a,
-                    n as i32, // lda = n (row stride in row-major = leading dim in col-major)
-                    x,
-                    1, // incx
-                    beta,
-                    y,
-                    1, // incy
+                    GemvConfig {
+                        trans: cublasOperation_t::CUBLAS_OP_T,
+                        m: n as i32,
+                        n: m as i32,
+                        alpha,
+                        lda: n as i32,
+                        incx: 1,
+                        beta,
+                        incy: 1,
+                    },
+                    a, x, y,
                 )
                 .map_err(|e| crate::LLMError::GpuError(format!("cuBLAS sgemv failed: {e}")))?;
         }
