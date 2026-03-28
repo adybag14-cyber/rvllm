@@ -184,10 +184,30 @@ mod cuda_impl {
 
             let max_context_len = attn_meta.max_context_len;
 
+            // Metadata dump (first call only)
+            static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            let probe = !PROBED.swap(true, std::sync::atomic::Ordering::Relaxed);
+            if probe {
+                info!(
+                    ?token_ids,
+                    ?positions,
+                    slot_mapping = ?&attn_meta.slot_mapping[..8.min(attn_meta.slot_mapping.len())],
+                    context_lens = ?&attn_meta.context_lens,
+                    block_tables = ?&attn_meta.block_tables,
+                    max_context_len,
+                    max_blocks,
+                    is_prefill,
+                    "PROBE metadata"
+                );
+            }
+
             // Step 1: token embedding lookup
             info!("gpu_runner: embedding lookup");
             let mut hidden_states = self.embedding_lookup(token_ids)?;
-            info!("gpu_runner: embedding done");
+            if probe {
+                let h: Vec<f32> = self.device.dtoh_sync_copy(&hidden_states).map_err(|e| LLMError::GpuError(format!("probe DtoH: {e}")))?;
+                info!(len = h.len(), first5 = ?&h[..5.min(h.len())], "PROBE embed");
+            }
 
             // Step 2: transformer layers
             let gpu_cache = self.cache.gpu_cache();
@@ -215,6 +235,28 @@ mod cuda_impl {
                     rope_sin: &self.rope_sin,
                 };
                 hidden_states = layer.forward(&input, &weights, &self.blas)?;
+                if probe && layer_idx == 0 {
+                    let h: Vec<f32> = self.device.dtoh_sync_copy(&hidden_states).map_err(|e| LLMError::GpuError(format!("probe DtoH: {e}")))?;
+                    let nan = h.iter().any(|v| v.is_nan());
+                    let mx = h.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    info!(nan, max = mx, first5 = ?&h[..5.min(h.len())], "PROBE layer0 output");
+
+                    // Read back cache block 0 for layer 0 to verify reshape_and_cache
+                    let (kc, vc) = &gpu_cache[0];
+                    let kc_host: Vec<f32> = self.device.dtoh_sync_copy(kc).map_err(|e| LLMError::GpuError(format!("probe DtoH: {e}")))?;
+                    let vc_host: Vec<f32> = self.device.dtoh_sync_copy(vc).map_err(|e| LLMError::GpuError(format!("probe DtoH: {e}")))?;
+                    // Cache layout: [num_blocks, block_size, num_kv_heads, head_dim]
+                    // Block 0, offset 0, kv_head 0: first head_dim elements
+                    let head_dim = self.config.head_dim;
+                    let kv_heads = self.config.num_kv_heads;
+                    // slot 0 -> offset 0 -> kc_host[0 .. kv_heads*head_dim]
+                    info!(
+                        k_cache_first5 = ?&kc_host[..5.min(kc_host.len())],
+                        v_cache_first5 = ?&vc_host[..5.min(vc_host.len())],
+                        cache_total_len = kc_host.len(),
+                        "PROBE cache block0"
+                    );
+                }
                 if layer_idx == 0 || layer_idx == num_layers - 1 {
                     info!(layer = layer_idx, "gpu_runner: layer done");
                 }
@@ -297,8 +339,8 @@ mod cuda_impl {
                     &output,
                     &self.embed_tokens,
                     &ids_gpu,
-                    num_tokens as i32,
                     hidden_size as i32,
+                    self.config.vocab_size as i32,
                 )).map_err(|e| LLMError::GpuError(format!("embedding_gather launch: {e}")))?;
             }
 

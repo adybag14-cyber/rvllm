@@ -16,7 +16,7 @@ mod inner {
 
     use rvllm_config::EngineConfig;
     use rvllm_core::prelude::{
-        FinishReason, LLMError, LogProb, RequestId, RequestOutput, Result,
+        BlockId, FinishReason, LLMError, LogProb, RequestId, RequestOutput, Result,
         SamplingParams, SequenceId, TokenId,
     };
     use rvllm_sequence::{Sequence, SequenceData, SequenceGroup, SequenceGroupMetadata};
@@ -441,7 +441,7 @@ mod inner {
                 return Ok(Vec::new());
             }
 
-            let metadata = Self::build_metadata(&scheduled_groups);
+            let metadata = Self::build_metadata(&scheduled_groups, self.config.cache.block_size);
 
             // Prefix caching: before prefill, check for matching prefix blocks
             if let Some(ref mut pc) = self.prefix_cache {
@@ -586,15 +586,28 @@ mod inner {
             &self.config
         }
 
-        fn build_metadata(groups: &[SequenceGroup]) -> Vec<SequenceGroupMetadata> {
+        fn build_metadata(groups: &[SequenceGroup], block_size: usize) -> Vec<SequenceGroupMetadata> {
+            let mut next_block: u32 = 0;
             let mut metadata = Vec::with_capacity(groups.len());
             for group in groups {
                 let is_prompt = group.get_seqs().iter().any(|s| s.get_output_len() == 0);
                 let mut seq_data = HashMap::new();
-                let block_tables = HashMap::new();
+                let mut block_tables = HashMap::new();
 
                 for seq in group.get_seqs() {
                     if seq.is_finished() { continue; }
+                    let total_tokens = seq.prompt_token_ids.len() + seq.output_token_ids.len();
+                    let num_blocks = (total_tokens + block_size - 1) / block_size;
+
+                    let blocks: Vec<BlockId> = (0..num_blocks)
+                        .map(|_| {
+                            let b = BlockId(next_block);
+                            next_block += 1;
+                            b
+                        })
+                        .collect();
+                    block_tables.insert(seq.seq_id, blocks);
+
                     seq_data.insert(seq.seq_id, SequenceData {
                         prompt_token_ids: seq.prompt_token_ids.clone(),
                         output_token_ids: seq.output_token_ids.clone(),

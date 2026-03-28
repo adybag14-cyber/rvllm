@@ -314,7 +314,7 @@ mod inner {
                 .ok_or_else(|| LLMError::GpuError(format!("kernel {module_name}::{func_name} not loaded")))?;
             unsafe {
                 kernel
-                    .launch(cfg, (input, weight, &mut output, eps, hidden_size as u32, num_tokens as u32))
+                    .launch(cfg, (&mut output, input, weight, eps, hidden_size as i32))
                     .map_err(|e| LLMError::GpuError(format!("rms_norm launch failed: {e}")))?;
             }
 
