@@ -10,7 +10,7 @@
   onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]});"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-html{font-size:15px;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
+html{font-size:17px;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
 body{background:#000;color:#d4d4d4;font-family:Helvetica Neue,Helvetica,Arial,sans-serif;font-weight:300;line-height:1.65;letter-spacing:-0.01em}
 a{color:#d4d4d4;text-decoration:none}
 a:hover{color:#fff}
@@ -18,57 +18,57 @@ a:hover{color:#fff}
 
 .container{max-width:740px;margin:0 auto;padding:0 2rem}
 
-header{padding:5rem 0 3rem}
+header{padding:3rem 0 2rem}
 header h1{font-size:2.6rem;font-weight:700;letter-spacing:-0.04em;color:#fff;margin-bottom:0.3rem}
-header .sub{font-size:1rem;color:#555;font-weight:300;margin-bottom:0.5rem}
-header .links{font-size:0.8rem;color:#444;letter-spacing:0.04em}
-header .links a{color:#666;margin-right:1.2rem}
+header .sub{font-size:1rem;color:#888;font-weight:300;margin-bottom:0.5rem}
+header .links{font-size:0.8rem;color:#777;letter-spacing:0.04em}
+header .links a{color:#999;margin-right:1.2rem}
 header .links a:hover{color:#fff}
 
-.hero{padding:2rem 0 3rem;border-bottom:1px solid #111}
+.hero{padding:1.5rem 0 2rem;border-bottom:1px solid #111}
 .hero .big{font-size:3.6rem;font-weight:700;color:#fff;letter-spacing:-0.04em;line-height:1.1}
-.hero .sub{font-size:0.95rem;color:#555;margin-top:0.4rem;font-weight:300}
+.hero .sub{font-size:0.95rem;color:#888;margin-top:0.4rem;font-weight:300}
 
-section{padding:3rem 0;border-bottom:1px solid #111}
+section{padding:2rem 0;border-bottom:1px solid #111}
 section:last-of-type{border-bottom:none}
 
 h2{font-size:1.3rem;font-weight:600;letter-spacing:-0.03em;color:#fff;margin-bottom:0.3rem}
-.section-sub{color:#555;font-size:0.72rem;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:1.8rem;font-weight:400}
-h3{font-size:0.75rem;text-transform:uppercase;letter-spacing:0.1em;color:#555;font-weight:500;margin:2rem 0 0.8rem}
+.section-sub{color:#888;font-size:0.72rem;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:1.8rem;font-weight:400}
+h3{font-size:0.75rem;text-transform:uppercase;letter-spacing:0.1em;color:#888;font-weight:500;margin:2rem 0 0.8rem}
 
-p{margin-bottom:0.9rem;font-size:0.92rem;color:#999}
+p{margin-bottom:0.8rem;font-size:1rem;color:#ccc}
 strong{font-weight:500;color:#ccc}
 
 ul,ol{padding-left:1.4rem;margin-bottom:0.9rem}
-li{font-size:0.92rem;color:#999;margin-bottom:0.25rem}
+li{font-size:1rem;color:#ccc;margin-bottom:0.25rem}
 
-pre{background:#0a0a0a;padding:1rem 1.2rem;font-family:SF Mono,Menlo,Consolas,monospace;font-size:0.78rem;line-height:1.55;color:#888;overflow-x:auto;margin:0.8rem 0 1.2rem;border-radius:2px}
-code{font-family:SF Mono,Menlo,Consolas,monospace;font-size:0.85em;color:#888}
+pre{background:#0a0a0a;padding:1rem 1.2rem;font-family:SF Mono,Menlo,Consolas,monospace;font-size:0.78rem;line-height:1.55;color:#b0b0b0;overflow-x:auto;margin:0.8rem 0 1.2rem;border-radius:2px}
+code{font-family:SF Mono,Menlo,Consolas,monospace;font-size:0.85em;color:#b0b0b0}
 p code,li code,td code{background:#0a0a0a;padding:1px 5px;border-radius:2px}
 
 /* tables */
 .tbl{overflow-x:auto;margin:0.6rem 0 1.4rem}
-.tbl .cap{font-size:0.72rem;color:#444;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.5rem}
-table{width:100%;border-collapse:collapse;font-size:0.82rem;font-variant-numeric:tabular-nums}
-thead th{padding:0.5rem 0.7rem;text-align:left;font-size:0.68rem;text-transform:uppercase;letter-spacing:0.06em;color:#555;font-weight:500;border-bottom:1px solid #222}
+.tbl .cap{font-size:0.72rem;color:#777;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.5rem}
+table{width:100%;border-collapse:collapse;font-size:0.92rem;font-variant-numeric:tabular-nums}
+thead th{padding:0.5rem 0.7rem;text-align:left;font-size:0.68rem;text-transform:uppercase;letter-spacing:0.06em;color:#888;font-weight:500;border-bottom:1px solid #222}
 th.r,td.r{text-align:right}
-tbody td{padding:0.4rem 0.7rem;color:#999;border-bottom:1px solid #0d0d0d}
+tbody td{padding:0.4rem 0.7rem;color:#ccc;border-bottom:1px solid #0d0d0d}
 tbody tr:hover{background:#0a0a0a}
 tr.peak td{color:#fff;font-weight:500}
 
-.note{margin:1rem 0 1.4rem;padding:1rem 1.2rem;background:#0a0a0a;border-left:2px solid #333;font-size:0.88rem;color:#999}
+.note{margin:1rem 0 1.4rem;padding:1rem 1.2rem;background:#0a0a0a;border-left:2px solid #333;font-size:0.88rem;color:#ccc}
 .note strong{color:#fff}
 
-.eq{text-align:center;padding:0.8rem 0;font-size:0.9rem;color:#666}
+.eq{text-align:center;padding:0.8rem 0;font-size:0.9rem;color:#999}
 
-.refs{font-size:0.82rem;color:#555}
+.refs{font-size:0.82rem;color:#888}
 .refs ol{padding-left:1.2rem}
 .refs li{margin-bottom:0.4rem}
 
 footer{padding:2rem 0 4rem;text-align:center}
-footer p{font-size:0.72rem;color:#333;letter-spacing:0.02em}
-footer a{color:#333}
-footer a:hover{color:#666}
+footer p{font-size:0.72rem;color:#666;letter-spacing:0.02em}
+footer a{color:#666}
+footer a:hover{color:#999}
 
 @media(max-width:600px){
   html{font-size:13px}
@@ -184,7 +184,7 @@ footer a:hover{color:#666}
 
 <section>
 <h2>System Comparison</h2>
-<p class="section-sub">vs Python vLLM 0.18</p>
+<p class="section-sub">vs Python vLLM 0.18 (200 tok/s baseline measured on A100 80GB SXM4)</p>
 <div class="tbl">
 <table>
 <thead><tr><th>Metric</th><th class="r">rvLLM (B200)</th><th class="r">rvLLM (A100)</th><th class="r">Python vLLM</th><th>Ratio</th></tr></thead>
