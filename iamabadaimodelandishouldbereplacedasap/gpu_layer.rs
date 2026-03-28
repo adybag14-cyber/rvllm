@@ -49,10 +49,6 @@ mod inner {
         pub k_proj: &'a CudaSlice<f32>,
         pub v_proj: &'a CudaSlice<f32>,
         pub o_proj: &'a CudaSlice<f32>,
-        // Optional QKV biases (Qwen2.5 has these)
-        pub q_proj_bias: Option<&'a CudaSlice<f32>>,
-        pub k_proj_bias: Option<&'a CudaSlice<f32>>,
-        pub v_proj_bias: Option<&'a CudaSlice<f32>>,
         // Post-attention norm
         pub post_attention_layernorm: &'a CudaSlice<f32>,
         // MLP weights
@@ -155,20 +151,9 @@ mod inner {
             let q_dim = num_heads * head_dim;
             let kv_dim = num_kv_heads * head_dim;
 
-            let mut q = Self::linear(&self.device, blas, &normed, weights.q_proj, num_tokens, q_dim, hidden)?;
-            let mut k = Self::linear(&self.device, blas, &normed, weights.k_proj, num_tokens, kv_dim, hidden)?;
-            let mut v = Self::linear(&self.device, blas, &normed, weights.v_proj, num_tokens, kv_dim, hidden)?;
-
-            // Apply QKV biases if present (e.g. Qwen2.5)
-            if let Some(bias) = weights.q_proj_bias {
-                Self::add_bias(&self.device, &mut q, bias, num_tokens, q_dim)?;
-            }
-            if let Some(bias) = weights.k_proj_bias {
-                Self::add_bias(&self.device, &mut k, bias, num_tokens, kv_dim)?;
-            }
-            if let Some(bias) = weights.v_proj_bias {
-                Self::add_bias(&self.device, &mut v, bias, num_tokens, kv_dim)?;
-            }
+            let q = Self::linear(&self.device, blas, &normed, weights.q_proj, num_tokens, q_dim, hidden)?;
+            let k = Self::linear(&self.device, blas, &normed, weights.k_proj, num_tokens, kv_dim, hidden)?;
+            let v = Self::linear(&self.device, blas, &normed, weights.v_proj, num_tokens, kv_dim, hidden)?;
 
             // ---------------------------------------------------------------
             // 3. RoPE on Q and K
@@ -353,29 +338,6 @@ mod inner {
         /// Linear projection via cuBLAS sgemm.
         /// Computes output = input @ weight^T where:
         ///   input: [m, k], weight: [n, k] (row-major), output: [m, n].
-        /// Add bias in-place: tensor[i*dim + j] += bias[j]
-        fn add_bias(
-            device: &Arc<CudaDevice>,
-            tensor: &mut CudaSlice<f32>,
-            bias: &CudaSlice<f32>,
-            num_tokens: usize,
-            dim: usize,
-        ) -> Result<()> {
-            let kernel = device
-                .get_func("add_bias", "add_bias_kernel")
-                .ok_or_else(|| LLMError::GpuError("add_bias_kernel not loaded".into()))?;
-            let cfg = LaunchConfig {
-                grid_dim: (num_tokens as u32, 1, 1),
-                block_dim: (dim.min(1024) as u32, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe {
-                kernel.launch(cfg, (tensor as &mut CudaSlice<f32>, bias, dim as i32))
-                    .map_err(|e| LLMError::GpuError(format!("add_bias launch: {e}")))?;
-            }
-            Ok(())
-        }
-
         fn linear(
             device: &Arc<CudaDevice>,
             blas: &CublasHandle,
