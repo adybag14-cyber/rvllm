@@ -741,15 +741,25 @@ mod inner {
                 shared_mem_bytes,
             };
 
-            // Build seq_start_pos from context_lens (cumulative prefix sum on CPU, upload)
+            // Build seq_start_pos from context_lens (cumulative prefix sum on CPU, upload).
+            // We upload num_seqs+1 entries with a sentinel = num_tokens at the end so the
+            // kernel can always read seq_start_pos[seq_idx+1] without bounds checking.
             let ctx_host = device
                 .dtoh_sync_copy(context_lens)
                 .map_err(|e| LLMError::GpuError(format!("context_lens DtoH: {e}")))?;
-            let mut seq_starts = Vec::with_capacity(num_seqs);
+            let mut seq_starts = Vec::with_capacity(num_seqs + 1);
             let mut pos = 0i32;
             for &cl in &ctx_host {
                 seq_starts.push(pos);
                 pos += cl as i32;
+            }
+            // Sentinel: must equal num_tokens so last seq gets correct q_len
+            seq_starts.push(num_tokens as i32);
+            if pos != num_tokens as i32 {
+                return Err(LLMError::GpuError(format!(
+                    "prefill_attention: sum(context_lens)={pos} != num_tokens={num_tokens} -- \
+                     seq_start_pos would cause OOB on query/output buffers"
+                )));
             }
             let seq_start_pos_gpu: CudaSlice<i32> = device
                 .htod_sync_copy(&seq_starts)

@@ -126,7 +126,7 @@ __global__ void flash_attention_2_kernel(
     const float* __restrict__ value_cache, // [num_blocks, block_size, num_kv_heads, head_dim]
     const int* __restrict__ block_tables,  // [num_seqs, max_blocks_per_seq]
     const int* __restrict__ context_lens,  // [num_seqs]
-    const int* __restrict__ seq_start_pos, // [num_seqs] -- cumulative start positions for prefill
+    const int* __restrict__ seq_start_pos, // [num_seqs+1] -- cumulative start positions for prefill (sentinel at end)
     float scale,
     int num_heads,
     int num_kv_heads,

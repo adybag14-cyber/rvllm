@@ -198,6 +198,12 @@ mod inner {
         running: Vec<SequenceGroup>,
         max_num_seqs: usize,
         max_num_batched_tokens: usize,
+        /// Number of free GPU KV-cache blocks available for new admissions.
+        /// Updated by the engine each step before scheduling.
+        free_block_count: usize,
+        /// Minimum free blocks required to admit a new sequence group.
+        /// Prevents OOM by keeping a watermark so running sequences can grow.
+        watermark_blocks: usize,
     }
 
     impl FifoScheduler {
@@ -207,7 +213,14 @@ mod inner {
                 running: Vec::new(),
                 max_num_seqs,
                 max_num_batched_tokens,
+                free_block_count: 0,
+                watermark_blocks: 0,
             }
+        }
+
+        fn set_block_budget(&mut self, free_blocks: usize, watermark: usize) {
+            self.free_block_count = free_blocks;
+            self.watermark_blocks = watermark;
         }
 
         fn add_seq_group(&mut self, group: SequenceGroup) {
@@ -284,8 +297,19 @@ mod inner {
             }
 
             // Promote waiting groups into running up to budget limits.
+            // Also gate on block availability: don't admit new groups when
+            // free blocks are below the watermark so running sequences have
+            // room to grow during decode.
             while !self.waiting.is_empty() {
                 if self.running.len() >= self.max_num_seqs {
+                    break;
+                }
+                if self.free_block_count < self.watermark_blocks {
+                    debug!(
+                        free = self.free_block_count,
+                        watermark = self.watermark_blocks,
+                        "scheduler: holding back waiting groups -- below block watermark"
+                    );
                     break;
                 }
                 let group = &self.waiting[0];
@@ -304,6 +328,12 @@ mod inner {
                 if total_tokens + tokens_this > self.max_num_batched_tokens {
                     break;
                 }
+                // Each new group needs at least 1 block per sequence.
+                let seqs_in_group = group.get_seqs().iter().filter(|s| !s.is_finished()).count();
+                if self.free_block_count < seqs_in_group {
+                    break;
+                }
+                self.free_block_count = self.free_block_count.saturating_sub(seqs_in_group);
                 total_tokens += tokens_this;
                 self.running.push(self.waiting.remove(0));
             }
@@ -424,7 +454,13 @@ mod inner {
                 None
             };
 
-            info!("GpuLLMEngine: ready for inference");
+            info!(
+                num_gpu_blocks,
+                num_cpu_blocks,
+                block_size = config.cache.block_size,
+                max_num_seqs = config.scheduler.max_num_seqs,
+                "GpuLLMEngine: ready for inference"
+            );
             Ok(Self {
                 config,
                 scheduler,
@@ -527,6 +563,15 @@ mod inner {
         pub fn step(&mut self) -> Result<Vec<RequestOutput>> {
             debug!("GpuLLMEngine: step begin");
 
+            // Tell the scheduler how many blocks are available so it can gate
+            // admission of new sequences from the waiting queue.
+            let free_count = self.free_blocks.len()
+                + (self.num_gpu_blocks.saturating_sub(self.next_block_id)) as usize;
+            // Watermark: keep 4% of total blocks free so running sequences can
+            // grow into new blocks during decode without hitting OOM.
+            let watermark = (self.num_gpu_blocks as usize / 25).max(1);
+            self.scheduler.set_block_budget(free_count, watermark);
+
             let (scheduled_groups, num_tokens) = self.scheduler.schedule();
             debug!(
                 num_groups = scheduled_groups.len(),
@@ -537,7 +582,27 @@ mod inner {
                 return Ok(Vec::new());
             }
 
-            let metadata = self.build_metadata(&scheduled_groups);
+            let (metadata, aborted_seqs) = self.build_metadata(&scheduled_groups);
+
+            // Propagate block-allocation aborts to request output states so
+            // finished-request cleanup picks them up.
+            if !aborted_seqs.is_empty() {
+                for group in &scheduled_groups {
+                    for (seq_idx, seq) in group.get_seqs().iter().enumerate() {
+                        if aborted_seqs.contains(&seq.seq_id) {
+                            if let Some(req) = self.requests.get_mut(&group.request_id) {
+                                if let Some(state) = req.seq_states.get_mut(seq_idx) {
+                                    state.finish_reason = Some(FinishReason::Abort);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if metadata.is_empty() {
+                return Ok(Vec::new());
+            }
 
             // Prefix caching: before prefill, check for matching prefix blocks
             if let Some(ref mut pc) = self.prefix_cache {
@@ -741,9 +806,18 @@ mod inner {
             &self.config
         }
 
-        fn build_metadata(&mut self, groups: &[SequenceGroup]) -> Vec<SequenceGroupMetadata> {
+        /// Build per-group metadata with block allocation.  Returns the
+        /// metadata list plus a set of sequence IDs that were aborted because
+        /// blocks could not be allocated.
+        fn build_metadata(
+            &mut self,
+            groups: &[SequenceGroup],
+        ) -> (Vec<SequenceGroupMetadata>, std::collections::HashSet<SequenceId>) {
             let block_size = self.config.cache.block_size;
             let mut metadata = Vec::with_capacity(groups.len());
+            let mut aborted_seqs: std::collections::HashSet<SequenceId> =
+                std::collections::HashSet::new();
+
             for group in groups {
                 let is_prompt = group.get_seqs().iter().any(|s| s.get_output_len() == 0);
                 let mut seq_data = HashMap::new();
@@ -759,6 +833,7 @@ mod inner {
 
                     // Reuse existing blocks, append new ones if needed
                     let existing = self.seq_block_tables.entry(seq.seq_id).or_default();
+                    let mut alloc_failed = false;
                     while existing.len() < needed_blocks {
                         let block_id = if let Some(recycled) = self.free_blocks.pop() {
                             recycled
@@ -769,15 +844,32 @@ mod inner {
                         } else {
                             warn!(
                                 seq_id = seq.seq_id.0,
-                                next_block_id = self.next_block_id,
+                                needed = needed_blocks,
+                                have = existing.len(),
                                 num_gpu_blocks = self.num_gpu_blocks,
                                 free_blocks = self.free_blocks.len(),
-                                "block allocation failed: no free GPU KV-cache blocks"
+                                "block allocation failed: no free GPU KV-cache blocks, aborting sequence"
                             );
+                            alloc_failed = true;
                             break;
                         };
                         existing.push(BlockId(block_id));
                     }
+
+                    if alloc_failed {
+                        // Recycle whatever blocks this sequence had -- it cannot
+                        // proceed without its full allocation.
+                        if let Some(blocks) = self.seq_block_tables.remove(&seq.seq_id) {
+                            for b in blocks {
+                                self.free_blocks.push(b.0);
+                            }
+                        }
+                        // Mark finished so the scheduler drops it next round.
+                        self.scheduler.finish_seq(seq.seq_id, SequenceStatus::FinishedAborted);
+                        aborted_seqs.insert(seq.seq_id);
+                        continue;
+                    }
+
                     block_tables.insert(seq.seq_id, existing.clone());
 
                     seq_data.insert(
@@ -790,15 +882,18 @@ mod inner {
                     );
                 }
 
-                metadata.push(SequenceGroupMetadata {
-                    request_id: group.request_id,
-                    is_prompt,
-                    seq_data,
-                    sampling_params: group.sampling_params.clone(),
-                    block_tables,
-                });
+                // Only emit metadata if the group still has live sequences.
+                if !seq_data.is_empty() {
+                    metadata.push(SequenceGroupMetadata {
+                        request_id: group.request_id,
+                        is_prompt,
+                        seq_data,
+                        sampling_params: group.sampling_params.clone(),
+                        block_tables,
+                    });
+                }
             }
-            metadata
+            (metadata, aborted_seqs)
         }
     }
 
