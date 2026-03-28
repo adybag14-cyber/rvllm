@@ -280,10 +280,8 @@ mod inner {
         next_request_id: AtomicU64,
         next_seq_id: u64,
         prefix_cache: Option<PrefixCache>,
-        /// Persistent block allocation with recycling.
+        /// Persistent block allocation for fake sequential allocator.
         next_block_id: u32,
-        /// Free list of recycled block IDs.
-        free_blocks: Vec<u32>,
         /// Per-sequence block tables that persist across step() calls.
         seq_block_tables: HashMap<SequenceId, Vec<BlockId>>,
     }
@@ -388,7 +386,6 @@ mod inner {
                 next_seq_id: 0,
                 prefix_cache,
                 next_block_id: 0,
-                free_blocks: Vec::new(),
                 seq_block_tables: HashMap::new(),
             })
         }
@@ -587,21 +584,11 @@ mod inner {
                 self.requests.remove(id);
                 self.scheduler.abort_seq_group(id);
             }
-            // Clean up block tables for finished sequences -- recycle block IDs
+            // Clean up block tables for finished sequences
             if !finished_ids.is_empty() {
                 let live_seq_ids: std::collections::HashSet<SequenceId> = self.scheduler
                     .live_seq_ids();
-                let dead_sids: Vec<SequenceId> = self.seq_block_tables.keys()
-                    .filter(|sid| !live_seq_ids.contains(sid))
-                    .copied()
-                    .collect();
-                for sid in dead_sids {
-                    if let Some(blocks) = self.seq_block_tables.remove(&sid) {
-                        for b in blocks {
-                            self.free_blocks.push(b.0);
-                        }
-                    }
-                }
+                self.seq_block_tables.retain(|sid, _| live_seq_ids.contains(sid));
             }
 
             debug!(num_outputs = results.len(), "GpuLLMEngine: step complete");
@@ -652,12 +639,8 @@ mod inner {
                     // Reuse existing blocks, append new ones if needed
                     let existing = self.seq_block_tables.entry(seq.seq_id).or_default();
                     while existing.len() < needed_blocks {
-                        let block_id = self.free_blocks.pop().unwrap_or_else(|| {
-                            let id = self.next_block_id;
-                            self.next_block_id += 1;
-                            id
-                        });
-                        existing.push(BlockId(block_id));
+                        existing.push(BlockId(self.next_block_id));
+                        self.next_block_id += 1;
                     }
                     block_tables.insert(seq.seq_id, existing.clone());
 
