@@ -674,6 +674,21 @@ mod cuda_impl {
             &self.stream
         }
 
+        /// Prepare the runner for CUDA graph capture.
+        ///
+        /// Pre-allocates the cuBLAS workspace (required by cuBLAS for graph
+        /// capture) and ensures the stream has async alloc support.
+        pub fn prepare_for_graph_capture(&mut self) -> rvllm_core::error::Result<()> {
+            self.blas.prepare_for_graph_capture()?;
+            if !self.stream.context().has_async_alloc() {
+                tracing::warn!(
+                    "GPU does not support async memory allocation (cuMemAllocAsync). \
+                     CUDA graph capture may fail. Consider upgrading the CUDA driver."
+                );
+            }
+            Ok(())
+        }
+
         /// GPU-only forward pass for CUDA graph capture.
         ///
         /// Runs the full forward pass (embedding -> layers -> norm -> argmax)

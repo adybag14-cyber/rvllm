@@ -633,6 +633,13 @@ impl GpuWorker {
                 info!("FP16 inference enabled (hgemm path)");
             }
 
+            // Pre-allocate cuBLAS workspace for CUDA graph capture.
+            // This must happen before any graph capture attempt.
+            if let Err(e) = runner.prepare_for_graph_capture() {
+                warn!("cuBLAS graph workspace setup failed: {e} -- graph capture disabled");
+                self.graph_runner.pool_mut().disable();
+            }
+
             self.gpu_model_runner = Some(runner);
             info!(
                 "GPU model runner initialized with {} GPU blocks (block_size={})",
@@ -948,6 +955,12 @@ impl GpuWorker {
             // any lazy kernel compilation / one-time init.
             runner.forward_gpu_only(num_tokens, num_seqs, max_context_len, false)?;
 
+            // Synchronize to drain all pending async ops (allocs, frees,
+            // kernel completions) before starting graph capture.
+            let cuda_stream = runner.cuda_stream().clone();
+            cuda_stream.synchronize()
+                .map_err(|e| LLMError::GpuError(format!("pre-capture sync: {e}")))?;
+
             // Re-upload metadata (warmup consumed the stream state).
             runner.upload_metadata(
                 &padded_input.token_ids,
@@ -956,7 +969,6 @@ impl GpuWorker {
             )?;
 
             // Begin capture on the model runner's stream.
-            let cuda_stream = runner.cuda_stream().clone();
             self.graph_runner.pool_mut().begin_capture_on(&cuda_stream)?;
             let result = runner.forward_gpu_only(
                 num_tokens, num_seqs, max_context_len, false,

@@ -2,27 +2,85 @@
 
 use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::cublas::{CudaBlas, Gemm as _, GemmConfig, Gemv as _, GemvConfig};
-use cudarc::driver::{CudaSlice, CudaStream};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtrMut};
 use std::sync::Arc;
 
 use crate::Result;
+
+/// Default cuBLAS workspace size for graph capture (4 MiB).
+/// NVIDIA recommends at least 4 KiB; 4 MiB covers all GEMM tile configs.
+const CUBLAS_GRAPH_WORKSPACE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Wrapper around cuBLAS for matrix operations.
 pub struct CublasHandle {
     blas: CudaBlas,
     stream: Arc<CudaStream>,
+    /// Pre-allocated workspace buffer for CUDA graph capture.
+    /// cuBLAS requires an explicit workspace via `cublasSetWorkspace_v2`
+    /// before any GEMM call inside a graph capture region, otherwise it
+    /// tries to allocate internally with `cudaMalloc` which is forbidden.
+    graph_workspace: Option<CudaSlice<u8>>,
 }
 
 impl CublasHandle {
     pub fn new(stream: Arc<CudaStream>) -> Result<Self> {
         let blas = CudaBlas::new(stream.clone())
             .map_err(|e| crate::LLMError::GpuError(format!("cuBLAS init failed: {e}")))?;
-        Ok(Self { blas, stream })
+        Ok(Self { blas, stream, graph_workspace: None })
     }
 
     /// Returns a reference to the underlying stream.
     pub fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
+    }
+
+    /// Pre-allocate and register a cuBLAS workspace for CUDA graph capture.
+    ///
+    /// Must be called BEFORE `cuStreamBeginCapture`. The workspace stays
+    /// registered for the lifetime of this handle; subsequent captures
+    /// reuse the same buffer.
+    #[cfg(feature = "cuda")]
+    pub fn prepare_for_graph_capture(&mut self) -> Result<()> {
+        if self.graph_workspace.is_some() {
+            return Ok(()); // already prepared
+        }
+
+        tracing::info!(
+            bytes = CUBLAS_GRAPH_WORKSPACE_BYTES,
+            "allocating cuBLAS graph workspace"
+        );
+
+        let mut ws = self.stream
+            .alloc_zeros::<u8>(CUBLAS_GRAPH_WORKSPACE_BYTES)
+            .map_err(|e| crate::LLMError::GpuError(
+                format!("cuBLAS workspace alloc: {e}")
+            ))?;
+
+        // Get raw device pointer for cublasSetWorkspace_v2
+        let (raw_ptr, _guard) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
+
+        unsafe {
+            let status = cudarc::cublas::sys::cublasSetWorkspace_v2(
+                *self.blas.handle(),
+                raw_ptr as *mut std::ffi::c_void,
+                CUBLAS_GRAPH_WORKSPACE_BYTES,
+            );
+            if status != cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                return Err(crate::LLMError::GpuError(
+                    format!("cublasSetWorkspace_v2 failed: {status:?}")
+                ));
+            }
+        }
+
+        self.graph_workspace = Some(ws);
+        tracing::info!("cuBLAS graph workspace registered");
+        Ok(())
+    }
+
+    /// No-op when cuda feature is off.
+    #[cfg(not(feature = "cuda"))]
+    pub fn prepare_for_graph_capture(&mut self) -> Result<()> {
+        Ok(())
     }
 
     /// SGEMM: C[m,n] = A[m,k] @ B[n,k]^T
