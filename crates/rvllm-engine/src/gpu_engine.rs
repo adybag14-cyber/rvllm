@@ -302,6 +302,14 @@ mod inner {
         seq_block_tables: HashMap<SequenceId, Vec<BlockId>>,
     }
 
+    /// Pending state from step_launch, consumed by step_collect.
+    pub struct StepPending {
+        pub scheduled_groups: Vec<SequenceGroup>,
+        pub metadata: Vec<SequenceGroupMetadata>,
+        /// Async batch size from execute_launch (Some = async DtoH pending).
+        pub actual_batch: Option<usize>,
+    }
+
     impl GpuLLMEngine {
         pub fn new(config: EngineConfig) -> Result<Self> {
             let model_name = &config.model.model_path;
@@ -493,6 +501,70 @@ mod inner {
                     }
                 }
             }
+        }
+
+        /// Launch GPU work for one step. Returns pending state if work was
+        /// launched, None if nothing to schedule. GPU computes asynchronously
+        /// after this returns (~60us for graph replay path).
+        pub fn step_launch(&mut self) -> Result<Option<StepPending>> {
+            let (scheduled_groups, metadata, aborted_seqs) = match self.prepare_step() {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+
+            if !aborted_seqs.is_empty() {
+                for group in &scheduled_groups {
+                    for (seq_idx, seq) in group.get_seqs().iter().enumerate() {
+                        if aborted_seqs.contains(&seq.seq_id) {
+                            if let Some(req) = self.requests.get_mut(&group.request_id) {
+                                if let Some(state) = req.seq_states.get_mut(seq_idx) {
+                                    state.finish_reason = Some(FinishReason::Abort);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Launch worker (returns quickly for async graph replay path)
+            let actual_batch = self.worker.execute_launch(&metadata)
+                .map_err(|e| LLMError::GpuError(format!("worker launch failed: {e}")))?;
+
+            Ok(Some(StepPending { scheduled_groups, metadata, actual_batch }))
+        }
+
+        /// Collect GPU results and process outputs. Call after step_launch.
+        /// If pending is None, returns empty (nothing was launched).
+        pub fn step_collect(&mut self, pending: Option<StepPending>) -> Result<Vec<RequestOutput>> {
+            let pending = match pending {
+                Some(p) => p,
+                None => return Ok(Vec::new()),
+            };
+
+            let worker_outputs = self.worker.execute_collect(pending.actual_batch, &pending.metadata)
+                .map_err(|e| LLMError::GpuError(format!("worker collect failed: {e}")))?;
+
+            // Prefix caching
+            if let Some(ref mut pc) = self.prefix_cache {
+                let block_size = self.config.cache.block_size;
+                for meta in &pending.metadata {
+                    if meta.is_prompt {
+                        for (_seq_id, seq_data) in &meta.seq_data {
+                            let num_full_blocks = seq_data.prompt_token_ids.len() / block_size;
+                            let block_ids: Vec<rvllm_core::prelude::BlockId> = (0..num_full_blocks)
+                                .map(|i| rvllm_core::prelude::BlockId(i as u32))
+                                .collect();
+                            let _ = prefix_cache::register_prefix_blocks(
+                                pc, &seq_data.prompt_token_ids, &block_ids, block_size,
+                            );
+                        }
+                    }
+                }
+            }
+
+            let results = self.process_worker_outputs(&pending.scheduled_groups, &worker_outputs);
+            self.recycle_dead_blocks();
+            Ok(results)
         }
 
         pub fn step(&mut self) -> Result<Vec<RequestOutput>> {
