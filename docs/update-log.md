@@ -1,0 +1,161 @@
+# rvLLM Update Log
+
+Chronological record of all optimization work, benchmarks, and architecture changes.
+
+---
+
+## 2026-03-28: Phase 4 -- CUDA Graph Capture/Replay
+
+**Problem:** Graph capture failed with `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`.
+
+**Root causes found (3):**
+1. `context.default_stream()` -- the legacy CUDA stream doesn't support `cuStreamBeginCapture`. Fixed: `context.new_stream()`.
+2. cuBLAS workspace -- cuBLAS internally calls `cudaMalloc` during capture. Fixed: pre-allocate 4MB workspace via `cublasSetWorkspace_v2`.
+3. cudarc event tracking -- per-CudaSlice read/write events create cross-phase dependencies during capture. Fixed: `disable_event_tracking()`.
+
+**Result:** Graph capture working end-to-end on A100. Full decode forward pass (28 layers) captured as single replayable graph.
+
+**Benchmark (A100 80GB, Qwen2.5-1.5B, f16, greedy):**
+| N | tok/s |
+|---|---|
+| 1 | 128 |
+| 4 | 540 |
+| 8 | 1,091 |
+| 16 | 2,118 |
+| 32 | 3,467 |
+
+Per-token: 7.7ms. Overhead: 77% (5.95ms of 7.7ms is not compute).
+
+---
+
+## 2026-03-28: Phase 5 -- 10-Agent Overhead Reduction Swarm
+
+**Problem:** 5.95ms overhead per token. Breakdown:
+- 392 unnecessary f32<->f16 cast kernels per forward
+- Separate add+norm (56 extra kernel launches)
+- RoPE allocates + copies (56 allocs + 56 memcpy)
+- 6 separate metadata HtoD uploads
+- tokio yield_now every iteration
+- Hot-path info! logging
+
+**10 agents launched in parallel worktrees:**
+1. cuBLAS GemmEx mixed-precision GEMM
+2. forward_mixed (1-alloc GEMM, no output cast)
+3. In-place RoPE (zero alloc, zero copy)
+4. Fused residual+RMSNorm (wire existing kernel)
+5. Wire forward_mixed into all 7 linear calls
+6. Packed metadata upload (6 HtoD -> 1)
+7. Engine loop (periodic yield_now every 64 steps)
+8. Scheduler (defer tokenizer.decode, reduce cloning)
+9. Input prep (DecodeInputScratch with buffer reuse)
+10. Graph capture fix (infinite retry bug, logging downgrade)
+
+**Result:** 7.7ms -> 5.75ms per token (-25%).
+
+| N | tok/s |
+|---|---|
+| 1 | 174 |
+| 32 | 4,276 |
+
+---
+
+## 2026-03-28: Shared Input Casts
+
+**Problem:** forward_mixed casts the same f32 input to f16 redundantly for Q/K/V (3x) and gate/up (2x).
+
+**Fix:** Cast once, share across projections using `forward_f16_in`.
+
+**Result:** 5.75ms -> 5.65ms (-1.8%).
+
+---
+
+## 2026-03-28: Fused QKV and Gate+Up Weights
+
+**Problem:** 3 separate cuBLAS calls for Q/K/V, 2 for gate/up. Each has ~15us dispatch overhead.
+
+**Fix:** Concatenate weights at load time. Single GEMM for QKV (1536+256+256=2048 output), single GEMM for gate+up (8960*2=17920 output). Zero-copy split via CudaView slices.
+
+**Result:** 5.65ms -> 5.55ms. 84 fewer cuBLAS calls per forward.
+
+---
+
+## 2026-03-28: Full f16 Forward (Zero Casts)
+
+**Problem:** 4 remaining f32->f16 cast kernels per layer (112 total). Hidden states bounced between f32 (for element-wise ops) and f16 (for GEMMs).
+
+**Fix:** Complete f16 forward path. All kernels use f16 variants:
+- `rms_norm_f16_kernel`, `rotary_embedding_f16_kernel`
+- `flash_attention_2_decode_f16io_kernel` (new: f16 Q/output)
+- `fused_residual_rmsnorm_f16_kernel`, `fused_silu_mul_f16_kernel`
+- `add_f16_kernel`, `add_bias_f16_kernel`
+- `reshape_and_cache_f16io_kernel` (f16 K/V input)
+- `hgemm` f16xf16->f16 for all projections
+
+Pre-converted norm weights, biases, and embedding table to f16 at load time. Zero cast kernels in the decode inner loop.
+
+**Result:** 5.55ms -> 4.93ms (-11.2%). 200 tok/s at N=1.
+
+---
+
+## 2026-03-28: Timing Instrumentation Reveals Truth
+
+Added per-step timing to the decode loop. **Key finding:**
+
+```
+upload_metadata:    2us   (basically free after packed upload)
+graph_replay:     750us   (kernel dispatch)
+read_graph_output: 4172us (GPU compute + sync wait)
+```
+
+The 4.2ms "read" is NOT transfer time (4 bytes). It's **waiting for GPU compute to finish**. The `clone_dtoh` synchronizes the stream, blocking until the graph replay completes.
+
+**Conclusion:** CPU overhead is solved (~0.5ms). The remaining time is GPU kernel efficiency. The theoretical memory-bandwidth floor is 1.3ms (2.6GB weights at 2039 GB/s).
+
+---
+
+## 2026-03-29: 9-Agent Kernel Efficiency Swarm
+
+**Problem:** 2.9ms gap between GPU compute (4.2ms) and theoretical floor (1.3ms). Sources: cuBLAS per-call overhead, memset kernels from alloc_zeros, separate add+norm across layers.
+
+**9 agents:**
+
+cuBLAS launch overhead:
+1. `hgemv_f16` for M=1 decode (lower dispatch than GEMM)
+2. `hgemm_strided_batched` for multi-GEMM batching
+3. `warmup_gemm_shapes` to pre-warm cuBLAS algo cache
+
+Small kernel overhead:
+4. In-place `rms_norm_f16` (zero alloc via shared memory)
+5. Cross-layer add+norm fusion (fuse last layer's residual add into next layer's norm)
+6. Replace `alloc_zeros` with `unsafe { alloc }` for immediately-overwritten buffers
+
+Memory pool overhead:
+7. `F16LayerScratch` struct (2.3MB, reusable across layers)
+8. CUDA memory pool `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD = u64::MAX`
+9. Allocation audit (10 allocs/layer, 5 reusable)
+
+**Result:** 4.93ms -> 4.21ms per token (-14.6%). Graph replay: 750us -> 95us (-87%).
+
+| N | tok/s |
+|---|---|
+| 1 | 236 |
+| 4 | 834 |
+| 8 | 1,786 |
+| 32 | 5,123 |
+
+---
+
+## Summary: Full Optimization History
+
+| Phase | Per-token | N=1 tok/s | Key change |
+|---|---|---|---|
+| Phase 4 (baseline) | 7.70ms | 130 | CUDA graph capture working |
+| Phase 5 (10-agent) | 5.75ms | 174 | Cast reduction, fused ops, engine opt |
+| Shared casts | 5.65ms | 177 | Share input cast across QKV, gate+up |
+| Fused weights | 5.55ms | 180 | QKV + gate+up weight concatenation |
+| Full f16 | 4.93ms | 200 | Zero casts, all f16 kernels |
+| 9-agent kernel | **4.21ms** | **236** | Cross-layer fusion, memset elimination, pool tuning |
+
+**Total: 7.70ms -> 4.21ms (1.83x speedup). 130 -> 236 tok/s (1.82x).**
+
+Theoretical peak: 574 tok/s (1.74ms, memory-bandwidth-bound). Current utilization: 41%.

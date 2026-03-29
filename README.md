@@ -2,7 +2,7 @@
 
 A from-scratch Rust rewrite of [vLLM](https://github.com/vllm-project/vllm) -- the most popular open-source LLM serving engine. Drop-in replacement for the OpenAI-compatible API with dramatically better resource efficiency.
 
-**23 Rust crates. 15 CUDA kernels. ~3,500 tok/s on A100 (FP16, N=32). FlashAttention-2 + CUDA graph capture/replay. 20x faster startup. 31x smaller.**
+**23 Rust crates. 15 CUDA kernels. 5,123 tok/s on A100 (FP16, N=32). 236 tok/s single-sequence. Full f16 forward, zero casts, CUDA graph replay. 20x faster startup. 31x smaller.**
 
 ## Install
 
@@ -18,15 +18,14 @@ Or build from source -- see [Quick Start](#quick-start) below.
 
 ## Benchmarks (Qwen2.5-1.5B, A100 80GB SXM4)
 
-Greedy decoding, FP16, 32 tokens/request. Measured 2026-03-28.
+Greedy decoding, full f16 forward, CUDA graph replay. Measured 2026-03-29.
 
-| Concurrent (N) | tok/s | Notes |
-|---:|---:|---|
-| 1 | 128 | 7.7ms/tok |
-| 4 | 540 | |
-| 8 | 1,091 | |
-| 16 | 2,118 | |
-| 32 | 3,467 | |
+| Concurrent (N) | tok/s | ms/tok |
+|---:|---:|---:|
+| 1 | 236 | 4.2 |
+| 4 | 834 | - |
+| 8 | 1,786 | - |
+| 32 | 5,123 | - |
 
 | Metric | Value |
 |---|---|
@@ -34,7 +33,7 @@ Greedy decoding, FP16, 32 tokens/request. Measured 2026-03-28.
 | Binary size | 16 MB (vs ~500 MB Python vLLM) |
 | CPU memory | 348 MB (vs ~1 GB Python vLLM) |
 
-Theoretical peak at N=1 is 574 tok/s (memory-bandwidth-bound). Current 22.7% utilization -- active optimization in progress. See [docs/benchmark-history.md](docs/benchmark-history.md) for past results.
+Theoretical peak at N=1 is 574 tok/s (memory-bandwidth-bound). Current utilization: 41%. See [docs/update-log.md](docs/update-log.md) for the full optimization history from 130 to 236 tok/s.
 
 ### CPU Component Benchmarks (sampling, logit processing)
 
@@ -569,29 +568,16 @@ Heavy use of Claude Code with Claude Opus for architecture design, CUDA kernel w
 
 Roughly **$1,780** in compute and AI overage costs to go from zero to a working Rust LLM server with verified **3,467 tok/s at N=32 on A100 FP16**, CUDA graph capture/replay, and end-to-end benchmark coverage. No salaries, no team -- one developer (Andy Norris, San Francisco) with Claude and rented GPUs over 22 hours.
 
-## Optimization Log
+## Optimization History
 
-### Phase 1: Initial (FP32, A100 40GB)
-- 3,191 tok/s peak at N=512
-- 86 tok/s single-sequence
+| Phase | N=1 tok/s | Key change |
+|---|---:|---|
+| Phase 4 | 130 | CUDA graph capture working (3 root causes fixed) |
+| Phase 5 | 174 | 10-agent swarm: cast reduction, fused ops, engine optimization |
+| Full f16 | 200 | Zero casts, all f16 kernels, f16io attention kernel |
+| 9-agent kernel | **236** | Cross-layer fusion, memset elimination, pool tuning |
 
-### Phase 2: FP16 inference (hgemm + f16 KV cache)
-- 8,339 tok/s peak at N=768
-- Matches vLLM at N=48-128
-
-### Phase 3: Sampling + attention backend selection
-- Context-aware attention: FlashAttention-2 for short contexts, Split-KV for long
-- Fused SiLU*mul activation kernel (gate + up in one kernel launch)
-- GPU-side argmax for greedy decode (no logit DtoH transfer)
-- Fused residual+RMSNorm kernel written (wired up in Phase 5)
-- Fixed CUDA graph replay (was doing redundant forward pass)
-
-### Phase 4: CUDA graph capture/replay
-- Fixed 3 root causes: default stream (no capture support), cuBLAS workspace (internal malloc during capture), cudarc event tracking (cross-phase isolation errors)
-- Graph now captures full decode forward pass (28 layers x 9+ kernels) into a single replayable graph
-- Eliminates ~250 individual kernel launch dispatches per decode step
-- Padded block_tables to fixed stride for stable GPU pointer width across replays
-- Pre-allocated 4MB cuBLAS workspace registered via cublasSetWorkspace_v2
+See **[docs/update-log.md](docs/update-log.md)** for the full chronological record with technical details, timing breakdowns, and agent descriptions.
 
 ## Changelog
 
