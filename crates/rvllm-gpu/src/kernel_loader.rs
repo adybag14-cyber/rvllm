@@ -36,8 +36,13 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
         ],
     ),
     ("add_bias", &["add_bias_kernel", "add_kernel"]),
+    (
+        "add_bias_f16",
+        &["add_bias_f16_kernel", "add_f16_kernel", "add_inplace_f16_kernel"],
+    ),
     ("copy_blocks", &["copy_blocks_kernel"]),
     ("embedding_gather", &["embedding_gather_kernel"]),
+    ("embedding_gather_f16", &["embedding_gather_f16_kernel"]),
     (
         "flash_attention",
         &[
@@ -58,6 +63,7 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
         ],
     ),
     ("fused_residual_rmsnorm", &["fused_residual_rmsnorm_kernel"]),
+    ("fused_residual_rmsnorm_f16", &["fused_residual_rmsnorm_f16_kernel"]),
     (
         "paged_attention",
         &["paged_attention_v2_kernel", "paged_attention_v2_f16kv_kernel"],
@@ -79,9 +85,14 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
         "cast_fp",
         &["cast_f32_to_f16_kernel", "cast_f16_to_f32_kernel"],
     ),
+    (
+        "reshape_and_cache_f16",
+        &["reshape_and_cache_f16io_kernel"],
+    ),
     ("rms_norm", &["rms_norm_kernel"]),
     ("rms_norm_f16", &["rms_norm_f16_kernel"]),
     ("rotary_embedding", &["rotary_embedding_kernel"]),
+    ("rotary_embedding_f16", &["rotary_embedding_f16_kernel"]),
     ("softmax", &["softmax_kernel"]),
     (
         "fused_lm_head_argmax",

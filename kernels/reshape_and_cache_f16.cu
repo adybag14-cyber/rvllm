@@ -13,7 +13,7 @@
 #include <cuda_fp16.h>
 
 extern "C"
-__global__ void reshape_and_cache_f16_kernel(
+__global__ void reshape_and_cache_f16io_kernel(
     __half* __restrict__ key_cache,        // [num_blocks, block_size, num_kv_heads, head_dim]
     __half* __restrict__ value_cache,      // [num_blocks, block_size, num_kv_heads, head_dim]
     const __half* __restrict__ key,        // [num_tokens, num_kv_heads, head_dim]
