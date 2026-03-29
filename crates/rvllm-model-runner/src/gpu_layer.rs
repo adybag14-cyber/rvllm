@@ -226,8 +226,7 @@ mod inner {
             weights: &GpuLayerWeightsF16<'_>,
             blas: &CublasHandle,
             prev_mlp_out: Option<&CudaSlice<f16>>,
-            #[cfg(feature = "cublaslt")]
-            lt: Option<&rvllm_gpu::cublaslt_ops::CublasLtOps>,
+            lt: Option<&crate::CublasLtRef>,
         ) -> Result<(CudaSlice<f16>, CudaSlice<f16>)> {
             let cfg = &self.config;
             let num_tokens = input.num_tokens;
@@ -1536,8 +1535,7 @@ mod inner {
         fn hgemm_dispatch(
             stream: &Arc<CudaStream>,
             blas: &CublasHandle,
-            #[cfg(feature = "cublaslt")]
-            lt: Option<&rvllm_gpu::cublaslt_ops::CublasLtOps>,
+            lt: Option<&crate::CublasLtRef>,
             input: &CudaSlice<f16>,
             weight: &CudaSlice<f16>,
             m: usize,

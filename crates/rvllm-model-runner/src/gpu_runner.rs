@@ -530,7 +530,7 @@ mod cuda_impl {
                         rope_sin: &self.rope_sin,
                     };
                     let weights = self.layer_weights_f16(layer_idx)?;
-                    let (residual, mlp_out) = layer.forward_f16(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.blas_lt.as_ref())?;
+                    let (residual, mlp_out) = layer.forward_f16(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref())?;
                     hidden_f16 = residual;
                     prev_mlp_out = Some(mlp_out);
                 }
@@ -845,7 +845,7 @@ mod cuda_impl {
                         rope_sin: &self.rope_sin,
                     };
                     let weights = self.layer_weights_f16(layer_idx)?;
-                    let (residual, mlp_out) = layer.forward_f16(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.blas_lt.as_ref())?;
+                    let (residual, mlp_out) = layer.forward_f16(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref())?;
                     hidden_f16 = residual;
                     prev_mlp_out = Some(mlp_out);
                 }
@@ -1001,6 +1001,14 @@ mod cuda_impl {
             &self.stream
         }
 
+        /// Get cublasLt reference (None when feature is off).
+        fn cublaslt_ref(&self) -> Option<&crate::CublasLtRef> {
+            #[cfg(feature = "cublaslt")]
+            { self.blas_lt.as_ref() }
+            #[cfg(not(feature = "cublaslt"))]
+            { None }
+        }
+
 
         /// Prepare the runner for CUDA graph capture.
         ///
@@ -1073,7 +1081,7 @@ mod cuda_impl {
                         rope_sin: &self.rope_sin,
                     };
                     let weights = self.layer_weights_f16(layer_idx)?;
-                    let (residual, mlp_out) = layer.forward_f16(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.blas_lt.as_ref())?;
+                    let (residual, mlp_out) = layer.forward_f16(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref())?;
                     hidden_f16 = residual;
                     prev_mlp_out = Some(mlp_out);
                 }
