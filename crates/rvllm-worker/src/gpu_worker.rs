@@ -1062,24 +1062,8 @@ impl GpuWorker {
     ) -> Result<ForwardOutput> {
         self.forward_count += 1;
 
-        // Only use graphs for pure decode steps with greedy sampling
-        let is_decode = !model_input.is_prefill
-            && model_input.attention_metadata.query_lens.iter().all(|&q| q == 1);
-
-        if !is_decode || !greedy_only || !self.graph_runner.is_enabled() {
-            return self.raw_gpu_forward_ex(model_input, greedy_only);
-        }
-
-        let actual_batch = model_input.num_tokens();
-        let padded = match rvllm_gpu::cuda_graph::padded_batch_size(actual_batch) {
-            Some(p) if p <= 128 => p,
-            _ => return self.raw_gpu_forward_ex(model_input, greedy_only),
-        };
-
-        // Pad the input to the graph batch size
-        let (padded_input, actual) = self.graph_runner.pad_input(model_input)?;
-
-        self.gpu_forward_ex_graphed(&padded_input, actual, padded, greedy_only)
+        // Use raw forward for everything. No padding. No graphs.
+        self.raw_gpu_forward_ex(model_input, greedy_only)
     }
 
     /// Run a padded decode forward with CUDA graph capture or replay.
