@@ -206,7 +206,8 @@ mod inner {
             // Spawn dedicated GPU thread.
             // Communication: async loop sends GpuWork, GPU thread sends back GpuStepResult.
             let (gpu_tx, gpu_rx) = std_mpsc::channel::<GpuWork>();
-            let (result_tx, result_rx) = std_mpsc::channel::<GpuStepResult>();
+            // Use tokio::sync::mpsc for results so we can .await instead of spin+yield
+            let (result_tx, mut result_rx) = mpsc::channel::<GpuStepResult>(4);
 
             let gpu_thread = std::thread::Builder::new()
                 .name("gpu-step".into())
@@ -284,41 +285,25 @@ mod inner {
                     break;
                 }
 
-                // -- While GPU computes: drain new requests that arrive --
-                loop {
-                    match result_rx.try_recv() {
-                        Ok(result) => {
-                            // GPU done -- process outputs
-                            has_unfinished = result.has_unfinished;
-                            Self::send_outputs(
-                                result.outputs,
-                                &mut output_channels,
-                                &abort_queue,
-                            ).await;
-                            break;
-                        }
-                        Err(std_mpsc::TryRecvError::Empty) => {
-                            // GPU still computing -- drain new requests
-                            Self::drain_commands_to_queue(
-                                &mut cmd_rx,
-                                &request_queue,
-                                &abort_queue,
-                                &mut output_channels,
-                            );
-                            Self::drain_generate_requests_to_queue(
-                                &mut gen_rx,
-                                &request_queue,
-                                &mut output_channels,
-                                &next_request_id,
-                            );
-                            // Yield to let HTTP handlers run on the tokio runtime
-                            tokio::task::yield_now().await;
-                        }
-                        Err(std_mpsc::TryRecvError::Disconnected) => {
-                            error!("GPU thread result channel disconnected");
-                            has_unfinished = false;
-                            break;
-                        }
+                // -- Wait for GPU result. Drain requests that arrive during the wait. --
+                let result = result_rx.recv().await;
+                // GPU done. Drain any requests that arrived during compute.
+                Self::drain_commands_to_queue(
+                    &mut cmd_rx, &request_queue, &abort_queue, &mut output_channels,
+                );
+                Self::drain_generate_requests_to_queue(
+                    &mut gen_rx, &request_queue, &mut output_channels, &next_request_id,
+                );
+                match result {
+                    Some(result) => {
+                        has_unfinished = result.has_unfinished;
+                        Self::send_outputs(
+                            result.outputs, &mut output_channels, &abort_queue,
+                        ).await;
+                    }
+                    None => {
+                        error!("GPU thread result channel disconnected");
+                        has_unfinished = false;
                     }
                 }
             }
@@ -345,7 +330,7 @@ mod inner {
         fn gpu_thread_loop(
             mut engine: GpuLLMEngine,
             work_rx: std_mpsc::Receiver<GpuWork>,
-            result_tx: std_mpsc::Sender<GpuStepResult>,
+            result_tx: mpsc::Sender<GpuStepResult>,
         ) {
             info!("GPU thread started");
             while let Ok(work) = work_rx.recv() {
@@ -353,7 +338,7 @@ mod inner {
                     GpuWork::Step => {
                         let outputs = engine.step();
                         let unfinished = engine.has_unfinished();
-                        if result_tx.send(GpuStepResult {
+                        if result_tx.blocking_send(GpuStepResult {
                             outputs,
                             has_unfinished: unfinished,
                         }).is_err() {
