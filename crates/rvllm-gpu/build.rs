@@ -165,6 +165,38 @@ fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
     }
 
     println!("cargo:rustc-env=RVLLM_PTX_DIR={}", ptx_dir.display());
+
+    // Also copy PTX files to workspace target/ptx/ where the runtime loader
+    // checks first (avoids hash-dependent build output paths).
+    let workspace_ptx = out_dir
+        .ancestors()
+        .find(|p| p.ends_with("target") || p.join("release").exists() || p.join("debug").exists())
+        .and_then(|p| {
+            // Walk up to target/
+            let mut cur = p;
+            while !cur.ends_with("target") {
+                cur = cur.parent()?;
+            }
+            Some(cur.to_path_buf())
+        })
+        .unwrap_or_else(|| out_dir.join("../../.."))
+        .join("ptx");
+
+    if let Err(e) = fs::create_dir_all(&workspace_ptx) {
+        println!("cargo:warning=Could not create {}: {e}", workspace_ptx.display());
+    } else {
+        if let Ok(entries) = fs::read_dir(&ptx_dir) {
+            for entry in entries.flatten() {
+                let src = entry.path();
+                if src.extension().and_then(|e| e.to_str()) == Some("ptx") {
+                    let dst = workspace_ptx.join(src.file_name().unwrap());
+                    if let Err(e) = fs::copy(&src, &dst) {
+                        println!("cargo:warning=Failed to copy {} -> {}: {e}", src.display(), dst.display());
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn main() {
