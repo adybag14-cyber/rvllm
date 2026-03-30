@@ -659,10 +659,13 @@ mod inner {
         /// the closure runs AFTER prepare_step but BEFORE process_worker_outputs.
         /// The closure should only drain NEW requests, not touch current sequences.
         pub fn step_with_overlap<F: FnOnce()>(&mut self, during_gpu: F) -> Result<Vec<RequestOutput>> {
+            let prof = std::env::var("RVLLM_PROFILE").is_ok();
+            let ts = std::time::Instant::now();
             let (scheduled_groups, metadata, aborted_seqs) = match self.prepare_step() {
                 Some(v) => v,
                 None => { during_gpu(); return Ok(Vec::new()); }
             };
+            let t_sched = ts.elapsed();
 
             if !aborted_seqs.is_empty() {
                 for group in &scheduled_groups {
@@ -678,9 +681,16 @@ mod inner {
                 }
             }
 
+            let tg = std::time::Instant::now();
             let worker_outputs = self.worker
                 .execute_with_overlap(&metadata, during_gpu)
                 .map_err(|e| LLMError::GpuError(format!("worker execute failed: {e}")))?;
+            let t_gpu = tg.elapsed();
+
+            if prof {
+                tracing::info!("PROFILE overlap: sched={:.3}ms gpu={:.3}ms",
+                    t_sched.as_secs_f64() * 1000.0, t_gpu.as_secs_f64() * 1000.0);
+            }
 
             // Prefix caching
             if let Some(ref mut pc) = self.prefix_cache {
@@ -706,15 +716,21 @@ mod inner {
         }
 
         pub fn step(&mut self) -> Result<Vec<RequestOutput>> {
+            let prof = std::env::var("RVLLM_PROFILE").is_ok();
             // Drain any buffered requests from the shared queue before scheduling
-            self.drain_request_queue();
             let t0 = std::time::Instant::now();
+            self.drain_request_queue();
+            let t_drain = t0.elapsed();
+
+            let t1 = std::time::Instant::now();
             let result = self.step_with_overlap(|| {});
-            if std::env::var("RVLLM_PROFILE").is_ok() {
-                let el = t0.elapsed();
-                if el.as_millis() > 0 {
-                    tracing::info!("PROFILE step total: {:.3}ms", el.as_secs_f64() * 1000.0);
-                }
+            let t_step = t1.elapsed();
+
+            if prof && t_step.as_millis() > 0 {
+                tracing::info!("PROFILE step: drain={:.3}ms overlap={:.3}ms total={:.3}ms",
+                    t_drain.as_secs_f64() * 1000.0,
+                    t_step.as_secs_f64() * 1000.0,
+                    t0.elapsed().as_secs_f64() * 1000.0);
             }
             result
         }

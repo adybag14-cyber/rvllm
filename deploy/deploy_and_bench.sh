@@ -27,7 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # --- Defaults ---
-MODEL="Qwen/Qwen2.5-1.5B"
+MODEL="Qwen/Qwen2.5-7B"
 ARCH=""
 SKIP_BUILD=0
 SKIP_COMPILE=0
@@ -152,18 +152,24 @@ if [[ "$SKIP_COMPILE" -eq 0 ]]; then
         stem=$(basename "$cu" .cu)
         ptx="$OUTDIR/${stem}.ptx"
 
-        EXTRA_FLAGS=""
         if [[ "$stem" == "persistent_layer_decode" ]]; then
-            # Cooperative groups requires relocatable device code
-            EXTRA_FLAGS="-rdc=true"
-        fi
-
-        if nvcc -ptx -arch="$ARCH" -O3 --use_fast_math $EXTRA_FLAGS -o "$ptx" "$cu" 2>/tmp/nvcc_${stem}.log; then
-            PTX_OK=$((PTX_OK + 1))
+            # Cooperative groups needs cubin (PTX downgrades grid.sync to bar.sync)
+            cubin="$OUTDIR/${stem}.cubin"
+            if nvcc -cubin -arch="$ARCH" -O3 --use_fast_math -rdc=true -o "$cubin" "$cu" 2>/tmp/nvcc_${stem}.log; then
+                PTX_OK=$((PTX_OK + 1))
+            else
+                PTX_FAIL=$((PTX_FAIL + 1))
+                warn "  FAILED: ${stem}.cu (cubin)"
+                cat /tmp/nvcc_${stem}.log 2>/dev/null | tail -3
+            fi
         else
-            PTX_FAIL=$((PTX_FAIL + 1))
-            warn "  FAILED: ${stem}.cu"
-            cat /tmp/nvcc_${stem}.log 2>/dev/null | tail -3
+            if nvcc -ptx -arch="$ARCH" -O3 --use_fast_math -o "$ptx" "$cu" 2>/tmp/nvcc_${stem}.log; then
+                PTX_OK=$((PTX_OK + 1))
+            else
+                PTX_FAIL=$((PTX_FAIL + 1))
+                warn "  FAILED: ${stem}.cu"
+                cat /tmp/nvcc_${stem}.log 2>/dev/null | tail -3
+            fi
         fi
     done
 
