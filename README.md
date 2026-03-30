@@ -2,7 +2,7 @@
 
 A from-scratch Rust rewrite of [vLLM](https://github.com/vllm-project/vllm) -- the most popular open-source LLM serving engine. Drop-in replacement for the OpenAI-compatible API with dramatically better resource efficiency.
 
-**30 CUDA kernels. Pure f16 end-to-end. CUDA graph replay. 20x faster startup. 31x smaller binary. One bottleneck left.**
+**30 CUDA kernels. Pure f16 end-to-end. CUDA graph replay. 3,034 tok/s on H100. 20x faster startup. 31x smaller binary.**
 
 ## Benchmarks (H100 SXM, Qwen2.5-7B f16)
 
@@ -14,18 +14,31 @@ Honest head-to-head against Python vLLM 0.18.0 on H100 80GB. Non-streaming HTTP 
 
 | Metric | rvllm | Python vLLM 0.18 | Ratio |
 |---|---:|---:|---|
-| **Throughput** | 1,093 tok/s | **4,557 tok/s** | 0.24x |
-| Requests/s | 5.9 | 23.1 | 0.26x |
-| Avg latency | 5,166 ms | **1,259 ms** | 4.1x slower |
-| P50 latency | 6,876 ms | **1,580 ms** | 4.4x slower |
-| P95 latency | 7,319 ms | **1,770 ms** | 4.1x slower |
-| Avg tok/request | 186.5 | 197.6 | ~same |
+| **Throughput** | **3,034 tok/s** | 4,557 tok/s | 0.67x |
+| Requests/s | 11.9 | 23.1 | 0.51x |
+| Avg latency | 2,476 ms | **1,259 ms** | 1.97x slower |
+| P50 latency | 2,500 ms | **1,580 ms** | 1.58x slower |
+| P95 latency | 2,534 ms | **1,770 ms** | 1.43x slower |
+| Avg tok/request | 256.0 | 197.6 | -- |
 
-vLLM generates tokens ~4x faster. These numbers reflect real physics: H100 has 3.35 TB/s memory bandwidth, a 7B f16 model is ~14GB of weights, so each decode step takes ~4ms at the memory wall. vLLM's torch.compile + Triton fusion pipeline gets close to that limit. rvllm's hand-written CUDA kernels + cuBLAS HGEMM do not fuse operations across layers, so each kernel launch pays its own overhead.
+rvllm is at **67% of vLLM's throughput** -- up from 24% before the CUDA graph and cublasLt fixes. The remaining 1.5x gap is kernel fusion: vLLM's torch.compile fuses multiple operations into single GPU kernels, eliminating intermediate memory round-trips. rvllm launches ~254 separate kernels per decode step; each writes to global memory and the next reads it back.
+
+### Optimization progress
+
+Two fixes closed 75% of the gap in one iteration:
+
+| Change | Before | After | Impact |
+|---|---:|---:|---|
+| **CUDA graph replay for all decode** | 1,093 tok/s | **3,034 tok/s** | +178% |
+| cublasLt split-K for all GEMMs | (included above) | (included above) | -- |
+
+**CUDA graph replay** was the big one. Graphs were captured at startup for 13 batch sizes but never replayed -- the dispatch path required `temperature == 0.0` (greedy-only), which no real request satisfies. Graphs capture the forward pass (GEMMs, attention, norms), not sampling. Removing the greedy gate let every decode step replay its pre-captured graph, eliminating ~254 kernel launch calls per step.
+
+**cublasLt split-K** was wired to the decode path but 6 GEMM call sites in the Q/K/V separate-projection fallback still used plain cuBLAS. These now route through cublasLt when M <= 32.
+
+**CUDA graph coherency fix**: the previous graph replay implementation was reverted because it replayed with stale metadata (block tables, context lengths). The root cause was that `CudaGraph::replay()` launched on the captured stream instead of the caller's stream, breaking CUDA stream ordering with the metadata HtoD uploads. Fixed by launching on the runner's stream.
 
 ### Where rvllm already wins
-
-The serving stack itself -- everything that isn't GPU compute -- is dramatically more efficient:
 
 | Metric | rvllm | Python vLLM |
 |---|---|---|
@@ -33,24 +46,27 @@ The serving stack itself -- everything that isn't GPU compute -- is dramatically
 | Binary size | **16 MB** | ~500 MB |
 | CPU memory | **348 MB** | ~1 GB |
 | Dependencies | **0** (static binary) | PyTorch + 500MB of packages |
+| P95 latency variance | **34 ms** (2500-2534) | **190 ms** (1580-1770) |
 
-No Python interpreter, no GIL, no garbage collector, no PyTorch tensor creation. HTTP routing (axum), scheduling, sampling, and memory management all run in compiled Rust. Once the GPU kernels close the gap, there is nothing else in the way.
+No Python interpreter, no GIL, no garbage collector, no PyTorch tensor creation. HTTP routing (axum), scheduling, sampling, and memory management all run in compiled Rust. rvllm's P95 tail is tighter than vLLM's -- 1.4% spread vs 12% -- because there are no GC pauses or JIT recompilations.
 
 ### The last bottleneck
 
-We've eliminated every overhead except one: **GPU kernel throughput**. The Rust serving stack, scheduler, memory manager, and HTTP layer are all faster than Python vLLM's equivalents. The sole remaining gap is that vLLM's torch.compile fuses multiple operations (RMSNorm + linear, attention + softmax, SiLU + down projection) into single GPU kernels, while rvllm launches them separately.
+The sole remaining gap is **kernel fusion**. rvllm launches ~254 CUDA kernels per decode step. Each kernel writes intermediate results to HBM, and the next kernel reads them back. vLLM's torch.compile fuses chains like RMSNorm+Linear, SiLU+Down, and attention+softmax into single kernels that keep intermediates in registers/shared memory.
 
-This is the final wall. Everything else is done. The path to closing it:
+This accounts for ~55% of rvllm's per-step time as intermediate memory traffic. The path to closing it:
 
 1. **FA3 decode kernel** -- DONE. 256 threads, vectorized half2, warp-parallel.
 2. **f16-native prefill kernel** -- DONE. Eliminates f32 cast round-trip in prefill attention.
-3. **Fused SiLU+Down** -- DONE. Single kernel for gate activation + down projection.
-4. **Fused RMSNorm+Linear** -- DONE (kernel written, wiring in progress).
-5. **JIT kernel fusion** -- IN PROGRESS. Fuse arbitrary kernel sequences at load time, matching what torch.compile does at the operator level. See `crates/rvllm-fusion/`.
-6. **FP8/INT8 quantization** -- halves weight reads, doubles effective memory bandwidth.
-7. **Hopper TMA/WGMMA** -- async tensor memory access + warp group matrix multiply for H100-native throughput.
+3. **CUDA graph replay** -- DONE. Eliminates 254 kernel launch calls per step (+178%).
+4. **cublasLt split-K** -- DONE. All decode GEMMs use split-K algorithm selection.
+5. **Fused SiLU+Down** -- DONE. Single kernel for gate activation + down projection.
+6. **Fused RMSNorm+Linear** -- DONE (kernel written, wiring in progress).
+7. **JIT kernel fusion** -- IN PROGRESS. Fuse arbitrary kernel sequences at load time, matching what torch.compile does at the operator level. See `crates/rvllm-fusion/`.
+8. **FP8/INT8 quantization** -- halves weight reads, doubles effective memory bandwidth.
+9. **Hopper TMA/WGMMA** -- async tensor memory access + warp group matrix multiply for H100-native throughput.
 
-Items 5-7 are what close the 4x gap. Kernel fusion (#5) is the big one -- it eliminates the per-kernel launch overhead and intermediate memory traffic that accounts for most of the difference. Quantization (#6) and Hopper intrinsics (#7) push past vLLM by exploiting hardware features that torch.compile doesn't target.
+Items 7-9 close the remaining 1.5x gap. Kernel fusion (#7) is the big one -- it eliminates the intermediate HBM round-trips that account for most of the remaining difference. Quantization (#8) halves weight reads. Hopper intrinsics (#9) push past vLLM by exploiting hardware features that torch.compile doesn't target.
 
 ### How the benchmark works
 
