@@ -112,59 +112,24 @@ fused_cute_add_norm_gateup_gemv(
     }
     __syncthreads();
 
-    // ---- Phase 2: GEMV -- rpb=8 dot products per block ----
-
-    // Compute how many rows this block actually handles (last block may have fewer)
-    const int rows_this_block = min(ROWS_PER_BLOCK, gate_up_dim - block_row_base);
-
-    // Each thread accumulates rpb=8 dot products
-    float acc[ROWS_PER_BLOCK];
-    #pragma unroll
-    for (int r = 0; r < ROWS_PER_BLOCK; r++) acc[r] = 0.0f;
-
-    for (int i = tid; i < h2; i += THREADS) {
-        float sn0 = s_normed[i * 2];
-        float sn1 = s_normed[i * 2 + 1];
-        #pragma unroll
-        for (int r = 0; r < ROWS_PER_BLOCK; r++) {
-            if (r < rows_this_block) {
-                const half2* w2 = (const half2*)(proj_weight + (long long)(block_row_base + r) * hidden_size);
+    // ---- Phase 2: GEMV -- warp-per-row, 8 warps = 8 rows in parallel ----
+    {
+        const int row = block_row_base + warp_id;
+        if (row < gate_up_dim) {
+            const half2* w2 = (const half2*)(proj_weight + (long long)row * hidden_size);
+            float acc = 0.0f;
+            for (int i = lane_id; i < h2; i += 32) {
                 half2 w = w2[i];
-                acc[r] += __half2float(w.x) * sn0 + __half2float(w.y) * sn1;
+                acc += __half2float(w.x) * s_normed[i * 2] + __half2float(w.y) * s_normed[i * 2 + 1];
             }
-        }
-    }
-
-    // Handle odd hidden_size
-    if ((hidden_size & 1) && tid == 0) {
-        int last = hidden_size - 1;
-        float sn = s_normed[last];
-        #pragma unroll
-        for (int r = 0; r < ROWS_PER_BLOCK; r++) {
-            if (r < rows_this_block) {
-                const __half* w_row = proj_weight + (long long)(block_row_base + r) * hidden_size;
-                acc[r] += __half2float(w_row[last]) * sn;
+            if ((hidden_size & 1) && lane_id == 0) {
+                int last = hidden_size - 1;
+                acc += __half2float(proj_weight[row * hidden_size + last]) * s_normed[last];
             }
-        }
-    }
-
-    // Reduce each row's dot product: warp shuffle then cross-warp via shared mem
-    // Serialize across rows reusing the 8-float scratch space
-    #pragma unroll
-    for (int r = 0; r < ROWS_PER_BLOCK; r++) {
-        if (r >= rows_this_block) break;
-
-        float val = warp_reduce_sum_angv(acc[r]);
-        if (lane_id == 0) s_warp[warp_id] = val;
-        __syncthreads();
-
-        if (warp_id == 0) {
-            float v = (lane_id < NUM_WARPS) ? s_warp[lane_id] : 0.0f;
-            v = warp_reduce_sum_angv(v);
+            acc = warp_reduce_sum_angv(acc);
             if (lane_id == 0) {
-                output[block_row_base + r] = __float2half(v);
+                output[row] = __float2half(acc);
             }
         }
-        __syncthreads();
     }
 }

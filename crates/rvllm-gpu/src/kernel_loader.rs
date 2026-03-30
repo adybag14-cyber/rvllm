@@ -107,15 +107,23 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
     ),
     (
         "fused_add_norm_qkv_gemv",
-        &["fused_cute_add_norm_qkv_gemv", "fused_cute_norm_qkv_gemv"],
+        &["fused_cute_add_norm_qkv_gemv", "fused_cute_norm_qkv_gemv", "fused_cute_add_norm_qkv_bias_gemv", "fused_cute_norm_qkv_bias_gemv"],
     ),
     (
         "fused_add_norm_gateup_gemv",
         &["fused_cute_add_norm_gateup_gemv"],
     ),
     (
+        "fused_oproj_add_norm_gateup_gemv",
+        &["fused_cute_oproj_add_norm_gateup_gemv"],
+    ),
+    (
         "fused_silu_down_gemv",
         &["fused_cute_silu_down_gemv"],
+    ),
+    (
+        "persistent_layer_decode",
+        &["persistent_layer_decode_f16"],
     ),
     ("gemv_f16", &["gemv_f16_kernel", "gemv_batched_f16_kernel"]),
     ("rms_norm", &["rms_norm_kernel"]),
