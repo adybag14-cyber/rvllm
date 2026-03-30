@@ -818,6 +818,155 @@ impl CudaFP8CacheEngine {
         Ok(())
     }
 
+    /// Quantize specific blocks from an f16 cache into this FP8 cache.
+    ///
+    /// Reads the given block indices from `f16_key_cache`/`f16_value_cache`,
+    /// quantizes to FP8 E4M3 with per-head scaling, and writes into the
+    /// corresponding GPU-resident FP8 buffers for `layer`.
+    pub fn quantize_f16_to_fp8(
+        &mut self,
+        layer: usize,
+        block_indices: &[usize],
+        f16_key_cache: &CudaSlice<f16>,
+        f16_value_cache: &CudaSlice<f16>,
+    ) -> Result<()> {
+        if block_indices.is_empty() {
+            return Ok(());
+        }
+
+        let head_stride = self.num_heads * self.head_dim;
+        let depb = self.data_elements_per_block();
+        let sepb = self.scale_elements_per_block();
+
+        let key_f16 = self.stream.clone_dtoh(f16_key_cache)
+            .map_err(|e| LLMError::GpuError(format!("fp8 quant dtoh key: {e}")))?;
+        let val_f16 = self.stream.clone_dtoh(f16_value_cache)
+            .map_err(|e| LLMError::GpuError(format!("fp8 quant dtoh val: {e}")))?;
+
+        let (kd_gpu, vd_gpu) = &mut self.gpu_cache_data[layer];
+        let (ks_gpu, vs_gpu) = &mut self.gpu_cache_scales[layer];
+
+        let mut kd = self.stream.clone_dtoh(kd_gpu)
+            .map_err(|e| LLMError::GpuError(format!("fp8 quant dtoh kd: {e}")))?;
+        let mut vd = self.stream.clone_dtoh(vd_gpu)
+            .map_err(|e| LLMError::GpuError(format!("fp8 quant dtoh vd: {e}")))?;
+        let mut ks = self.stream.clone_dtoh(ks_gpu)
+            .map_err(|e| LLMError::GpuError(format!("fp8 quant dtoh ks: {e}")))?;
+        let mut vs = self.stream.clone_dtoh(vs_gpu)
+            .map_err(|e| LLMError::GpuError(format!("fp8 quant dtoh vs: {e}")))?;
+
+        for &bidx in block_indices {
+            let f16_off = bidx * depb;
+            let fp8_data_off = bidx * depb;
+            let fp8_scale_off = bidx * sepb;
+
+            for tok in 0..self.block_size {
+                let src = f16_off + tok * head_stride;
+                let dst_d = fp8_data_off + tok * head_stride;
+                let dst_s = fp8_scale_off + tok * self.num_heads;
+
+                let kf32: Vec<f32> = key_f16[src..src + head_stride]
+                    .iter().map(|v| v.to_f32()).collect();
+                let vf32: Vec<f32> = val_f16[src..src + head_stride]
+                    .iter().map(|v| v.to_f32()).collect();
+
+                let (kq, ksc) = crate::fp8_cache::quantize_heads(&kf32, self.num_heads, self.head_dim);
+                let (vq, vsc) = crate::fp8_cache::quantize_heads(&vf32, self.num_heads, self.head_dim);
+
+                kd[dst_d..dst_d + head_stride].copy_from_slice(&kq);
+                vd[dst_d..dst_d + head_stride].copy_from_slice(&vq);
+                ks[dst_s..dst_s + self.num_heads].copy_from_slice(&ksc);
+                vs[dst_s..dst_s + self.num_heads].copy_from_slice(&vsc);
+            }
+        }
+
+        self.stream.memcpy_htod(&kd, kd_gpu)
+            .map_err(|e| LLMError::GpuError(format!("fp8 quant htod kd: {e}")))?;
+        self.stream.memcpy_htod(&vd, vd_gpu)
+            .map_err(|e| LLMError::GpuError(format!("fp8 quant htod vd: {e}")))?;
+        self.stream.memcpy_htod(&ks, ks_gpu)
+            .map_err(|e| LLMError::GpuError(format!("fp8 quant htod ks: {e}")))?;
+        self.stream.memcpy_htod(&vs, vs_gpu)
+            .map_err(|e| LLMError::GpuError(format!("fp8 quant htod vs: {e}")))?;
+
+        debug!(layer, blocks = block_indices.len(), "quantize_f16_to_fp8 complete");
+        Ok(())
+    }
+
+    /// Dequantize FP8 blocks back into an f16 cache for attention.
+    ///
+    /// Reads the given block indices from this FP8 engine, dequantizes to f16,
+    /// and writes directly into `f16_key_cache`/`f16_value_cache` at the
+    /// corresponding block offsets.
+    pub fn dequantize_blocks_to_f16_cache(
+        &self,
+        layer: usize,
+        block_indices: &[usize],
+        f16_key_cache: &mut CudaSlice<f16>,
+        f16_value_cache: &mut CudaSlice<f16>,
+    ) -> Result<()> {
+        if block_indices.is_empty() {
+            return Ok(());
+        }
+
+        let head_stride = self.num_heads * self.head_dim;
+        let depb = self.data_elements_per_block();
+        let sepb = self.scale_elements_per_block();
+
+        let (kd_gpu, vd_gpu) = &self.gpu_cache_data[layer];
+        let (ks_gpu, vs_gpu) = &self.gpu_cache_scales[layer];
+
+        let kd = self.stream.clone_dtoh(kd_gpu)
+            .map_err(|e| LLMError::GpuError(format!("fp8 deq2cache dtoh kd: {e}")))?;
+        let vd = self.stream.clone_dtoh(vd_gpu)
+            .map_err(|e| LLMError::GpuError(format!("fp8 deq2cache dtoh vd: {e}")))?;
+        let ksc = self.stream.clone_dtoh(ks_gpu)
+            .map_err(|e| LLMError::GpuError(format!("fp8 deq2cache dtoh ks: {e}")))?;
+        let vsc = self.stream.clone_dtoh(vs_gpu)
+            .map_err(|e| LLMError::GpuError(format!("fp8 deq2cache dtoh vs: {e}")))?;
+
+        let mut key_host = self.stream.clone_dtoh(f16_key_cache)
+            .map_err(|e| LLMError::GpuError(format!("fp8 deq2cache dtoh f16 key: {e}")))?;
+        let mut val_host = self.stream.clone_dtoh(f16_value_cache)
+            .map_err(|e| LLMError::GpuError(format!("fp8 deq2cache dtoh f16 val: {e}")))?;
+
+        for &bidx in block_indices {
+            let data_off = bidx * depb;
+            let scale_off = bidx * sepb;
+            let f16_off = bidx * depb;
+
+            for tok in 0..self.block_size {
+                let td = data_off + tok * head_stride;
+                let ts = scale_off + tok * self.num_heads;
+                let out = f16_off + tok * head_stride;
+
+                let kf32 = crate::fp8_cache::dequantize_heads(
+                    &kd[td..td + head_stride],
+                    &ksc[ts..ts + self.num_heads],
+                    self.num_heads, self.head_dim,
+                );
+                let vf32 = crate::fp8_cache::dequantize_heads(
+                    &vd[td..td + head_stride],
+                    &vsc[ts..ts + self.num_heads],
+                    self.num_heads, self.head_dim,
+                );
+
+                for i in 0..head_stride {
+                    key_host[out + i] = f16::from_f32(kf32[i]);
+                    val_host[out + i] = f16::from_f32(vf32[i]);
+                }
+            }
+        }
+
+        self.stream.memcpy_htod(&key_host, f16_key_cache)
+            .map_err(|e| LLMError::GpuError(format!("fp8 deq2cache htod key: {e}")))?;
+        self.stream.memcpy_htod(&val_host, f16_value_cache)
+            .map_err(|e| LLMError::GpuError(format!("fp8 deq2cache htod val: {e}")))?;
+
+        debug!(layer, blocks = block_indices.len(), "dequantize_blocks_to_f16_cache complete");
+        Ok(())
+    }
+
     /// Maximum FP8 blocks that fit in `available_bytes`.
     pub fn max_blocks_for_memory(
         num_layers: usize,

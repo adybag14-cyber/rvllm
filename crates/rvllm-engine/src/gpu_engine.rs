@@ -24,7 +24,7 @@ mod inner {
     use rvllm_tokenizer::Tokenizer;
     use rvllm_worker::gpu_worker::{GpuWorker, GpuWorkerOutput};
 
-    use rvllm_speculative::{SpeculativeConfig, SpeculativeEngine, TargetModel};
+    use rvllm_speculative::{SelfDraftModel, SpeculativeConfig, SpeculativeEngine, TargetModel};
 
     use crate::hf_snapshot;
     use crate::output::{OutputProcessor, SequenceOutputState};
@@ -1255,8 +1255,76 @@ mod inner {
                 .unwrap_or(3)
         }
 
+        /// Get the number of draft layers from env or default to num_layers / 4.
+        fn speculative_draft_layers(total_layers: usize) -> usize {
+            std::env::var("RVLLM_SPECULATIVE_DRAFT_LAYERS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(total_layers / 4)
+        }
+
+        /// Whether to use self-draft (no separate model).
+        fn speculative_self_draft() -> bool {
+            std::env::var("RVLLM_SPECULATIVE_SELF_DRAFT").map_or(false, |v| v == "1")
+                || Self::speculative_draft_model().is_none()
+        }
+
+        /// Build a SelfDraftModel that calls partial forward on the GPU worker.
+        ///
+        /// SAFETY: The returned model holds a raw pointer to the worker.
+        /// Caller must ensure the worker outlives the draft model and that
+        /// no other mutable access occurs concurrently.
+        unsafe fn build_self_draft(
+            worker: &mut GpuWorker,
+            vocab_size: usize,
+            block_size: usize,
+            num_draft_layers: usize,
+        ) -> Box<dyn rvllm_speculative::DraftModel> {
+            let worker_ptr = worker as *mut GpuWorker;
+
+            let partial_fn: rvllm_speculative::self_draft::PartialForwardFn =
+                Box::new(move |tokens: &[TokenId], max_layers: usize| {
+                    let w = unsafe { &mut *worker_ptr };
+
+                    let seq_id = SequenceId(u64::MAX - 2);
+                    let request_id = RequestId(u64::MAX - 2);
+
+                    let mut seq_data_map = HashMap::new();
+                    seq_data_map.insert(
+                        seq_id,
+                        SequenceData {
+                            prompt_token_ids: tokens.to_vec(),
+                            output_token_ids: Vec::new(),
+                            cumulative_logprob: 0.0,
+                        },
+                    );
+
+                    let needed_blocks = (tokens.len() + block_size - 1) / block_size;
+                    let block_table: Vec<BlockId> =
+                        (0..needed_blocks as u32).map(BlockId).collect();
+                    let mut block_tables = HashMap::new();
+                    block_tables.insert(seq_id, block_table);
+
+                    let metadata = vec![SequenceGroupMetadata {
+                        request_id,
+                        is_prompt: true,
+                        seq_data: seq_data_map,
+                        sampling_params: SamplingParams::default(),
+                        block_tables,
+                    }];
+
+                    w.forward_logits_partial(&metadata, max_layers)
+                });
+
+            Box::new(SelfDraftModel::new(num_draft_layers, vocab_size, partial_fn))
+        }
+
         /// Run a single request through speculative decoding.
         /// Returns the generated token IDs (excluding prompt).
+        ///
+        /// When `RVLLM_SPECULATIVE_SELF_DRAFT=1` or no draft model path is set,
+        /// uses self-draft (first N layers of the target model). Otherwise uses
+        /// the placeholder DraftModelRunner with the configured draft model path.
         pub fn generate_speculative(
             &mut self,
             prompt_tokens: &[TokenId],
@@ -1269,26 +1337,39 @@ mod inner {
                 ));
             }
 
-            let draft_path = Self::speculative_draft_model().unwrap_or_default();
             let k = Self::speculative_k();
+            let vocab_size = self.worker.vocab_size();
+            let block_size = self.config.cache.block_size;
+            let use_self_draft = Self::speculative_self_draft();
+            let total_layers = self.worker.num_layers();
+            let draft_layers = Self::speculative_draft_layers(total_layers);
 
             info!(
-                draft_model = %draft_path,
                 k,
                 max_tokens,
                 prompt_len = prompt_tokens.len(),
+                self_draft = use_self_draft,
+                draft_layers,
                 "starting speculative decoding"
             );
 
-            let spec_config = SpeculativeConfig::new(draft_path, k);
-            let vocab_size = self.worker.vocab_size();
-            let block_size = self.config.cache.block_size;
+            // Build draft model.
+            let draft: Box<dyn rvllm_speculative::DraftModel> = if use_self_draft {
+                // SAFETY: see build_self_draft docs.
+                unsafe { Self::build_self_draft(&mut self.worker, vocab_size, block_size, draft_layers) }
+            } else {
+                let draft_path = Self::speculative_draft_model().unwrap_or_default();
+                let cfg = SpeculativeConfig::new(draft_path, k);
+                Box::new(rvllm_speculative::DraftModelRunner::new(cfg)?)
+            };
+
+            let spec_config = SpeculativeConfig::new("self-draft".into(), k);
 
             // SAFETY: GpuTargetModel borrows worker mutably via raw pointer.
             // We don't access self.worker while the SpeculativeEngine is alive.
             let target = unsafe { GpuTargetModel::new(&mut self.worker, vocab_size, block_size) };
 
-            let mut spec_engine = SpeculativeEngine::new(spec_config, target)?;
+            let mut spec_engine = SpeculativeEngine::with_draft(spec_config, target, draft)?;
 
             let output_tokens =
                 spec_engine.generate(prompt_tokens, max_tokens, |tok| tok == eos_token_id)?;
@@ -1305,8 +1386,163 @@ mod inner {
 
             Ok(output_tokens)
         }
+
+        /// Benchmark speculative decoding with self-draft vs standard decode.
+        ///
+        /// Runs both paths on the same prompt and reports comparative metrics.
+        /// Set RVLLM_SPECULATIVE=1 before calling.
+        pub fn benchmark_speculative(
+            &mut self,
+            prompt_tokens: &[TokenId],
+            max_tokens: usize,
+            eos_token_id: TokenId,
+        ) -> Result<SpeculativeBenchResult> {
+            let k = Self::speculative_k();
+            let vocab_size = self.worker.vocab_size();
+            let block_size = self.config.cache.block_size;
+            let total_layers = self.worker.num_layers();
+            let draft_layers = Self::speculative_draft_layers(total_layers);
+
+            info!(
+                k,
+                draft_layers,
+                total_layers,
+                max_tokens,
+                "benchmarking speculative decoding"
+            );
+
+            // --- Standard decode baseline ---
+            let std_start = Instant::now();
+            let std_tokens = self.generate_standard(prompt_tokens, max_tokens, eos_token_id)?;
+            let std_elapsed = std_start.elapsed();
+            let std_tok_per_sec = std_tokens.len() as f64 / std_elapsed.as_secs_f64();
+
+            // --- Speculative decode ---
+            let spec_config = SpeculativeConfig::new("self-draft".into(), k);
+            let draft = unsafe {
+                Self::build_self_draft(&mut self.worker, vocab_size, block_size, draft_layers)
+            };
+            let target = unsafe { GpuTargetModel::new(&mut self.worker, vocab_size, block_size) };
+            let mut spec_engine = SpeculativeEngine::with_draft(spec_config, target, draft)?;
+
+            let spec_start = Instant::now();
+            let spec_tokens =
+                spec_engine.generate(prompt_tokens, max_tokens, |tok| tok == eos_token_id)?;
+            let spec_elapsed = spec_start.elapsed();
+            let spec_tok_per_sec = spec_tokens.len() as f64 / spec_elapsed.as_secs_f64();
+
+            let metrics = spec_engine.metrics().clone();
+
+            let result = SpeculativeBenchResult {
+                standard_tokens: std_tokens.len(),
+                standard_elapsed_ms: std_elapsed.as_millis() as u64,
+                standard_tok_per_sec: std_tok_per_sec,
+                speculative_tokens: spec_tokens.len(),
+                speculative_elapsed_ms: spec_elapsed.as_millis() as u64,
+                speculative_tok_per_sec: spec_tok_per_sec,
+                acceptance_rate: metrics.acceptance_rate(),
+                speedup_ratio: metrics.speedup_ratio(),
+                draft_layers,
+                k,
+                wall_clock_speedup: spec_tok_per_sec / std_tok_per_sec.max(1e-9),
+            };
+
+            info!(
+                std_tps = %format!("{:.1}", result.standard_tok_per_sec),
+                spec_tps = %format!("{:.1}", result.speculative_tok_per_sec),
+                accept = %format!("{:.1}%", result.acceptance_rate * 100.0),
+                speedup = %format!("{:.2}x", result.wall_clock_speedup),
+                "speculative benchmark complete"
+            );
+
+            Ok(result)
+        }
+
+        /// Simple autoregressive decode loop (no speculation) for benchmarking baseline.
+        fn generate_standard(
+            &mut self,
+            prompt_tokens: &[TokenId],
+            max_tokens: usize,
+            eos_token_id: TokenId,
+        ) -> Result<Vec<TokenId>> {
+            let vocab_size = self.worker.vocab_size();
+            let block_size = self.config.cache.block_size;
+            let mut context = prompt_tokens.to_vec();
+            let mut output = Vec::with_capacity(max_tokens);
+
+            for _ in 0..max_tokens {
+                let seq_id = SequenceId(u64::MAX - 3);
+                let request_id = RequestId(u64::MAX - 3);
+
+                let mut seq_data_map = HashMap::new();
+                seq_data_map.insert(
+                    seq_id,
+                    SequenceData {
+                        prompt_token_ids: context.clone(),
+                        output_token_ids: Vec::new(),
+                        cumulative_logprob: 0.0,
+                    },
+                );
+
+                let needed_blocks = (context.len() + block_size - 1) / block_size;
+                let block_table: Vec<BlockId> =
+                    (0..needed_blocks as u32).map(BlockId).collect();
+                let mut block_tables = HashMap::new();
+                block_tables.insert(seq_id, block_table);
+
+                let metadata = vec![SequenceGroupMetadata {
+                    request_id,
+                    is_prompt: true,
+                    seq_data: seq_data_map,
+                    sampling_params: SamplingParams::default(),
+                    block_tables,
+                }];
+
+                let logits = self.worker.forward_logits(&metadata)?;
+                let num_tokens = context.len();
+                let offset = (num_tokens - 1) * vocab_size;
+                if logits.len() < offset + vocab_size {
+                    break;
+                }
+                let token_logits = &logits[offset..offset + vocab_size];
+
+                // Greedy argmax
+                let mut best_tok = 0u32;
+                let mut best_val = f32::NEG_INFINITY;
+                for (i, &v) in token_logits.iter().enumerate() {
+                    if v > best_val {
+                        best_val = v;
+                        best_tok = i as u32;
+                    }
+                }
+
+                output.push(best_tok);
+                context.push(best_tok);
+                if best_tok == eos_token_id {
+                    break;
+                }
+            }
+
+            Ok(output)
+        }
+    }
+
+    /// Results from benchmarking speculative vs standard decode.
+    #[derive(Debug, Clone)]
+    pub struct SpeculativeBenchResult {
+        pub standard_tokens: usize,
+        pub standard_elapsed_ms: u64,
+        pub standard_tok_per_sec: f64,
+        pub speculative_tokens: usize,
+        pub speculative_elapsed_ms: u64,
+        pub speculative_tok_per_sec: f64,
+        pub acceptance_rate: f64,
+        pub speedup_ratio: f64,
+        pub draft_layers: usize,
+        pub k: usize,
+        pub wall_clock_speedup: f64,
     }
 }
 
 #[cfg(feature = "cuda")]
-pub use inner::{AbortQueue, GpuLLMEngine, GpuTargetModel, PendingRequest, RequestQueue};
+pub use inner::{AbortQueue, GpuLLMEngine, GpuTargetModel, PendingRequest, RequestQueue, SpeculativeBenchResult};

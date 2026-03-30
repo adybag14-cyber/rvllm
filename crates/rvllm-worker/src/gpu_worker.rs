@@ -1016,6 +1016,100 @@ impl GpuWorker {
         self.fp8_cache_engine.as_mut()
     }
 
+    /// FP8 pre-forward: dequantize FP8 cache blocks to f16 cache for attention reads.
+    ///
+    /// Collects unique block indices from the attention metadata's block_tables
+    /// and restores them from the FP8 shadow cache into the runner's f16 cache.
+    #[cfg(feature = "cuda")]
+    fn fp8_pre_forward_dequantize(&mut self, model_input: &ModelInput) -> Result<()> {
+        let fp8_engine = match self.fp8_cache_engine.as_ref() {
+            Some(e) => e,
+            None => return Ok(()),
+        };
+        let runner = match self.gpu_model_runner.as_mut() {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+
+        // Collect unique block indices from block_tables
+        let mut block_set = std::collections::HashSet::new();
+        for table in &model_input.attention_metadata.block_tables {
+            for &block_id in table {
+                block_set.insert(block_id as usize);
+            }
+        }
+        let block_indices: Vec<usize> = block_set.into_iter().collect();
+
+        if block_indices.is_empty() {
+            return Ok(());
+        }
+
+        let num_layers = fp8_engine.num_layers();
+        let cache = runner.cache_mut();
+        for layer in 0..num_layers {
+            let (key_cache, value_cache) = &mut cache.gpu_cache_mut()[layer];
+            fp8_engine.dequantize_blocks_to_f16_cache(
+                layer,
+                &block_indices,
+                key_cache,
+                value_cache,
+            )?;
+        }
+
+        trace!(blocks = block_indices.len(), "FP8 pre-forward dequantize complete");
+        Ok(())
+    }
+
+    /// FP8 post-forward: quantize newly written f16 cache blocks to FP8 shadow.
+    ///
+    /// Derives the written block indices from slot_mapping and stores them
+    /// compressed in the FP8 engine.
+    #[cfg(feature = "cuda")]
+    fn fp8_post_forward_quantize(&mut self, model_input: &ModelInput) -> Result<()> {
+        let fp8_engine = match self.fp8_cache_engine.as_mut() {
+            Some(e) => e,
+            None => return Ok(()),
+        };
+        let runner = match self.gpu_model_runner.as_ref() {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+
+        let block_size = self.config.block_size;
+        let mut block_set = std::collections::HashSet::new();
+        for &slot in &model_input.attention_metadata.slot_mapping {
+            let block_idx = slot as usize / block_size;
+            block_set.insert(block_idx);
+        }
+        // Also include blocks from block_tables (they were read and may have
+        // been updated by reshape_and_cache during the forward pass).
+        for table in &model_input.attention_metadata.block_tables {
+            for &block_id in table {
+                block_set.insert(block_id as usize);
+            }
+        }
+        let block_indices: Vec<usize> = block_set.into_iter().collect();
+
+        if block_indices.is_empty() {
+            return Ok(());
+        }
+
+        let num_layers = fp8_engine.num_layers();
+        let cache = runner.cache();
+        for layer in 0..num_layers {
+            let (key_cache, value_cache) = &cache.gpu_cache()[layer];
+            fp8_engine.quantize_f16_to_fp8(
+                layer,
+                &block_indices,
+                key_cache,
+                value_cache,
+            )?;
+        }
+
+        trace!(blocks = block_indices.len(), "FP8 post-forward quantize complete");
+        Ok(())
+    }
+
     /// Vocabulary size of the loaded model.
     pub fn vocab_size(&self) -> usize {
         self.vocab_size
@@ -1339,41 +1433,65 @@ impl GpuWorker {
     ) -> Result<ForwardOutput> {
         self.forward_count += 1;
 
+        // FP8 KV pre-forward: dequantize FP8 blocks back to f16 cache so
+        // the attention kernel reads correct data.
+        #[cfg(feature = "cuda")]
+        if self.use_fp8_kv {
+            self.fp8_pre_forward_dequantize(model_input)?;
+        }
+
         // Use graphs for any pure decode step (all query_lens == 1).
         // Sampling params don't matter -- graphs capture the forward pass
         // (GEMMs, attention, norms), not the sampling/logit processing.
         let is_decode = !model_input.is_prefill
             && model_input.attention_metadata.query_lens.iter().all(|&q| q == 1);
 
-        if !is_decode || !self.graph_runner.is_enabled() {
-            return self.raw_gpu_forward_ex(model_input, greedy_only);
-        }
+        let result = if !is_decode || !self.graph_runner.is_enabled() {
+            self.raw_gpu_forward_ex(model_input, greedy_only)
+        } else {
+            #[cfg(feature = "cuda")]
+            {
+                let batch = model_input.num_tokens();
+                let padded = Self::padded_batch_size(batch);
 
-        #[cfg(feature = "cuda")]
-        {
-            let batch = model_input.num_tokens();
-            let padded = Self::padded_batch_size(batch);
-
-            // 1. Check for padded graph (hot path)
-            if self.graph_runner.has_graph_for_exact(padded) {
-                return self.gpu_forward_ex_graphed_padded(model_input, batch, padded, greedy_only);
+                // 1. Check for padded graph (hot path)
+                if self.graph_runner.has_graph_for_exact(padded) {
+                    self.gpu_forward_ex_graphed_padded(model_input, batch, padded, greedy_only)
+                } else if self.forward_count > Self::GRAPH_WARMUP_CALLS
+                    && !self.graph_runner.was_capture_attempted(padded)
+                {
+                    // 2. Past warmup? Capture a graph for this padded batch size
+                    match self.try_capture_graph_padded(model_input, batch, padded, greedy_only) {
+                        Ok(output) => Ok(output),
+                        Err(e) => {
+                            warn!(padded, "graph capture failed, raw forward: {e}");
+                            self.raw_gpu_forward_ex(model_input, greedy_only)
+                        }
+                    }
+                } else {
+                    // 3. Fallback: raw forward (pre-warmup or capture failure)
+                    self.raw_gpu_forward_ex(model_input, greedy_only)
+                }
             }
 
-            // 2. Past warmup? Capture a graph for this padded batch size
-            if self.forward_count > Self::GRAPH_WARMUP_CALLS
-                && !self.graph_runner.was_capture_attempted(padded)
+            #[cfg(not(feature = "cuda"))]
             {
-                match self.try_capture_graph_padded(model_input, batch, padded, greedy_only) {
-                    Ok(output) => return Ok(output),
-                    Err(e) => {
-                        warn!(padded, "graph capture failed, raw forward: {e}");
-                    }
+                self.raw_gpu_forward_ex(model_input, greedy_only)
+            }
+        };
+
+        // FP8 KV post-forward: quantize newly written f16 cache blocks to FP8.
+        // Errors here are non-fatal (the f16 cache is still correct for this step).
+        #[cfg(feature = "cuda")]
+        if self.use_fp8_kv {
+            if result.is_ok() {
+                if let Err(e) = self.fp8_post_forward_quantize(model_input) {
+                    warn!("FP8 post-forward quantize failed (non-fatal): {e}");
                 }
             }
         }
 
-        // 3. Fallback: raw forward (pre-warmup or capture failure)
-        self.raw_gpu_forward_ex(model_input, greedy_only)
+        result
     }
 
     /// Replay a captured graph for a padded batch size, return only actual_batch results.

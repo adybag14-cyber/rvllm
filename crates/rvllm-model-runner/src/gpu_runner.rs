@@ -692,6 +692,92 @@ mod cuda_impl {
             Ok(ForwardOutput::Logits(logits_cpu))
         }
 
+        /// Partial forward: run only the first `max_layers` transformer layers,
+        /// then apply final RMSNorm + LM head to produce logits.
+        /// Used by self-draft speculative decoding to get approximate predictions
+        /// from a fraction of the model's depth.
+        pub fn forward_partial(
+            &self,
+            token_ids: &[u32],
+            positions: &[u32],
+            attn_meta: &crate::bridge::AttentionMetadata,
+            is_prefill: bool,
+            max_layers: usize,
+        ) -> Result<Vec<f32>> {
+            let num_tokens = token_ids.len();
+            let hidden_size = self.config.hidden_size;
+            let vocab_size = self.config.vocab_size;
+            let block_size = self.cache.block_size();
+
+            if num_tokens == 0 {
+                return Err(LLMError::ModelError("empty input".into()));
+            }
+
+            self.upload_metadata(token_ids, positions, attn_meta)?;
+
+            let mut hidden_f16 = self.embedding_lookup_from_meta(num_tokens)?;
+
+            let gpu_cache = self.cache.gpu_cache();
+            let meta_packed = self.meta_packed.borrow();
+            let packed_buf = meta_packed.slice();
+            let offsets = self.meta_packed_offsets.get();
+            let num_seqs = attn_meta.context_lens.len();
+            let max_context_len = attn_meta.max_context_len;
+            let layers_to_run = max_layers.min(self.layers.len());
+            let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
+
+            for (layer_idx, layer) in self.layers.iter().take(layers_to_run).enumerate() {
+                let (key_cache, value_cache) = &gpu_cache[layer_idx];
+                let input = GpuLayerInput {
+                    hidden_states: &hidden_f16,
+                    positions: packed_buf.slice(offsets.positions..offsets.positions + offsets.num_positions),
+                    key_cache,
+                    value_cache,
+                    block_tables: packed_buf.slice(offsets.block_tables..offsets.block_tables + offsets.num_block_tables),
+                    context_lens: packed_buf.slice(offsets.context_lens..offsets.context_lens + offsets.num_context_lens),
+                    slot_mapping: packed_buf.slice(offsets.slot_mapping..offsets.slot_mapping + offsets.num_slot_mapping),
+                    num_tokens,
+                    num_seqs,
+                    max_context_len,
+                    block_size,
+                    is_prefill,
+                    seq_start_pos: packed_buf.slice(offsets.seq_start_pos..offsets.seq_start_pos + offsets.num_seq_start_pos),
+                    rope_cos: &self.rope_cos,
+                    rope_sin: &self.rope_sin,
+                    fp8_input_scratch_ptr: self.fp8_input_scratch.as_ref().map_or(0u64, |s| {
+                        let (p, _) = DevicePtr::device_ptr(s, &self.stream);
+                        p
+                    }),
+                    fp8_input_scratch_len: self.fp8_input_scratch.as_ref().map_or(0, |s| s.len()),
+                };
+                let weights = self.layer_weights(layer_idx)?;
+                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref())?;
+                hidden_f16 = residual;
+                prev_mlp_out = Some(mlp_out);
+            }
+
+            // Final norm + LM head (same as full forward)
+            let normed_f16 = if let Some(ref last_mlp) = prev_mlp_out {
+                let (n, _) = GpuTransformerLayer::fused_residual_rmsnorm_f16(
+                    &self.stream, &self.loader,
+                    &hidden_f16, last_mlp, &self.final_norm_weight,
+                    self.rms_norm_eps, num_tokens, hidden_size,
+                )?;
+                n
+            } else {
+                self.rms_norm_f16_runner(&hidden_f16, &self.final_norm_weight, hidden_size)?
+            };
+
+            let logits_gpu = CudaLinearLayer::forward_f16_in(
+                &normed_f16, &self.lm_head_weight, num_tokens, vocab_size, hidden_size,
+                &self.blas,
+            )?;
+
+            let logits_cpu = self.stream.clone_dtoh(&logits_gpu)
+                .map_err(|e| LLMError::GpuError(format!("forward_partial logits DtoH: {e}")))?;
+            Ok(logits_cpu)
+        }
+
         /// Upload all per-step metadata into persistent GPU buffers.
         ///
         /// This MUST be called before `forward_graph_body` (or before replaying
@@ -1553,6 +1639,19 @@ mod mock_impl {
         }
 
         pub fn read_graph_output_async(&self, _dst: &mut [i32]) -> Result<()> {
+            Err(LLMError::GpuError(
+                "GpuModelRunner requires the `cuda` feature".into(),
+            ))
+        }
+
+        pub fn forward_partial(
+            &self,
+            _token_ids: &[u32],
+            _positions: &[u32],
+            _attn_meta: &crate::bridge::AttentionMetadata,
+            _is_prefill: bool,
+            _max_layers: usize,
+        ) -> Result<Vec<f32>> {
             Err(LLMError::GpuError(
                 "GpuModelRunner requires the `cuda` feature".into(),
             ))

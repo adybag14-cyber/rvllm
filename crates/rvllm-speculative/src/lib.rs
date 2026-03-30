@@ -19,10 +19,12 @@ pub mod config;
 pub mod draft;
 pub mod engine;
 pub mod scheduler;
+pub mod self_draft;
 pub mod verification;
 
 pub use config::SpeculativeConfig;
 pub use draft::{DraftModel, DraftModelRunner, DraftToken};
 pub use engine::{SpeculativeEngine, SpeculativeMetrics, TargetModel};
 pub use scheduler::{SpeculativeScheduler, SpeculativeStep};
+pub use self_draft::SelfDraftModel;
 pub use verification::{verify_tokens, verify_tokens_with_rng, VerificationResult};
