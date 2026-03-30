@@ -178,8 +178,8 @@ impl CublasAutotuner {
 
             // Row-major: C[m,n] = A[m,k] @ B[n,k]^T
             // cublasLt col-major: C_col[n,m] = B_col[k,n]^T @ A_col[k,m]
-            let trans_a = lt_sys::cublasOperation_t::CUBLAS_OP_T;
-            let trans_b = lt_sys::cublasOperation_t::CUBLAS_OP_N;
+            let trans_a = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T;
+            let trans_b = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
             lt_sys::cublasLtMatmulDescSetAttribute(
                 desc.0,
                 lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,

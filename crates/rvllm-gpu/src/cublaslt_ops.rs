@@ -127,8 +127,8 @@ impl CublasLtOps {
                 return Err(LLMError::GpuError(format!("hgemm_a_bt_with_algo desc create: {s:?}")));
             }
 
-            let trans_a = lt_sys::cublasOperation_t::CUBLAS_OP_T;
-            let trans_b = lt_sys::cublasOperation_t::CUBLAS_OP_N;
+            let trans_a = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T;
+            let trans_b = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
             lt_sys::cublasLtMatmulDescSetAttribute(
                 desc,
                 lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
@@ -190,10 +190,10 @@ impl CublasLtOps {
         n: usize,
         k: usize,
         alpha: f32,
-        a: &impl DevicePtr<f16>,
-        b: &impl DevicePtr<f16>,
+        a: &CudaSlice<f16>,
+        b: &CudaSlice<f16>,
         beta: f32,
-        c: &mut impl DevicePtrMut<f16>,
+        c: &mut CudaSlice<f16>,
     ) -> Result<()> {
         let cfg = MatmulConfig {
             transa: true,
@@ -283,8 +283,8 @@ impl CublasLtOps {
                 return Err(LLMError::GpuError(format!("fp8 desc create: {s:?}")));
             }
 
-            let trans_a = lt_sys::cublasOperation_t::CUBLAS_OP_T;
-            let trans_b = lt_sys::cublasOperation_t::CUBLAS_OP_N;
+            let trans_a = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T;
+            let trans_b = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
             lt_sys::cublasLtMatmulDescSetAttribute(desc, lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA, &trans_a as *const _ as *const c_void, std::mem::size_of_val(&trans_a));
             lt_sys::cublasLtMatmulDescSetAttribute(desc, lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB, &trans_b as *const _ as *const c_void, std::mem::size_of_val(&trans_b));
 
