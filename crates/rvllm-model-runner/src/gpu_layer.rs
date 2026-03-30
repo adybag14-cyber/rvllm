@@ -709,7 +709,7 @@ mod inner {
             }
 
             // ================================================================
-            // T>1 PREFILL: unfused path (cuBLAS GEMMs, separate kernels)
+            // T>1 BATCHED DECODE / PREFILL: cuBLAS GEMMs
             // ================================================================
 
             // 1. Pre-attention RMSNorm
@@ -725,80 +725,43 @@ mod inner {
             };
             let residual_ref = fused_residual.as_ref().unwrap_or(hidden_f16);
 
-            // 2. QKV projections
-            // Fused GEMM [N, hidden] x [hidden, qkv_dim]^T + transpose for all N
-            // Fallback: 3 separate GEMMs when fused weight unavailable
-            let mut qkv = if let Some(fused_qkv) = weights.fused_qkv {
-                let qkv_interleaved = Self::hgemm_dispatch(&self.stream, blas, lt, &normed, fused_qkv, num_tokens, qkv_dim, hidden, &self.loader)?;
-                if let Ok(transpose_fn) = self.loader.get_func("qkv_transpose", "qkv_transpose_f16_kernel") {
-                    let mut qkv_transposed = unsafe { self.stream.alloc::<f16>(num_tokens * qkv_dim) }
-                        .map_err(|e| LLMError::GpuError(format!("qkv transpose alloc: {e}")))?;
-                    let total = (num_tokens * qkv_dim) as u32;
-                    let cfg = LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
-                    unsafe {
-                        self.stream.launch_builder(&transpose_fn)
-                            .arg(&mut qkv_transposed).arg(&qkv_interleaved)
-                            .arg(&(num_tokens as i32)).arg(&(q_dim as i32)).arg(&(kv_dim as i32))
-                            .launch(cfg)
-                            .map_err(|e| LLMError::GpuError(format!("qkv transpose: {e}")))?;
-                    }
-                    qkv_transposed
-                } else {
-                    let mut qkv_buf = unsafe { self.stream.alloc::<f16>(num_tokens * qkv_dim) }
-                        .map_err(|e| LLMError::GpuError(format!("qkv alloc: {e}")))?;
-                    let q_end_t = num_tokens * q_dim;
-                    let k_end_t = q_end_t + num_tokens * kv_dim;
-                    { let mut d = qkv_buf.slice_mut(..q_end_t); Self::hgemm_dispatch_into(blas, lt, &normed, weights.q_proj, num_tokens, q_dim, hidden, &mut d)?; }
-                    { let mut d = qkv_buf.slice_mut(q_end_t..k_end_t); Self::hgemm_dispatch_into(blas, lt, &normed, weights.k_proj, num_tokens, kv_dim, hidden, &mut d)?; }
-                    { let mut d = qkv_buf.slice_mut(k_end_t..); Self::hgemm_dispatch_into(blas, lt, &normed, weights.v_proj, num_tokens, kv_dim, hidden, &mut d)?; }
-                    qkv_buf
-                }
-            } else {
+            // 2. QKV: 3 separate GEMMs into contiguous [Q|K|V] buffer (no transpose needed)
+            // This is faster than fused GEMM + transpose for batched decode because:
+            // - cuBLAS M>1 GEMM uses tensor cores efficiently
+            // - No extra transpose kernel
+            // - Each GEMM writes directly to its slice
+            let mut qkv = {
                 let mut qkv_buf = unsafe { self.stream.alloc::<f16>(num_tokens * qkv_dim) }
                     .map_err(|e| LLMError::GpuError(format!("qkv alloc: {e}")))?;
                 let q_end_t = num_tokens * q_dim;
                 let k_end_t = q_end_t + num_tokens * kv_dim;
-                { let mut d = qkv_buf.slice_mut(..q_end_t); Self::hgemm_dispatch_into(blas, lt, &normed, weights.q_proj, num_tokens, q_dim, hidden, &mut d)?; }
-                { let mut d = qkv_buf.slice_mut(q_end_t..k_end_t); Self::hgemm_dispatch_into(blas, lt, &normed, weights.k_proj, num_tokens, kv_dim, hidden, &mut d)?; }
-                { let mut d = qkv_buf.slice_mut(k_end_t..); Self::hgemm_dispatch_into(blas, lt, &normed, weights.v_proj, num_tokens, kv_dim, hidden, &mut d)?; }
+                if let Some(fused_qkv) = weights.fused_qkv {
+                    // Single fused GEMM [N, qkv_dim] -- weight is [Q;K;V] concatenated
+                    // Output is already [Q|K|V] contiguous, no transpose needed
+                    Self::hgemm_dispatch_into(blas, lt, &normed, fused_qkv, num_tokens, qkv_dim, hidden, &mut qkv_buf.slice_mut(..))?;
+                } else {
+                    { let mut d = qkv_buf.slice_mut(..q_end_t); Self::hgemm_dispatch_into(blas, lt, &normed, weights.q_proj, num_tokens, q_dim, hidden, &mut d)?; }
+                    { let mut d = qkv_buf.slice_mut(q_end_t..k_end_t); Self::hgemm_dispatch_into(blas, lt, &normed, weights.k_proj, num_tokens, kv_dim, hidden, &mut d)?; }
+                    { let mut d = qkv_buf.slice_mut(k_end_t..); Self::hgemm_dispatch_into(blas, lt, &normed, weights.v_proj, num_tokens, kv_dim, hidden, &mut d)?; }
+                }
                 qkv_buf
             };
 
-            // 3. QKV bias -- broadcast bias[qkv_dim] across N tokens in one kernel per section
+            // 3. QKV bias -- single broadcast kernel for all of [Q|K|V] at once
             if let Some(bias) = weights.qkv_bias {
                 if let Ok(ref bk) = self.loader.get_func("add_bias_broadcast", "add_bias_broadcast_f16_kernel") {
-                    // Q bias
-                    let mut q_view = qkv.slice_mut(..q_end);
-                    let q_bias = bias.slice(..q_dim);
-                    let q_total = (num_tokens * q_dim) as u32;
+                    // Broadcast full qkv_bias[qkv_dim] across N tokens in one kernel
+                    let total = (num_tokens * qkv_dim) as u32;
+                    let mut qkv_view = qkv.slice_mut(..num_tokens * qkv_dim);
                     unsafe {
                         self.stream.launch_builder(bk)
-                            .arg(&mut q_view).arg(&q_bias).arg(&(num_tokens as i32)).arg(&(q_dim as i32))
-                            .launch(LaunchConfig { grid_dim: ((q_total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
-                            .map_err(|e| LLMError::GpuError(format!("q bias: {e}")))?;
-                    }
-                    // K bias
-                    let mut k_view = qkv.slice_mut(q_end..k_end);
-                    let k_bias = bias.slice(q_dim..q_dim + kv_dim);
-                    let k_total = (num_tokens * kv_dim) as u32;
-                    unsafe {
-                        self.stream.launch_builder(bk)
-                            .arg(&mut k_view).arg(&k_bias).arg(&(num_tokens as i32)).arg(&(kv_dim as i32))
-                            .launch(LaunchConfig { grid_dim: ((k_total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
-                            .map_err(|e| LLMError::GpuError(format!("k bias: {e}")))?;
-                    }
-                    // V bias
-                    let mut v_view = qkv.slice_mut(k_end..);
-                    let v_bias = bias.slice(q_dim + kv_dim..qkv_dim);
-                    unsafe {
-                        self.stream.launch_builder(bk)
-                            .arg(&mut v_view).arg(&v_bias).arg(&(num_tokens as i32)).arg(&(kv_dim as i32))
-                            .launch(LaunchConfig { grid_dim: ((k_total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
-                            .map_err(|e| LLMError::GpuError(format!("v bias: {e}")))?;
+                            .arg(&mut qkv_view).arg(bias).arg(&(num_tokens as i32)).arg(&(qkv_dim as i32))
+                            .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                            .map_err(|e| LLMError::GpuError(format!("qkv bias: {e}")))?;
                     }
                 } else {
-                    // Fallback: old path
-                    { let mut v = qkv.slice_mut(..q_end); Self::add_bias_f16_view(&self.stream, &self.loader, &mut v, bias, num_tokens, q_dim)?; }
+                    let mut v = qkv.slice_mut(..q_end);
+                    Self::add_bias_f16_view(&self.stream, &self.loader, &mut v, bias, num_tokens, q_dim)?;
                 }
             }
 
