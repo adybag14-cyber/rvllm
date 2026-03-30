@@ -5,7 +5,7 @@
 //! split-K heuristics and a larger algorithm search space.
 
 use cudarc::cublaslt::{CudaBlasLT, Matmul, MatmulConfig, MatmulShared};
-use cudarc::cublaslt::sys as lt_sys;
+use crate::cublaslt_raw as lt_sys;
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use half::f16;
 use std::sync::Arc;
@@ -242,7 +242,7 @@ impl CublasLtOps {
                 output_f16_ptr as *mut c_void, layout_c,
                 &heur.algo,
                 ws_ptr as *mut c_void, ws_size,
-                self.stream.cu_stream(),
+                lt_sys::cu_stream_to_cuda_stream(self.stream.cu_stream()),
             );
 
             lt_sys::cublasLtMatmulPreferenceDestroy(pref);

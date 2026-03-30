@@ -4,7 +4,7 @@
 //! GEMM shape and cache the fastest one. This is what vLLM/torch.compile does
 //! under the hood.
 
-use cudarc::cublaslt::sys as lt_sys;
+use crate::cublaslt_raw as lt_sys;
 use cudarc::driver::sys as cu_sys;
 use cudarc::driver::{DevicePtr, DevicePtrMut};
 use std::collections::HashMap;
@@ -286,7 +286,7 @@ impl CublasAutotuner {
                         &h.algo,
                         ws_ptr as *mut c_void,
                         ws_size,
-                        cu_stream as *mut _,
+                        lt_sys::cu_stream_to_cuda_stream(cu_stream),
                     );
                     if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
                         ok = false;
@@ -319,7 +319,7 @@ impl CublasAutotuner {
                         &h.algo,
                         ws_ptr as *mut c_void,
                         ws_size,
-                        cu_stream as *mut _,
+                        lt_sys::cu_stream_to_cuda_stream(cu_stream),
                     );
                 }
                 stop_ev.record(cu_stream)?;
@@ -344,21 +344,29 @@ impl CublasAutotuner {
         }
     }
 
-    /// Autotune all GEMM shapes for Qwen2.5-7B at M=1 and M=128.
-    pub fn autotune_model(lt_ops: &CublasLtOps, dtype: GemmDtype) -> Result<Self> {
+    /// Autotune all GEMM shapes for the model at M=1 and M=128.
+    pub fn autotune_model(
+        lt_ops: &CublasLtOps,
+        dtype: GemmDtype,
+        hidden: usize,
+        q_dim: usize,
+        qkv_dim: usize,
+        intermediate: usize,
+        gate_up_dim: usize,
+    ) -> Result<Self> {
         let shapes: &[(usize, usize, usize)] = &[
             // QKV projection
-            (1, 4608, 3584),
-            (128, 4608, 3584),
-            // O-proj
-            (1, 3584, 3584),
-            (128, 3584, 3584),
+            (1, qkv_dim, hidden),
+            (128, qkv_dim, hidden),
+            // O-proj (q_dim -> hidden)
+            (1, hidden, q_dim),
+            (128, hidden, q_dim),
             // GateUp
-            (1, 37888, 3584),
-            (128, 37888, 3584),
+            (1, gate_up_dim, hidden),
+            (128, gate_up_dim, hidden),
             // Down
-            (1, 3584, 18944),
-            (128, 3584, 18944),
+            (1, hidden, intermediate),
+            (128, hidden, intermediate),
         ];
 
         let mut tuner = Self::new();
@@ -394,5 +402,10 @@ impl CublasAutotuner {
 
     pub fn is_empty(&self) -> bool {
         self.results.is_empty()
+    }
+
+    /// Maximum workspace size across all autotuned algorithms.
+    pub fn max_workspace_size(&self) -> usize {
+        self.results.values().map(|a| a.workspace_size).max().unwrap_or(0)
     }
 }
