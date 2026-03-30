@@ -117,6 +117,7 @@ pub async fn create_response(
         .map_err(|e| ApiError::Internal(format!("chat template error: {}", e)))?;
 
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
+    let response_text = req.normalize_text_config()?;
     let sampling_params = req.to_sampling_params();
     let tool_choice = req.effective_tool_choice();
     let response_tools = req.tools.clone().unwrap_or_default();
@@ -150,6 +151,7 @@ pub async fn create_response(
         let req_clone = req.clone();
         let response_store = state.response_store.clone();
         let response_id_clone = response_id.clone();
+        let response_text_clone = response_text.clone();
         let tool_choice_clone = tool_choice.clone();
         let response_tools_clone = response_tools.clone();
 
@@ -174,6 +176,7 @@ pub async fn create_response(
                 req_clone.top_p,
                 req_clone.metadata.clone(),
                 req_clone.parallel_tool_calls,
+                response_text_clone.clone(),
                 tool_choice_clone.clone(),
                 response_tools_clone.clone(),
             );
@@ -296,6 +299,7 @@ pub async fn create_response(
                                 req_clone.top_p,
                                 req_clone.metadata.clone(),
                                 req_clone.parallel_tool_calls,
+                                response_text_clone.clone(),
                                 tool_choice_clone,
                                 response_tools_clone,
                             ),
@@ -321,6 +325,7 @@ pub async fn create_response(
                 output_items.clone(),
                 ResponseUsage::from_request_output(&output),
                 req_clone.parallel_tool_calls,
+                response_text_clone,
                 req_clone.effective_tool_choice(),
                 req_clone.tools.clone().unwrap_or_default(),
             );
@@ -491,6 +496,7 @@ async fn stream_tool_response(
 ) -> Result<Response, ApiError> {
     let model = state.model_name.clone();
     let response_store = state.response_store.clone();
+    let response_text = req.normalize_text_config().ok();
     let tool_choice = req.effective_tool_choice();
     let response_tools = req.tools.clone().unwrap_or_default();
 
@@ -514,6 +520,7 @@ async fn stream_tool_response(
             req.top_p,
             req.metadata.clone(),
             req.parallel_tool_calls,
+            response_text.clone().unwrap_or_default(),
             tool_choice.clone(),
             response_tools.clone(),
         );
@@ -548,6 +555,7 @@ async fn stream_tool_response(
                         req.top_p,
                         req.metadata.clone(),
                         req.parallel_tool_calls,
+                        response_text.clone().unwrap_or_default(),
                         tool_choice.clone(),
                         response_tools.clone(),
                     ),
@@ -945,6 +953,7 @@ async fn stream_tool_response(
             output_items.clone(),
             ResponseUsage::from_request_output(&output),
             req.parallel_tool_calls,
+            response_text.unwrap_or_default(),
             tool_choice,
             response_tools,
         );
@@ -1052,6 +1061,7 @@ fn response_from_output(
         output_items,
         ResponseUsage::from_request_output(output),
         req.parallel_tool_calls,
+        req.normalize_text_config()?,
         tool_choice,
         response_tools,
     ))
@@ -1532,6 +1542,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_response_route_accepts_json_object_text_format() {
+        let (server, _) = make_server(vec![vec![request_output("{\"ok\":true}", true)]]);
+
+        let response = server
+            .post("/v1/responses")
+            .json(&serde_json::json!({
+                "model": "test",
+                "input": "Return JSON",
+                "text": {
+                    "format": {
+                        "type": "json_object"
+                    }
+                }
+            }))
+            .await;
+
+        response.assert_status_ok();
+        let body = response.json::<serde_json::Value>();
+        assert_eq!(body["object"], "response");
+        assert_eq!(body["text"]["format"]["type"], "json_object");
+    }
+
+    #[tokio::test]
     async fn previous_response_id_replays_function_calls_and_outputs() {
         let (server, engine) = make_server(vec![
             vec![request_output(
@@ -1602,6 +1635,38 @@ mod tests {
         let input_items = input_items.json::<serde_json::Value>();
         assert_eq!(input_items["data"][0]["type"], "function_call_output");
         assert_eq!(input_items["data"][0]["output"]["temp_c"], 18);
+    }
+
+    #[tokio::test]
+    async fn create_response_route_preserves_json_object_text_format() {
+        let (server, _) = make_server(vec![vec![request_output("{\"ok\":true}", true)]]);
+
+        let response = server
+            .post("/v1/responses")
+            .json(&serde_json::json!({
+                "model": "test",
+                "input": "Return JSON with an ok field.",
+                "store": true,
+                "text": {
+                    "format": {
+                        "type": "json_object"
+                    }
+                }
+            }))
+            .await;
+
+        response.assert_status_ok();
+        let body = response.json::<serde_json::Value>();
+        assert_eq!(body["text"]["format"]["type"], "json_object");
+        assert_eq!(body["output"][0]["type"], "message");
+        assert_eq!(body["output"][0]["content"][0]["text"], "{\"ok\":true}");
+
+        let stored = server
+            .get(&format!("/v1/responses/{}", body["id"].as_str().unwrap()))
+            .await;
+        stored.assert_status_ok();
+        let stored = stored.json::<serde_json::Value>();
+        assert_eq!(stored["text"]["format"]["type"], "json_object");
     }
 
     #[tokio::test]

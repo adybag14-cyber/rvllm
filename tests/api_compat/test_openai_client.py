@@ -186,6 +186,23 @@ class TestResponses:
         assert data["data"][0]["type"] == "message"
         assert data["data"][0]["content"][0]["type"] == "input_text"
 
+    def test_response_json_object_text_format(self):
+        """Responses accept text.format=json_object and echo it in the response"""
+        r = requests.post(f"{BASE_URL}/v1/responses", json={
+            "model": "test",
+            "input": "Return JSON with an ok field.",
+            "max_output_tokens": 8,
+            "text": {
+                "format": {
+                    "type": "json_object",
+                }
+            },
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["text"]["format"]["type"] == "json_object"
+        assert data["output"][0]["type"] == "message"
+
     def test_response_previous_response_id(self):
         """Responses can chain prior stored turns"""
         first = requests.post(f"{BASE_URL}/v1/responses", json={
@@ -248,6 +265,20 @@ class TestResponses:
         assert data["data"][0]["type"] == "function_call_output"
         assert data["data"][0]["call_id"] == "call_123"
         assert data["data"][0]["output"]["ok"] is True
+
+    def test_response_json_object_text_format(self):
+        """Responses accept structured text.format=json_object"""
+        r = requests.post(f"{BASE_URL}/v1/responses", json={
+            "model": "test",
+            "input": "Return JSON",
+            "text": {
+                "format": {"type": "json_object"}
+            },
+            "max_output_tokens": 8,
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["text"]["format"]["type"] == "json_object"
 
     def test_response_rejects_built_in_tools(self):
         """Built-in Responses tools are still rejected explicitly"""
