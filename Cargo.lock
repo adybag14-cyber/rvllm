@@ -2755,7 +2755,6 @@ dependencies = [
  "rvllm-executor",
  "rvllm-scheduler",
  "rvllm-sequence",
- "rvllm-speculative",
  "rvllm-telemetry",
  "rvllm-tokenizer",
  "rvllm-worker",
