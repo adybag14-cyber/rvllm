@@ -2,20 +2,46 @@
 
 A from-scratch Rust rewrite of [vLLM](https://github.com/vllm-project/vllm) -- the most popular open-source LLM serving engine. Drop-in replacement for the OpenAI-compatible API with dramatically better resource efficiency.
 
-**50 CUDA kernels. Rust PTX compiler with 2-7.5x faster codegen than nvcc. cuBLAS autotuning. CUDA graph replay. FP8 inference. 20x faster startup. 31x smaller binary.**
+**8,652 tok/s at 128 concurrent streams (direct engine). 50 CUDA kernels. FA3 v2 warp-parallel attention. Rust PTX compiler with 2-7.5x faster codegen than nvcc. cuBLAS autotuning. CUDA graph replay. FP8 inference. 20x faster startup. 31x smaller binary.**
 
 ## rvLLM vs Python vLLM -- Head-to-Head
 
 All measurements on H100 SXM 80GB, Qwen2.5-7B f16, separate GPU instances per engine. No cherry-picking -- same model, same hardware, same prompts.
 
-### Throughput
+### Throughput (Phase 5d -- FA3 v2)
 
-| Metric | rvLLM | Python vLLM 0.18 | Ratio |
-|---|---:|---:|---|
-| **Direct engine tok/s (N=128)** | 12,607 | 14,962 | 0.84x |
-| **Direct engine tok/s (N=64)** | 7,280 | 8,807 | 0.83x |
-| **Direct engine tok/s (N=16)** | 2,058 | 2,524 | 0.82x |
-| **Direct engine tok/s (N=1)** | 108 | 169 | 0.64x |
+Direct engine (no HTTP overhead), Qwen2.5-7B f16, 512 tok/req:
+
+| N | tok/s |
+|---:|---:|
+| 1 | 75 |
+| 16 | 1,537 |
+| 32 | 3,020 |
+| 64 | 5,447 |
+| 128 | 8,652 |
+
+HTTP steady-state comparison (apples-to-apples):
+
+| N | rvLLM | vLLM 0.18 (eager) | Ratio |
+|---:|---:|---:|---|
+| 16 | 1,503 | 1,714 | 0.88x |
+| 32 | 2,902 | 3,431 | 0.85x |
+| 64 | 5,120 | 6,677 | 0.77x |
+| 128 | 8,161 | 12,230 | 0.67x |
+
+Gap with vLLM went from ~2x (Phase 4) to 1.14-1.50x (Phase 5d HTTP).
+
+### FA3 v2 Attention Kernel
+
+Our decode attention was rewritten with warp-parallel QK^T, parallel softmax, bank-conflict-free shared memory, GQA Q pre-loading, V reuse across heads, and higher occupancy. A/B test on the same codebase and H100:
+
+| N | v1 tok/s | v2 tok/s | Change |
+|---:|---:|---:|---|
+| 1 | 47 | 75 | +60% |
+| 16 | 864 | 1,537 | +78% |
+| 32 | 1,716 | 3,020 | +76% |
+| 64 | 3,182 | 5,447 | +71% |
+| 128 | 5,371 | 8,652 | +61% |
 
 ### JIT Compiler: Our Fused Kernels vs Hand-Written CUDA
 
@@ -153,6 +179,27 @@ A single decode step at c=128 concurrency:
 | 5 | Deeper fusion + v4 vectorized loads | 12,800 | Mar 30 |
 | 6 | Vendored cublaslt + autotuner | 12,607 | Mar 30 |
 | 7 | JIT compiler (2-7.5x faster kernels) | wiring | Mar 30 |
+| 5d | FA3 v2 (warp-parallel attention rewrite) | 8,652 | Mar 31 |
+
+Note: Phase 5d numbers are direct engine, not comparable to Phase 4-7 (which used different measurement methodology). See FA3 v2 A/B test above for the true apples-to-apples improvement (+61% at N=128).
+
+### What Differs from vLLM
+
+The gap is 1.14x at N=16 and 1.50x at N=128 (HTTP). Root causes, in order of impact:
+
+1. **GEMM tuning**: vLLM uses Triton autotuned GEMMs + torch.compile; we use stock cuBLAS heuristics. This is the dominant remaining gap at high concurrency.
+2. **Attention**: vLLM uses FlashAttention-3 (Tri Dao's official CUDA, heavily optimized with TMA, warp specialization, pipelining); our FA3 v2 is closer but still lacks async global-to-shared copies (cp.async/TMA).
+3. **Scheduler**: vLLM has mature continuous batching with sophisticated prefill/decode interleaving, chunked prefill, and priority preemption. Ours is simpler.
+4. **Quantization**: vLLM supports GPTQ, AWQ, SqueezeLLM, Marlin, FP8, etc. We have FP8 only.
+
+What rvLLM does better:
+
+1. **20x faster cold start** (6s vs 120s) -- no Python interpreter, no torch.compile warmup
+2. **31x smaller binary** (16 MB vs 500 MB) -- static Rust binary, zero dependencies
+3. **3x less CPU memory** (348 MB vs ~1 GB)
+4. **5.6x tighter P95 latency** -- no GIL, no GC pauses, no JIT recompilations
+5. **Zero dependencies** -- single static binary, ~50 MB container image
+6. **JIT fused kernels 2-7.5x faster** than hand-written CUDA for N=1 decode
 
 ### What's Inside
 
@@ -166,7 +213,7 @@ A single decode step at c=128 concurrency:
 | `rvllm-fusion` | JIT kernel compiler, PTX emitter, LLVM NVPTX backend |
 | **`rtriton`** | **Triton-style GPU kernel compiler + cuBLAS integration** |
 | `rvllm-kv-cache` | Paged KV cache (f16 + FP8) |
-| `rvllm-attention` | Attention backends (FA3, GQA, split-KV) |
+| `rvllm-attention` | Attention backends (FA3 v2 warp-parallel, GQA, split-KV) |
 | `rvllm-speculative` | Speculative decoding (self-draft) |
 | `rvllm-tp` | Tensor parallelism (NCCL, Megatron-LM sharding) |
 | `rvllm-tokenizer` | HuggingFace tokenizer wrapper |
