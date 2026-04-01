@@ -2752,6 +2752,7 @@ dependencies = [
  "rvllm-config",
  "rvllm-core",
  "rvllm-executor",
+ "rvllm-scheduler",
  "rvllm-sequence",
  "rvllm-speculative",
  "rvllm-telemetry",

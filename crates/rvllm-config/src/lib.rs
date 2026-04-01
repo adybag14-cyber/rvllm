@@ -100,6 +100,7 @@ fn apply_cli_overrides(config: &mut EngineConfig, args: &CliArgs) {
     // Scheduler
     config.scheduler.max_num_seqs = args.max_num_seqs;
     config.scheduler.max_num_batched_tokens = args.max_num_batched_tokens;
+    config.scheduler.max_prefill_chunk = args.max_prefill_chunk;
     config.scheduler.max_paddings = args.max_paddings;
     if let Ok(mode) = args.preemption_mode.parse::<PreemptionMode>() {
         config.scheduler.preemption_mode = mode;
@@ -142,6 +143,7 @@ mod tests {
             kv_cache_dtype: "auto".into(),
             max_num_seqs: 256,
             max_num_batched_tokens: 4096,
+            max_prefill_chunk: 128,
             max_paddings: 256,
             preemption_mode: "recompute".into(),
             tensor_parallel_size: 1,
@@ -180,6 +182,7 @@ swap_space_gb = 2.0
 [scheduler]
 max_num_seqs = 128
 max_num_batched_tokens = 1024
+max_prefill_chunk = 128
 max_paddings = 64
 preemption_mode = "Swap"
 
@@ -214,6 +217,7 @@ log_level = "warn"
             kv_cache_dtype: "auto".into(),
             max_num_seqs: 128,
             max_num_batched_tokens: 1024,
+            max_prefill_chunk: 128,
             max_paddings: 64,
             preemption_mode: "swap".into(),
             tensor_parallel_size: 1,
@@ -251,6 +255,7 @@ log_level = "warn"
             kv_cache_dtype: "auto".into(),
             max_num_seqs: 256,
             max_num_batched_tokens: 2048,
+            max_prefill_chunk: 128,
             max_paddings: 256,
             preemption_mode: "recompute".into(),
             tensor_parallel_size: 1,

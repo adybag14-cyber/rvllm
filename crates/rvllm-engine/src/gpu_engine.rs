@@ -7,20 +7,27 @@
 
 #[cfg(feature = "cuda")]
 mod inner {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
     use std::time::Instant;
 
+    use parking_lot::Mutex;
     use tracing::{debug, info, trace, warn};
 
-    use rvllm_block_manager::prefix_cache::{self, PrefixCache};
+    use rvllm_block_manager::{BlockManager, MemoryPool};
     use rvllm_config::EngineConfig;
     use rvllm_core::prelude::{
         BlockId, FinishReason, LLMError, LogProb, RequestId, RequestOutput, Result, SamplingParams,
         SequenceId, TokenId,
     };
-    use rvllm_sequence::{Sequence, SequenceData, SequenceGroup, SequenceGroupMetadata, SequenceStatus};
+    use rvllm_scheduler::{
+        scheduler::SequenceGroup as ScheduledSequenceGroupState,
+        PreemptionMode as SchedulerPreemptionMode, ScheduledSequenceGroup,
+        Scheduler as ChunkedScheduler, SchedulerConfig as ChunkedSchedulerConfig, SchedulerPolicy,
+    };
+    use rvllm_sequence::{Sequence, SequenceData, SequenceGroupMetadata, SequenceStatus};
     use rvllm_tokenizer::Tokenizer;
     use rvllm_worker::gpu_worker::{GpuWorker, GpuWorkerOutput};
 
@@ -151,160 +158,39 @@ mod inner {
         seq_states: Vec<SequenceOutputState>,
     }
 
-    // ------------------------------------------------------------------
-    // Minimal FIFO scheduler
-    // ------------------------------------------------------------------
-
-    struct FifoScheduler {
-        /// Waiting queue: groups not yet scheduled.
-        waiting: Vec<SequenceGroup>,
-        /// Running queue: groups currently being executed (already scheduled).
-        running: Vec<SequenceGroup>,
-        max_num_seqs: usize,
-        max_num_batched_tokens: usize,
-        /// Number of free GPU KV-cache blocks available for new admissions.
-        /// Updated by the engine each step before scheduling.
-        free_block_count: usize,
-        /// Minimum free blocks required to admit a new sequence group.
-        /// Prevents OOM by keeping a watermark so running sequences can grow.
-        watermark_blocks: usize,
+    struct LocalPool {
+        total: usize,
+        free: Mutex<VecDeque<u32>>,
     }
 
-    impl FifoScheduler {
-        fn new(max_num_seqs: usize, max_num_batched_tokens: usize) -> Self {
+    impl LocalPool {
+        fn new(total: usize) -> Self {
+            let mut free = VecDeque::with_capacity(total);
+            for i in 0..total {
+                free.push_back(i as u32);
+            }
             Self {
-                waiting: Vec::new(),
-                running: Vec::new(),
-                max_num_seqs,
-                max_num_batched_tokens,
-                free_block_count: 0,
-                watermark_blocks: 0,
+                total,
+                free: Mutex::new(free),
             }
         }
+    }
 
-        fn set_block_budget(&mut self, free_blocks: usize, watermark: usize) {
-            self.free_block_count = free_blocks;
-            self.watermark_blocks = watermark;
+    impl MemoryPool for LocalPool {
+        fn allocate(&self) -> Option<BlockId> {
+            self.free.lock().pop_front().map(BlockId)
         }
 
-        fn add_seq_group(&mut self, group: SequenceGroup) {
-            self.waiting.push(group);
+        fn free(&self, block_id: BlockId) {
+            self.free.lock().push_back(block_id.0);
         }
 
-        fn abort_seq_group(&mut self, request_id: &RequestId) {
-            self.waiting.retain(|g| g.request_id != *request_id);
-            self.running.retain(|g| g.request_id != *request_id);
+        fn free_blocks(&self) -> usize {
+            self.free.lock().len()
         }
 
-        fn has_unfinished_seqs(&self) -> bool {
-            !self.waiting.is_empty() || !self.running.is_empty()
-        }
-
-        fn live_seq_ids(&self) -> std::collections::HashSet<SequenceId> {
-            self.waiting
-                .iter()
-                .chain(self.running.iter())
-                .flat_map(|g| g.get_seqs().iter().map(|s| s.seq_id))
-                .collect()
-        }
-
-        /// Append a generated token to a sequence in the scheduler.
-        fn update_seq_token(&mut self, seq_id: SequenceId, token_id: TokenId, logprob: f32) {
-            for group in self.running.iter_mut().chain(self.waiting.iter_mut()) {
-                for seq in group.get_seqs_mut() {
-                    if seq.seq_id == seq_id {
-                        seq.append_token(token_id, logprob);
-                        return;
-                    }
-                }
-            }
-        }
-
-        /// Mark a sequence as finished so `schedule()` can purge it.
-        fn finish_seq(&mut self, seq_id: SequenceId, status: SequenceStatus) {
-            for group in self.running.iter_mut().chain(self.waiting.iter_mut()) {
-                for seq in group.get_seqs_mut() {
-                    if seq.seq_id == seq_id {
-                        let _ = seq.set_status(status);
-                        return;
-                    }
-                }
-            }
-        }
-
-        fn get_num_unfinished_seq_groups(&self) -> usize {
-            self.waiting.len() + self.running.len()
-        }
-
-        fn schedule(&mut self) -> (Vec<SequenceGroup>, usize) {
-            // Purge finished groups from both queues.
-            self.running.retain(|g| !g.is_finished());
-            self.waiting.retain(|g| !g.is_finished());
-
-            let mut total_tokens: usize = 0;
-
-            // Running groups are always re-scheduled (they need their next token).
-            for group in &self.running {
-                let tokens_this: usize = group
-                    .get_seqs()
-                    .iter()
-                    .filter(|s| !s.is_finished())
-                    .map(|s| {
-                        if s.get_output_len() == 0 {
-                            s.get_len()
-                        } else {
-                            1
-                        }
-                    })
-                    .sum();
-                total_tokens += tokens_this;
-            }
-
-            // Promote waiting groups into running up to budget limits.
-            // Also gate on block availability: don't admit new groups when
-            // free blocks are below the watermark so running sequences have
-            // room to grow during decode.
-            while !self.waiting.is_empty() {
-                if self.running.len() >= self.max_num_seqs {
-                    break;
-                }
-                if self.free_block_count < self.watermark_blocks {
-                    debug!(
-                        free = self.free_block_count,
-                        watermark = self.watermark_blocks,
-                        "scheduler: holding back waiting groups -- below block watermark"
-                    );
-                    break;
-                }
-                let group = &self.waiting[0];
-                let tokens_this: usize = group
-                    .get_seqs()
-                    .iter()
-                    .filter(|s| !s.is_finished())
-                    .map(|s| {
-                        if s.get_output_len() == 0 {
-                            s.get_len()
-                        } else {
-                            1
-                        }
-                    })
-                    .sum();
-                if total_tokens + tokens_this > self.max_num_batched_tokens {
-                    break;
-                }
-                // Each new group needs at least 1 block per sequence.
-                let seqs_in_group = group.get_seqs().iter().filter(|s| !s.is_finished()).count();
-                if self.free_block_count < seqs_in_group {
-                    break;
-                }
-                self.free_block_count = self.free_block_count.saturating_sub(seqs_in_group);
-                total_tokens += tokens_this;
-                self.running.push(self.waiting.remove(0));
-            }
-
-            // Return clones of running groups for execution.
-            let selected: Vec<SequenceGroup> = self.running.iter().cloned().collect();
-            (selected, total_tokens)
+        fn total_blocks(&self) -> usize {
+            self.total
         }
     }
 
@@ -329,21 +215,12 @@ mod inner {
 
     pub struct GpuLLMEngine {
         config: EngineConfig,
-        scheduler: FifoScheduler,
+        scheduler: ChunkedScheduler,
         worker: GpuWorker,
         tokenizer: Tokenizer,
         requests: HashMap<RequestId, EngineRequest>,
         next_request_id: std::sync::Arc<AtomicU64>,
         next_seq_id: u64,
-        prefix_cache: Option<PrefixCache>,
-        /// Total number of GPU KV-cache blocks available.
-        num_gpu_blocks: u32,
-        /// Persistent block allocation with recycling.
-        next_block_id: u32,
-        /// Free list of recycled block IDs.
-        free_blocks: Vec<u32>,
-        /// Per-sequence block tables that persist across step() calls.
-        seq_block_tables: HashMap<SequenceId, Vec<BlockId>>,
         /// Shared queue for new requests arriving during GPU compute.
         request_queue: Option<RequestQueue>,
         /// Shared queue for abort requests arriving during GPU compute.
@@ -352,7 +229,7 @@ mod inner {
 
     /// Pending state from step_launch, consumed by step_collect.
     pub struct StepPending {
-        pub scheduled_groups: Vec<SequenceGroup>,
+        pub scheduled_groups: Vec<ScheduledSequenceGroup>,
         pub metadata: Vec<SequenceGroupMetadata>,
         /// Async batch size from execute_launch (Some = async DtoH pending).
         pub actual_batch: Option<usize>,
@@ -452,20 +329,28 @@ mod inner {
             };
             worker.init_cache(num_gpu_blocks, num_cpu_blocks)?;
 
-            // 8. Scheduler
-            let scheduler = FifoScheduler::new(
-                config.scheduler.max_num_seqs,
-                config.scheduler.max_num_batched_tokens,
+            let gpu_pool: Arc<dyn MemoryPool> = Arc::new(LocalPool::new(num_gpu_blocks));
+            let cpu_pool: Arc<dyn MemoryPool> = Arc::new(LocalPool::new(num_cpu_blocks));
+            let mut block_manager = BlockManager::new(gpu_pool, cpu_pool, config.cache.block_size);
+            if config.cache.enable_prefix_caching {
+                block_manager.enable_prefix_caching(1024);
+            }
+            let scheduler = ChunkedScheduler::new(
+                ChunkedSchedulerConfig {
+                    max_num_seqs: config.scheduler.max_num_seqs,
+                    max_num_batched_tokens: config.scheduler.max_num_batched_tokens,
+                    max_paddings: config.scheduler.max_paddings,
+                    preemption_mode: match config.scheduler.preemption_mode {
+                        rvllm_config::PreemptionMode::Swap => SchedulerPreemptionMode::Swap,
+                        rvllm_config::PreemptionMode::Recompute => {
+                            SchedulerPreemptionMode::Recompute
+                        }
+                    },
+                    policy: SchedulerPolicy::Fcfs,
+                    max_prefill_chunk: config.scheduler.max_prefill_chunk,
+                },
+                block_manager,
             );
-
-            let prefix_cache = if config.cache.enable_prefix_caching {
-                let block_size = config.cache.block_size;
-                let max_cached = 1024; // max cached prefix blocks
-                info!(block_size, max_cached, "prefix caching enabled");
-                Some(PrefixCache::new(block_size, max_cached))
-            } else {
-                None
-            };
 
             let spec_enabled = Self::speculative_enabled();
             let fp8_kv = worker.use_fp8_kv();
@@ -486,11 +371,6 @@ mod inner {
                 requests: HashMap::new(),
                 next_request_id: std::sync::Arc::new(AtomicU64::new(1)),
                 next_seq_id: 0,
-                prefix_cache,
-                num_gpu_blocks: num_gpu_blocks as u32,
-                next_block_id: 0,
-                free_blocks: Vec::new(),
-                seq_block_tables: HashMap::new(),
                 request_queue: None,
                 abort_queue: None,
             })
@@ -544,14 +424,8 @@ mod inner {
                 seq_states.push(SequenceOutputState::new());
             }
 
-            let seq_group = SequenceGroup::new(
-                request_id,
-                seqs,
-                params.clone(),
-                Instant::now(),
-                prompt.clone(),
-            );
-            self.scheduler.add_seq_group(seq_group);
+            let seq_group = ScheduledSequenceGroupState::new(request_id, seqs, 0);
+            self.scheduler.add_request(seq_group);
 
             self.requests.insert(
                 request_id,
@@ -569,7 +443,7 @@ mod inner {
 
         pub fn abort_request(&mut self, request_id: &RequestId) {
             info!(%request_id, "GpuLLMEngine: aborting request");
-            self.scheduler.abort_seq_group(request_id);
+            self.scheduler.abort_request(request_id);
             if let Some(req) = self.requests.get_mut(request_id) {
                 for state in &mut req.seq_states {
                     if state.finish_reason.is_none() {
@@ -589,8 +463,9 @@ mod inner {
             };
 
             if !aborted_seqs.is_empty() {
-                for group in &scheduled_groups {
-                    for (seq_idx, seq) in group.get_seqs().iter().enumerate() {
+                for scheduled in &scheduled_groups {
+                    let group = &scheduled.seq_group;
+                    for (seq_idx, seq) in group.sequences.iter().enumerate() {
                         if aborted_seqs.contains(&seq.seq_id) {
                             if let Some(req) = self.requests.get_mut(&group.request_id) {
                                 if let Some(state) = req.seq_states.get_mut(seq_idx) {
@@ -603,10 +478,16 @@ mod inner {
             }
 
             // Launch worker (returns quickly for async graph replay path)
-            let actual_batch = self.worker.execute_launch(&metadata)
+            let actual_batch = self
+                .worker
+                .execute_launch(&metadata)
                 .map_err(|e| LLMError::GpuError(format!("worker launch failed: {e}")))?;
 
-            Ok(Some(StepPending { scheduled_groups, metadata, actual_batch }))
+            Ok(Some(StepPending {
+                scheduled_groups,
+                metadata,
+                actual_batch,
+            }))
         }
 
         /// Collect GPU results and process outputs. Call after step_launch.
@@ -617,29 +498,12 @@ mod inner {
                 None => return Ok(Vec::new()),
             };
 
-            let worker_outputs = self.worker.execute_collect(pending.actual_batch, &pending.metadata)
+            let worker_outputs = self
+                .worker
+                .execute_collect(pending.actual_batch, &pending.metadata)
                 .map_err(|e| LLMError::GpuError(format!("worker collect failed: {e}")))?;
 
-            // Prefix caching
-            if let Some(ref mut pc) = self.prefix_cache {
-                let block_size = self.config.cache.block_size;
-                for meta in &pending.metadata {
-                    if meta.is_prompt {
-                        for (_seq_id, seq_data) in &meta.seq_data {
-                            let num_full_blocks = seq_data.prompt_token_ids.len() / block_size;
-                            let block_ids: Vec<rvllm_core::prelude::BlockId> = (0..num_full_blocks)
-                                .map(|i| rvllm_core::prelude::BlockId(i as u32))
-                                .collect();
-                            let _ = prefix_cache::register_prefix_blocks(
-                                pc, &seq_data.prompt_token_ids, &block_ids, block_size,
-                            );
-                        }
-                    }
-                }
-            }
-
             let results = self.process_worker_outputs(&pending.scheduled_groups, &worker_outputs);
-            self.recycle_dead_blocks();
             Ok(results)
         }
 
@@ -679,18 +543,25 @@ mod inner {
         /// Same correctness as step() -- scheduler state is consistent because
         /// the closure runs AFTER prepare_step but BEFORE process_worker_outputs.
         /// The closure should only drain NEW requests, not touch current sequences.
-        pub fn step_with_overlap<F: FnOnce()>(&mut self, during_gpu: F) -> Result<Vec<RequestOutput>> {
+        pub fn step_with_overlap<F: FnOnce()>(
+            &mut self,
+            during_gpu: F,
+        ) -> Result<Vec<RequestOutput>> {
             let prof = std::env::var("RVLLM_PROFILE").is_ok();
             let ts = std::time::Instant::now();
             let (scheduled_groups, metadata, aborted_seqs) = match self.prepare_step() {
                 Some(v) => v,
-                None => { during_gpu(); return Ok(Vec::new()); }
+                None => {
+                    during_gpu();
+                    return Ok(Vec::new());
+                }
             };
             let t_sched = ts.elapsed();
 
             if !aborted_seqs.is_empty() {
-                for group in &scheduled_groups {
-                    for (seq_idx, seq) in group.get_seqs().iter().enumerate() {
+                for scheduled in &scheduled_groups {
+                    let group = &scheduled.seq_group;
+                    for (seq_idx, seq) in group.sequences.iter().enumerate() {
                         if aborted_seqs.contains(&seq.seq_id) {
                             if let Some(req) = self.requests.get_mut(&group.request_id) {
                                 if let Some(state) = req.seq_states.get_mut(seq_idx) {
@@ -703,36 +574,21 @@ mod inner {
             }
 
             let tg = std::time::Instant::now();
-            let worker_outputs = self.worker
+            let worker_outputs = self
+                .worker
                 .execute_with_overlap(&metadata, during_gpu)
                 .map_err(|e| LLMError::GpuError(format!("worker execute failed: {e}")))?;
             let t_gpu = tg.elapsed();
 
             if prof {
-                tracing::info!("PROFILE overlap: sched={:.3}ms gpu={:.3}ms",
-                    t_sched.as_secs_f64() * 1000.0, t_gpu.as_secs_f64() * 1000.0);
-            }
-
-            // Prefix caching
-            if let Some(ref mut pc) = self.prefix_cache {
-                let block_size = self.config.cache.block_size;
-                for meta in &metadata {
-                    if meta.is_prompt {
-                        for (_seq_id, seq_data) in &meta.seq_data {
-                            let num_full_blocks = seq_data.prompt_token_ids.len() / block_size;
-                            let block_ids: Vec<rvllm_core::prelude::BlockId> = (0..num_full_blocks)
-                                .map(|i| rvllm_core::prelude::BlockId(i as u32))
-                                .collect();
-                            let _ = prefix_cache::register_prefix_blocks(
-                                pc, &seq_data.prompt_token_ids, &block_ids, block_size,
-                            );
-                        }
-                    }
-                }
+                tracing::info!(
+                    "PROFILE overlap: sched={:.3}ms gpu={:.3}ms",
+                    t_sched.as_secs_f64() * 1000.0,
+                    t_gpu.as_secs_f64() * 1000.0
+                );
             }
 
             let results = self.process_worker_outputs(&scheduled_groups, &worker_outputs);
-            self.recycle_dead_blocks();
             Ok(results)
         }
 
@@ -748,10 +604,12 @@ mod inner {
             let t_step = t1.elapsed();
 
             if prof && t_step.as_millis() > 0 {
-                tracing::info!("PROFILE step: drain={:.3}ms overlap={:.3}ms total={:.3}ms",
+                tracing::info!(
+                    "PROFILE step: drain={:.3}ms overlap={:.3}ms total={:.3}ms",
                     t_drain.as_secs_f64() * 1000.0,
                     t_step.as_secs_f64() * 1000.0,
-                    t0.elapsed().as_secs_f64() * 1000.0);
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
             }
             result
         }
@@ -763,8 +621,9 @@ mod inner {
             };
 
             if !aborted_seqs.is_empty() {
-                for group in &scheduled_groups {
-                    for (seq_idx, seq) in group.get_seqs().iter().enumerate() {
+                for scheduled in &scheduled_groups {
+                    let group = &scheduled.seq_group;
+                    for (seq_idx, seq) in group.sequences.iter().enumerate() {
                         if aborted_seqs.contains(&seq.seq_id) {
                             if let Some(req) = self.requests.get_mut(&group.request_id) {
                                 if let Some(state) = req.seq_states.get_mut(seq_idx) {
@@ -785,35 +644,7 @@ mod inner {
                 "gpu_engine: worker.execute returned"
             );
 
-            // Prefix caching: after prefill, register new prefix blocks.
-            if let Some(ref mut pc) = self.prefix_cache {
-                let block_size = self.config.cache.block_size;
-                for meta in &metadata {
-                    if meta.is_prompt {
-                        for (_seq_id, seq_data) in &meta.seq_data {
-                            let num_full_blocks = seq_data.prompt_token_ids.len() / block_size;
-                            let block_ids: Vec<rvllm_core::prelude::BlockId> = (0..num_full_blocks)
-                                .map(|i| rvllm_core::prelude::BlockId(i as u32))
-                                .collect();
-                            let newly_cached = prefix_cache::register_prefix_blocks(
-                                pc,
-                                &seq_data.prompt_token_ids,
-                                &block_ids,
-                                block_size,
-                            );
-                            if !newly_cached.is_empty() {
-                                debug!(
-                                    newly_cached = newly_cached.len(),
-                                    "registered prefix blocks in cache"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
             let results = self.process_worker_outputs(&scheduled_groups, &worker_outputs);
-            self.recycle_dead_blocks();
 
             debug!(num_outputs = results.len(), "GpuLLMEngine: step complete");
             Ok(results)
@@ -830,7 +661,10 @@ mod inner {
                     }
                 }
             }
-            info!(num_completed = all_outputs.len(), "GpuLLMEngine: run loop finished");
+            info!(
+                num_completed = all_outputs.len(),
+                "GpuLLMEngine: run loop finished"
+            );
             Ok(all_outputs)
         }
 
@@ -839,48 +673,25 @@ mod inner {
         fn prepare_step(
             &mut self,
         ) -> Option<(
-            Vec<SequenceGroup>,
+            Vec<ScheduledSequenceGroup>,
             Vec<SequenceGroupMetadata>,
             std::collections::HashSet<SequenceId>,
         )> {
-            let free_count = self.free_blocks.len()
-                + (self.num_gpu_blocks.saturating_sub(self.next_block_id)) as usize;
-            let watermark = (self.num_gpu_blocks as usize / 25).max(1);
-            self.scheduler.set_block_budget(free_count, watermark);
-
-            let (scheduled_groups, num_tokens) = self.scheduler.schedule();
+            let scheduled = self.scheduler.schedule().ok()?;
             debug!(
-                num_groups = scheduled_groups.len(),
-                num_tokens, "pipelined scheduler output"
+                num_groups = scheduled.scheduled_seq_groups.len(),
+                num_tokens = scheduled.num_batched_tokens,
+                num_prefill_groups = scheduled.num_prefill_groups,
+                "pipelined scheduler output"
             );
-            if scheduled_groups.is_empty() {
+            if scheduled.scheduled_seq_groups.is_empty() {
                 return None;
             }
 
+            let scheduled_groups = scheduled.scheduled_seq_groups;
             let (metadata, aborted_seqs) = self.build_metadata(&scheduled_groups);
             if metadata.is_empty() {
                 return None;
-            }
-
-            // Prefix caching: check for matching prefix blocks before prefill.
-            if let Some(ref mut pc) = self.prefix_cache {
-                for meta in &metadata {
-                    if meta.is_prompt {
-                        for (_seq_id, seq_data) in &meta.seq_data {
-                            let hits = pc.count_hits(&seq_data.prompt_token_ids);
-                            if hits > 0 {
-                                let block_size = self.config.cache.block_size;
-                                let cached_tokens = hits * block_size;
-                                debug!(
-                                    hits,
-                                    cached_tokens,
-                                    prompt_len = seq_data.prompt_token_ids.len(),
-                                    "prefix cache hit: reusing cached KV blocks"
-                                );
-                            }
-                        }
-                    }
-                }
             }
 
             trace!(
@@ -894,22 +705,20 @@ mod inner {
         /// clean up finished requests.
         fn process_worker_outputs(
             &mut self,
-            scheduled_groups: &[SequenceGroup],
+            scheduled_groups: &[ScheduledSequenceGroup],
             worker_outputs: &GpuWorkerOutput,
         ) -> Vec<RequestOutput> {
             let mut output_map: HashMap<u64, (TokenId, LogProb, &[(TokenId, LogProb)])> =
                 HashMap::with_capacity(worker_outputs.outputs.len());
             for wo in &worker_outputs.outputs {
-                output_map.insert(
-                    wo.seq_id,
-                    (wo.token_id, wo.logprob, &wo.top_logprobs),
-                );
+                output_map.insert(wo.seq_id, (wo.token_id, wo.logprob, &wo.top_logprobs));
             }
 
             let mut results = Vec::with_capacity(scheduled_groups.len());
             let eos = self.tokenizer.eos_token_id();
 
-            for group in scheduled_groups {
+            for scheduled in scheduled_groups {
+                let group = &scheduled.seq_group;
                 let request_id = group.request_id;
                 let req = match self.requests.get_mut(&request_id) {
                     Some(r) => r,
@@ -923,7 +732,7 @@ mod inner {
                 // EOS and max_tokens checks only need token IDs.
                 let needs_text = !req.sampling_params.stop_strings.is_empty();
 
-                for (seq_idx, seq) in group.get_seqs().iter().enumerate() {
+                for (seq_idx, seq) in group.sequences.iter().enumerate() {
                     if seq.is_finished() {
                         continue;
                     }
@@ -937,8 +746,13 @@ mod inner {
                         } else {
                             String::new()
                         };
-                        self.scheduler
-                            .update_seq_token(seq.seq_id, *token_id, *logprob);
+                        if let Err(err) = self
+                            .scheduler
+                            .update_seq_token(seq.seq_id, *token_id, *logprob)
+                        {
+                            warn!(seq_id = seq.seq_id.0, %err, "failed to extend scheduler state after token append");
+                            continue;
+                        }
 
                         let top_logprobs = if logprobs_requested && !top_lps.is_empty() {
                             Some(top_lps.to_vec())
@@ -962,9 +776,19 @@ mod inner {
                                     FinishReason::Length => SequenceStatus::FinishedLength,
                                     FinishReason::Abort => SequenceStatus::FinishedAborted,
                                 };
-                                self.scheduler.finish_seq(seq.seq_id, status);
+                                let _ = self.scheduler.finish_seq(seq.seq_id, status);
                             }
                         }
+                    }
+                }
+
+                let prompt_len = group.prompt_len();
+                let chunk_end = group.num_prompt_tokens_processed.min(prompt_len);
+                let chunk_start =
+                    chunk_end.saturating_sub(scheduled.token_chunk_size.min(chunk_end));
+                if chunk_start < chunk_end && chunk_end >= prompt_len {
+                    for seq in &group.sequences {
+                        self.scheduler.register_finished_prompt(seq.seq_id);
                     }
                 }
 
@@ -976,10 +800,8 @@ mod inner {
                     if all_finished {
                         for state in &mut req.seq_states {
                             if !state.token_ids.is_empty() && state.text.is_empty() {
-                                state.text = self
-                                    .tokenizer
-                                    .decode(&state.token_ids)
-                                    .unwrap_or_default();
+                                state.text =
+                                    self.tokenizer.decode(&state.token_ids).unwrap_or_default();
                             }
                         }
                     }
@@ -1003,48 +825,26 @@ mod inner {
                 .collect();
             for id in &finished_ids {
                 self.requests.remove(id);
-                self.scheduler.abort_seq_group(id);
+                self.scheduler.abort_request(id);
             }
 
             results
         }
 
-        /// Recycle KV cache blocks from sequences no longer tracked by scheduler.
-        fn recycle_dead_blocks(&mut self) {
-            let live_seq_ids: std::collections::HashSet<SequenceId> =
-                self.scheduler.live_seq_ids();
-            let dead_sids: Vec<SequenceId> = self
-                .seq_block_tables
-                .keys()
-                .filter(|sid| !live_seq_ids.contains(sid))
-                .copied()
-                .collect();
-            for sid in dead_sids {
-                if let Some(blocks) = self.seq_block_tables.remove(&sid) {
-                    debug!(
-                        seq_id = sid.0,
-                        num_blocks = blocks.len(),
-                        "recycling blocks from finished sequence"
-                    );
-                    for b in blocks {
-                        self.free_blocks.push(b.0);
-                    }
-                }
-            }
-        }
-
         /// Check for unfinished sequences (scheduler-side only, doesn't
         /// account for in-flight GPU work).
         fn has_unfinished_excluding_worker(&self) -> bool {
-            self.scheduler.has_unfinished_seqs() || !self.requests.is_empty()
+            self.scheduler.has_unfinished() || !self.requests.is_empty()
         }
 
         pub fn has_unfinished(&self) -> bool {
-            self.scheduler.has_unfinished_seqs() || !self.requests.is_empty()
+            self.scheduler.has_unfinished() || !self.requests.is_empty()
         }
 
         pub fn num_unfinished(&self) -> usize {
-            self.scheduler.get_num_unfinished_seq_groups()
+            self.scheduler.num_waiting()
+                + self.scheduler.num_running()
+                + self.scheduler.num_swapped()
         }
 
         pub fn config(&self) -> &EngineConfig {
@@ -1061,73 +861,58 @@ mod inner {
         /// blocks could not be allocated.
         fn build_metadata(
             &mut self,
-            groups: &[SequenceGroup],
-        ) -> (Vec<SequenceGroupMetadata>, std::collections::HashSet<SequenceId>) {
-            let block_size = self.config.cache.block_size;
+            groups: &[ScheduledSequenceGroup],
+        ) -> (
+            Vec<SequenceGroupMetadata>,
+            std::collections::HashSet<SequenceId>,
+        ) {
             let mut metadata = Vec::with_capacity(groups.len());
             let mut aborted_seqs: std::collections::HashSet<SequenceId> =
                 std::collections::HashSet::new();
 
-            for group in groups {
-                let is_prompt = group.get_seqs().iter().any(|s| s.get_output_len() == 0);
+            for scheduled in groups {
+                let group = &scheduled.seq_group;
+                let prompt_len = group.prompt_len();
+                let chunk_end = group.num_prompt_tokens_processed.min(prompt_len);
+                let chunk_start =
+                    chunk_end.saturating_sub(scheduled.token_chunk_size.min(chunk_end));
+                let is_prompt = chunk_start < chunk_end;
                 let mut seq_data = HashMap::new();
                 let mut block_tables = HashMap::new();
 
-                for seq in group.get_seqs() {
+                for seq in &group.sequences {
                     if seq.is_finished() {
                         continue;
                     }
-                    let total_tokens = seq.prompt_token_ids.len() + seq.output_token_ids.len();
-                    // +1 headroom: pre-allocate for the token about to be generated this step
-                    let needed_blocks = (total_tokens + 1 + block_size - 1) / block_size;
-
-                    // Reuse existing blocks, append new ones if needed
-                    let existing = self.seq_block_tables.entry(seq.seq_id).or_default();
-                    let mut alloc_failed = false;
-                    while existing.len() < needed_blocks {
-                        let block_id = if let Some(recycled) = self.free_blocks.pop() {
-                            recycled
-                        } else if self.next_block_id < self.num_gpu_blocks {
-                            let id = self.next_block_id;
-                            self.next_block_id += 1;
-                            id
-                        } else {
-                            warn!(
-                                seq_id = seq.seq_id.0,
-                                needed = needed_blocks,
-                                have = existing.len(),
-                                num_gpu_blocks = self.num_gpu_blocks,
-                                free_blocks = self.free_blocks.len(),
-                                "block allocation failed: no free GPU KV-cache blocks, aborting sequence"
-                            );
-                            alloc_failed = true;
-                            break;
-                        };
-                        existing.push(BlockId(block_id));
-                    }
-
-                    if alloc_failed {
-                        // Recycle whatever blocks this sequence had -- it cannot
-                        // proceed without its full allocation.
-                        if let Some(blocks) = self.seq_block_tables.remove(&seq.seq_id) {
-                            for b in blocks {
-                                self.free_blocks.push(b.0);
-                            }
-                        }
-                        // Mark finished so the scheduler drops it next round.
-                        self.scheduler.finish_seq(seq.seq_id, SequenceStatus::FinishedAborted);
+                    let Some(existing) = self.scheduler.get_block_table(seq.seq_id) else {
+                        warn!(
+                            seq_id = seq.seq_id.0,
+                            "missing block table for scheduled sequence"
+                        );
+                        let _ = self
+                            .scheduler
+                            .finish_seq(seq.seq_id, SequenceStatus::FinishedAborted);
                         aborted_seqs.insert(seq.seq_id);
                         continue;
-                    }
+                    };
 
-                    block_tables.insert(seq.seq_id, existing.clone());
+                    block_tables.insert(seq.seq_id, existing);
 
                     seq_data.insert(
                         seq.seq_id,
-                        SequenceData {
-                            prompt_token_ids: seq.prompt_token_ids.clone(),
-                            output_token_ids: seq.output_token_ids.clone(),
-                            cumulative_logprob: seq.cumulative_logprob,
+                        if is_prompt {
+                            SequenceData {
+                                prompt_token_ids: seq.prompt_token_ids[chunk_start..chunk_end]
+                                    .to_vec(),
+                                output_token_ids: seq.prompt_token_ids[..chunk_start].to_vec(),
+                                cumulative_logprob: seq.cumulative_logprob,
+                            }
+                        } else {
+                            SequenceData {
+                                prompt_token_ids: seq.prompt_token_ids.clone(),
+                                output_token_ids: seq.output_token_ids.clone(),
+                                cumulative_logprob: seq.cumulative_logprob,
+                            }
                         },
                     );
                 }
@@ -1138,7 +923,11 @@ mod inner {
                         request_id: group.request_id,
                         is_prompt,
                         seq_data,
-                        sampling_params: group.sampling_params.clone(),
+                        sampling_params: self
+                            .requests
+                            .get(&group.request_id)
+                            .map(|req| req.sampling_params.clone())
+                            .unwrap_or_default(),
                         block_tables,
                     });
                 }
@@ -1250,8 +1039,14 @@ mod inner {
                 let token_logits = &logits[offset..offset + vs];
 
                 // Convert logits to probabilities via softmax.
-                let max_logit = token_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mut probs: Vec<f32> = token_logits.iter().map(|&l| (l - max_logit).exp()).collect();
+                let max_logit = token_logits
+                    .iter()
+                    .cloned()
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let mut probs: Vec<f32> = token_logits
+                    .iter()
+                    .map(|&l| (l - max_logit).exp())
+                    .collect();
                 let sum: f32 = probs.iter().sum();
                 if sum > 0.0 {
                     for p in &mut probs {
@@ -1320,7 +1115,9 @@ mod inner {
             struct SendPtr(usize);
             unsafe impl Send for SendPtr {}
             impl SendPtr {
-                unsafe fn get(&self) -> &mut GpuWorker { &mut *(self.0 as *mut GpuWorker) }
+                unsafe fn get(&self) -> &mut GpuWorker {
+                    &mut *(self.0 as *mut GpuWorker)
+                }
             }
             let worker_ptr = SendPtr(worker as *mut GpuWorker as usize);
 
@@ -1358,7 +1155,11 @@ mod inner {
                     w.forward_logits_partial(&metadata, max_layers)
                 });
 
-            Box::new(SelfDraftModel::new(num_draft_layers, vocab_size, partial_fn))
+            Box::new(SelfDraftModel::new(
+                num_draft_layers,
+                vocab_size,
+                partial_fn,
+            ))
         }
 
         /// Run a single request through speculative decoding.
@@ -1398,7 +1199,9 @@ mod inner {
             // Build draft model.
             let draft: Box<dyn rvllm_speculative::DraftModel> = if use_self_draft {
                 // SAFETY: see build_self_draft docs.
-                unsafe { Self::build_self_draft(&mut self.worker, vocab_size, block_size, draft_layers) }
+                unsafe {
+                    Self::build_self_draft(&mut self.worker, vocab_size, block_size, draft_layers)
+                }
             } else {
                 let draft_path = Self::speculative_draft_model().unwrap_or_default();
                 let cfg = SpeculativeConfig::new(draft_path, k);
@@ -1447,10 +1250,7 @@ mod inner {
 
             info!(
                 k,
-                draft_layers,
-                total_layers,
-                max_tokens,
-                "benchmarking speculative decoding"
+                draft_layers, total_layers, max_tokens, "benchmarking speculative decoding"
             );
 
             // --- Standard decode baseline ---
@@ -1527,8 +1327,7 @@ mod inner {
                 );
 
                 let needed_blocks = (context.len() + block_size - 1) / block_size;
-                let block_table: Vec<BlockId> =
-                    (0..needed_blocks as u32).map(BlockId).collect();
+                let block_table: Vec<BlockId> = (0..needed_blocks as u32).map(BlockId).collect();
                 let mut block_tables = HashMap::new();
                 block_tables.insert(seq_id, block_table);
 
@@ -1587,4 +1386,6 @@ mod inner {
 }
 
 #[cfg(feature = "cuda")]
-pub use inner::{AbortQueue, GpuLLMEngine, GpuTargetModel, PendingRequest, RequestQueue, SpeculativeBenchResult};
+pub use inner::{
+    AbortQueue, GpuLLMEngine, GpuTargetModel, PendingRequest, RequestQueue, SpeculativeBenchResult,
+};

@@ -74,6 +74,10 @@ pub struct CliArgs {
     #[arg(long, default_value_t = 2048)]
     pub max_num_batched_tokens: usize,
 
+    /// Max prompt tokens processed per prefill step. 0 disables chunking.
+    #[arg(long, default_value_t = 128)]
+    pub max_prefill_chunk: usize,
+
     /// Max padding tokens in a batch.
     #[arg(long, default_value_t = 256)]
     pub max_paddings: usize,

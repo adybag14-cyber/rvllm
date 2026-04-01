@@ -61,10 +61,11 @@ fn prepare_prefill(metadata: &[SequenceGroupMetadata], block_size: usize) -> Res
     for group in metadata {
         for (seq_id, seq_data) in &group.seq_data {
             let prompt_tokens = &seq_data.prompt_token_ids;
-            let seq_len = prompt_tokens.len();
+            let prior_len = seq_data.output_token_ids.len();
+            let seq_len = prior_len + prompt_tokens.len();
 
             token_ids.extend_from_slice(prompt_tokens);
-            position_ids.extend(0..seq_len as u32);
+            position_ids.extend((prior_len as u32)..(seq_len as u32));
             context_lens.push(seq_len as u32);
 
             // Build slot mapping from block table
@@ -74,7 +75,7 @@ fn prepare_prefill(metadata: &[SequenceGroupMetadata], block_size: usize) -> Res
                 .map(|t| t.as_slice())
                 .unwrap_or(&[]);
 
-            for pos in 0..seq_len {
+            for pos in prior_len..seq_len {
                 let block_idx = pos / block_size;
                 let block_offset = pos % block_size;
                 if block_idx < bt.len() {
@@ -96,7 +97,14 @@ fn prepare_prefill(metadata: &[SequenceGroupMetadata], block_size: usize) -> Res
         position_ids,
         attention_metadata: AttentionMetadata {
             slot_mapping,
-            query_lens: context_lens.clone(), // prefill: query_lens == context_lens
+            query_lens: metadata
+                .iter()
+                .flat_map(|g| {
+                    g.seq_data
+                        .values()
+                        .map(|sd| sd.prompt_token_ids.len() as u32)
+                })
+                .collect(),
             context_lens,
             block_tables: block_tables_out,
             max_context_len,
@@ -177,10 +185,11 @@ fn prepare_prefill_refs(
     for group in metadata {
         for (seq_id, seq_data) in &group.seq_data {
             let prompt_tokens = &seq_data.prompt_token_ids;
-            let seq_len = prompt_tokens.len();
+            let prior_len = seq_data.output_token_ids.len();
+            let seq_len = prior_len + prompt_tokens.len();
 
             token_ids.extend_from_slice(prompt_tokens);
-            position_ids.extend(0..seq_len as u32);
+            position_ids.extend((prior_len as u32)..(seq_len as u32));
             context_lens.push(seq_len as u32);
 
             let bt = group
@@ -189,7 +198,7 @@ fn prepare_prefill_refs(
                 .map(|t| t.as_slice())
                 .unwrap_or(&[]);
 
-            for pos in 0..seq_len {
+            for pos in prior_len..seq_len {
                 let block_idx = pos / block_size;
                 let block_offset = pos % block_size;
                 if block_idx < bt.len() {
@@ -211,7 +220,14 @@ fn prepare_prefill_refs(
         position_ids,
         attention_metadata: AttentionMetadata {
             slot_mapping,
-            query_lens: context_lens.clone(),
+            query_lens: metadata
+                .iter()
+                .flat_map(|g| {
+                    g.seq_data
+                        .values()
+                        .map(|sd| sd.prompt_token_ids.len() as u32)
+                })
+                .collect(),
             context_lens,
             block_tables: block_tables_out,
             max_context_len,
@@ -375,8 +391,12 @@ pub fn prepare_decode_reuse(
         for (seq_id, seq_data) in &group.seq_data {
             // Build all token ids in scratch buffer
             scratch.all_tokens.clear();
-            scratch.all_tokens.extend_from_slice(&seq_data.prompt_token_ids);
-            scratch.all_tokens.extend_from_slice(&seq_data.output_token_ids);
+            scratch
+                .all_tokens
+                .extend_from_slice(&seq_data.prompt_token_ids);
+            scratch
+                .all_tokens
+                .extend_from_slice(&seq_data.output_token_ids);
 
             let last_token = scratch.all_tokens.last().copied().unwrap_or(0);
             scratch.token_ids.push(last_token);
@@ -395,7 +415,9 @@ pub fn prepare_decode_reuse(
             let block_offset = (seq_len - 1) % block_size;
             if block_idx < bt.len() {
                 let physical_block = bt[block_idx].0;
-                scratch.slot_mapping.push(physical_block * block_size as u32 + block_offset as u32);
+                scratch
+                    .slot_mapping
+                    .push(physical_block * block_size as u32 + block_offset as u32);
             } else {
                 scratch.slot_mapping.push(0);
             }

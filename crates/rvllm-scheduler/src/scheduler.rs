@@ -1,6 +1,6 @@
 //! Core scheduler: continuous batching with preemption and chunked prefill.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
 
 use rvllm_block_manager::BlockManager;
@@ -46,7 +46,7 @@ impl SequenceGroup {
 
     /// Number of prompt tokens (from the first sequence).
     pub fn prompt_len(&self) -> usize {
-        self.sequences.first().map_or(0, |s| s.get_len())
+        self.sequences.first().map_or(0, |s| s.get_prompt_len())
     }
 
     /// Remaining prompt tokens to prefill.
@@ -184,6 +184,81 @@ impl Scheduler {
 
     pub fn num_swapped(&self) -> usize {
         self.swapped.len()
+    }
+
+    pub fn live_seq_ids(&self) -> HashSet<rvllm_core::prelude::SequenceId> {
+        self.waiting
+            .iter()
+            .chain(self.running.iter())
+            .chain(self.swapped.iter())
+            .flat_map(|g| g.sequences.iter().map(|s| s.seq_id))
+            .collect()
+    }
+
+    pub fn get_block_table(&self, seq_id: rvllm_core::prelude::SequenceId) -> Option<Vec<BlockId>> {
+        self.block_manager
+            .get_block_table(seq_id)
+            .map(|table| table.iter().map(|b| b.block_id).collect())
+    }
+
+    pub fn update_seq_token(
+        &mut self,
+        seq_id: rvllm_core::prelude::SequenceId,
+        token_id: rvllm_core::prelude::TokenId,
+        logprob: f32,
+    ) -> Result<()> {
+        for group in self
+            .running
+            .iter_mut()
+            .chain(self.waiting.iter_mut())
+            .chain(self.swapped.iter_mut())
+        {
+            for seq in &mut group.sequences {
+                if seq.seq_id == seq_id {
+                    seq.append_token(token_id, logprob);
+                    self.block_manager.allocate(seq)?;
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn finish_seq(
+        &mut self,
+        seq_id: rvllm_core::prelude::SequenceId,
+        status: SequenceStatus,
+    ) -> Result<()> {
+        for group in self
+            .running
+            .iter_mut()
+            .chain(self.waiting.iter_mut())
+            .chain(self.swapped.iter_mut())
+        {
+            for seq in &mut group.sequences {
+                if seq.seq_id == seq_id {
+                    seq.set_status(status)?;
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn register_finished_prompt(&mut self, seq_id: rvllm_core::prelude::SequenceId) {
+        for group in self
+            .running
+            .iter()
+            .chain(self.waiting.iter())
+            .chain(self.swapped.iter())
+        {
+            for seq in &group.sequences {
+                if seq.seq_id == seq_id {
+                    self.block_manager.register_prefix(seq);
+                    return;
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

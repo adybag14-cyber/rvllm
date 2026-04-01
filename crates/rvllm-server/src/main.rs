@@ -42,6 +42,10 @@ enum Commands {
         tensor_parallel_size: usize,
         #[arg(long, default_value_t = 256)]
         max_num_seqs: usize,
+        #[arg(long, default_value_t = 8192)]
+        max_num_batched_tokens: usize,
+        #[arg(long, default_value_t = 128)]
+        max_prefill_chunk: usize,
         #[arg(long)]
         tokenizer: Option<String>,
         #[arg(long, default_value = "info")]
@@ -113,7 +117,9 @@ fn detect_device_string() -> anyhow::Result<&'static str> {
         if !devices.is_empty() {
             return Ok("cuda");
         }
-        anyhow::bail!("cuda feature enabled but no CUDA devices found; refusing to start non-GPU backend")
+        anyhow::bail!(
+            "cuda feature enabled but no CUDA devices found; refusing to start non-GPU backend"
+        )
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -137,6 +143,8 @@ async fn main() -> anyhow::Result<()> {
             num_cpu_blocks,
             tensor_parallel_size,
             max_num_seqs,
+            max_num_batched_tokens,
+            max_prefill_chunk,
             tokenizer,
             log_level,
             disable_telemetry,
@@ -173,6 +181,8 @@ async fn main() -> anyhow::Result<()> {
                     .scheduler(
                         SchedulerConfigImpl::builder()
                             .max_num_seqs(max_num_seqs)
+                            .max_num_batched_tokens(max_num_batched_tokens)
+                            .max_prefill_chunk(max_prefill_chunk)
                             .build(),
                     )
                     .parallel(
@@ -205,6 +215,8 @@ async fn main() -> anyhow::Result<()> {
                 num_gpu_blocks = num_gpu_blocks,
                 num_cpu_blocks = num_cpu_blocks,
                 tp_size = tensor_parallel_size,
+                max_num_batched_tokens = max_num_batched_tokens,
+                max_prefill_chunk = max_prefill_chunk,
                 "starting server"
             );
 
@@ -242,10 +254,8 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("model: {model}  output_len: {output_len}  dtype: {dtype}");
             }
 
-            let batch_sizes: Vec<usize> = n
-                .split(',')
-                .filter_map(|s| s.trim().parse().ok())
-                .collect();
+            let batch_sizes: Vec<usize> =
+                n.split(',').filter_map(|s| s.trim().parse().ok()).collect();
 
             // Build engine config
             let config = {
@@ -291,131 +301,153 @@ async fn main() -> anyhow::Result<()> {
 
             #[cfg(feature = "cuda")]
             {
-            // Each batch size runs as a separate process to avoid CUDA context
-            // poisoning between different graph captures.
-            if batch_sizes.len() > 1 {
-                let exe = std::env::current_exe()?;
-                for &batch in &batch_sizes {
-                    let output = std::process::Command::new(&exe)
-                        .arg("benchmark")
-                        .arg("--model").arg(&model)
-                        .arg("--dtype").arg(format!("{dtype}"))
-                        .arg("--output-len").arg(format!("{output_len}"))
-                        .arg("--max-model-len").arg(format!("{max_model_len}"))
-                        .arg("--gpu-memory-utilization").arg(format!("{gpu_memory_utilization}"))
-                        .arg("--n").arg(format!("{batch}"))
-                        .args(if json { vec!["--json"] } else { vec![] })
-                        .env("RVLLM_PTX_DIR", std::env::var("RVLLM_PTX_DIR").unwrap_or_default())
-                        .output()?;
-                    // Print child's stderr (bench results) and stdout (json)
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    for line in stderr.lines() {
-                        if !line.is_empty() { eprintln!("{line}"); }
+                // Each batch size runs as a separate process to avoid CUDA context
+                // poisoning between different graph captures.
+                if batch_sizes.len() > 1 {
+                    let exe = std::env::current_exe()?;
+                    for &batch in &batch_sizes {
+                        let output = std::process::Command::new(&exe)
+                            .arg("benchmark")
+                            .arg("--model")
+                            .arg(&model)
+                            .arg("--dtype")
+                            .arg(format!("{dtype}"))
+                            .arg("--output-len")
+                            .arg(format!("{output_len}"))
+                            .arg("--max-model-len")
+                            .arg(format!("{max_model_len}"))
+                            .arg("--gpu-memory-utilization")
+                            .arg(format!("{gpu_memory_utilization}"))
+                            .arg("--n")
+                            .arg(format!("{batch}"))
+                            .args(if json { vec!["--json"] } else { vec![] })
+                            .env(
+                                "RVLLM_PTX_DIR",
+                                std::env::var("RVLLM_PTX_DIR").unwrap_or_default(),
+                            )
+                            .output()?;
+                        // Print child's stderr (bench results) and stdout (json)
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        for line in stderr.lines() {
+                            if !line.is_empty() {
+                                eprintln!("{line}");
+                            }
+                        }
+                        if !stdout.is_empty() {
+                            println!("{stdout}");
+                        }
                     }
-                    if !stdout.is_empty() { println!("{stdout}"); }
+                    return Ok(()); // We handled everything via subprocesses
                 }
-                return Ok(()); // We handled everything via subprocesses
-            }
 
-            // Single batch size -- run directly in this process.
-            let engine = rvllm_engine::AsyncGpuLLMEngine::new(config.clone()).await?;
-            let mut results = Vec::new();
+                // Single batch size -- run directly in this process.
+                let engine = rvllm_engine::AsyncGpuLLMEngine::new(config.clone()).await?;
+                let mut results = Vec::new();
 
-            for &batch in &batch_sizes {
-
-            // Warmup: fire `batch` requests to trigger graph capture at this N
-            {
-                let mut warmup_handles = Vec::new();
-                for i in 0..batch {
-                    let eng = engine.clone();
-                    let p = rvllm_core::types::SamplingParams {
+                for &batch in &batch_sizes {
+                    // Warmup: fire `batch` requests to trigger graph capture at this N
+                    {
+                        let mut warmup_handles = Vec::new();
+                        for i in 0..batch {
+                            let eng = engine.clone();
+                            let p = rvllm_core::types::SamplingParams {
+                                temperature: 0.0,
+                                max_tokens: 5,
+                                ..Default::default()
+                            };
+                            warmup_handles.push(tokio::spawn(async move {
+                                if let Ok((_id, mut s)) = eng.generate(format!("warm {i}"), p).await
+                                {
+                                    while s.next().await.is_some() {}
+                                }
+                            }));
+                        }
+                        for h in warmup_handles {
+                            let _ = h.await;
+                        }
+                    }
+                    // Fire N requests concurrently
+                    let params = rvllm_core::types::SamplingParams {
                         temperature: 0.0,
-                        max_tokens: 5,
+                        max_tokens: output_len,
                         ..Default::default()
                     };
-                    warmup_handles.push(tokio::spawn(async move {
-                        if let Ok((_id, mut s)) = eng.generate(format!("warm {i}"), p).await {
-                            while s.next().await.is_some() {}
-                        }
-                    }));
-                }
-                for h in warmup_handles { let _ = h.await; }
-            }
-                // Fire N requests concurrently
-                let params = rvllm_core::types::SamplingParams {
-                    temperature: 0.0,
-                    max_tokens: output_len,
-                    ..Default::default()
-                };
 
-                let t0 = std::time::Instant::now();
-                let mut handles = Vec::with_capacity(batch);
-                for i in 0..batch {
-                    let eng = engine.clone();
-                    let p = params.clone();
-                    let prompt = format!("Write about topic number {i}");
-                    handles.push(tokio::spawn(async move {
-                        match eng.generate(prompt, p).await {
-                            Ok((_id, mut stream)) => {
-                                let mut toks = 0usize;
-                                while let Some(out) = stream.next().await {
-                                    if out.finished {
-                                        for c in &out.outputs {
-                                            toks += c.token_ids.len();
+                    let t0 = std::time::Instant::now();
+                    let mut handles = Vec::with_capacity(batch);
+                    for i in 0..batch {
+                        let eng = engine.clone();
+                        let p = params.clone();
+                        let prompt = format!("Write about topic number {i}");
+                        handles.push(tokio::spawn(async move {
+                            match eng.generate(prompt, p).await {
+                                Ok((_id, mut stream)) => {
+                                    let mut toks = 0usize;
+                                    while let Some(out) = stream.next().await {
+                                        if out.finished {
+                                            for c in &out.outputs {
+                                                toks += c.token_ids.len();
+                                            }
                                         }
                                     }
+                                    toks
                                 }
-                                toks
+                                Err(e) => {
+                                    eprintln!("  generate error: {e}");
+                                    0
+                                }
                             }
-                            Err(e) => {
-                                eprintln!("  generate error: {e}");
-                                0
-                            }
-                        }
-                    }));
-                }
-
-                let mut total_toks = 0usize;
-                let mut failed = 0usize;
-                for h in handles {
-                    match h.await {
-                        Ok(t) if t > 0 => total_toks += t,
-                        _ => failed += 1,
+                        }));
                     }
+
+                    let mut total_toks = 0usize;
+                    let mut failed = 0usize;
+                    for h in handles {
+                        match h.await {
+                            Ok(t) if t > 0 => total_toks += t,
+                            _ => failed += 1,
+                        }
+                    }
+                    let elapsed = t0.elapsed();
+                    let tps = total_toks as f64 / elapsed.as_secs_f64();
+
+                    if json {
+                        results.push(serde_json::json!({
+                            "n": batch,
+                            "total_tokens": total_toks,
+                            "elapsed_ms": elapsed.as_millis(),
+                            "tok_per_sec": (tps * 10.0).round() / 10.0,
+                            "failed": failed,
+                        }));
+                    } else {
+                        eprintln!(
+                            "N={:<4} {:>6} tok  {:>6}ms  {:>8.1} tok/s  {}",
+                            batch,
+                            total_toks,
+                            elapsed.as_millis(),
+                            tps,
+                            if failed > 0 {
+                                format!("({failed} failed)")
+                            } else {
+                                "ok".into()
+                            },
+                        );
+                    }
+                    // engine dropped here (single iteration when running as subprocess)
                 }
-                let elapsed = t0.elapsed();
-                let tps = total_toks as f64 / elapsed.as_secs_f64();
 
                 if json {
-                    results.push(serde_json::json!({
-                        "n": batch,
-                        "total_tokens": total_toks,
-                        "elapsed_ms": elapsed.as_millis(),
-                        "tok_per_sec": (tps * 10.0).round() / 10.0,
-                        "failed": failed,
-                    }));
-                } else {
-                    eprintln!(
-                        "N={:<4} {:>6} tok  {:>6}ms  {:>8.1} tok/s  {}",
-                        batch,
-                        total_toks,
-                        elapsed.as_millis(),
-                        tps,
-                        if failed > 0 { format!("({failed} failed)") } else { "ok".into() },
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "engine": "rvllm",
+                            "model": model,
+                            "output_len": output_len,
+                            "results": results,
+                        }))?
                     );
                 }
-                // engine dropped here (single iteration when running as subprocess)
-            }
-
-            if json {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                    "engine": "rvllm",
-                    "model": model,
-                    "output_len": output_len,
-                    "results": results,
-                }))?);
-            }
             } // #[cfg(feature = "cuda")]
         }
     }
