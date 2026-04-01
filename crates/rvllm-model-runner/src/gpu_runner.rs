@@ -1746,18 +1746,12 @@ mod cuda_impl {
             let p_sync       = DevicePtr::device_ptr(&sync_gpu, &self.stream).0;
             let p_keys       = DevicePtr::device_ptr(&key_ptrs_gpu, &self.stream).0;
             let p_vals       = DevicePtr::device_ptr(&val_ptrs_gpu, &self.stream).0;
-            let p_block_tables = DevicePtr::device_ptr(
-                &packed_buf.slice(offsets.block_tables..offsets.block_tables + offsets.num_block_tables),
-                &self.stream).0;
-            let p_context_lens = DevicePtr::device_ptr(
-                &packed_buf.slice(offsets.context_lens..offsets.context_lens + offsets.num_context_lens),
-                &self.stream).0;
-            let p_positions = DevicePtr::device_ptr(
-                &packed_buf.slice(offsets.positions..offsets.positions + offsets.num_positions),
-                &self.stream).0;
-            let p_slot_mapping = DevicePtr::device_ptr(
-                &packed_buf.slice(offsets.slot_mapping..offsets.slot_mapping + offsets.num_slot_mapping),
-                &self.stream).0;
+            // Compute metadata pointers via base + byte offset (avoids slice bounds issues)
+            let p_packed_base = DevicePtr::device_ptr(packed_buf, &self.stream).0;
+            let p_block_tables = p_packed_base + (offsets.block_tables * 4) as u64;
+            let p_context_lens = p_packed_base + (offsets.context_lens * 4) as u64;
+            let p_positions    = p_packed_base + (offsets.positions * 4) as u64;
+            let p_slot_mapping = p_packed_base + (offsets.slot_mapping * 4) as u64;
             let p_rope_cos   = DevicePtr::device_ptr(&self.rope_cos, &self.stream).0;
             let p_rope_sin   = DevicePtr::device_ptr(&self.rope_sin, &self.stream).0;
             let p_output     = DevicePtr::device_ptr(&output_gpu, &self.stream).0;
