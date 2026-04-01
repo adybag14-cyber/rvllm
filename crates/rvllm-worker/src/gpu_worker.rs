@@ -787,6 +787,10 @@ impl GpuWorker {
 
         // Find CUTLASS headers for CuTE includes
         let cutlass_dirs: Vec<std::path::PathBuf> = [
+            "./cutlass/include",
+            "./cutlass/tools/util/include",
+            "/root/rvllm/cutlass/include",
+            "/root/rvllm/cutlass/tools/util/include",
             "/root/cutlass/include",
             "/root/cutlass/tools/util/include",
             "/usr/local/cutlass/include",
