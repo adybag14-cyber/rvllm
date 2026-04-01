@@ -97,31 +97,35 @@ No Python interpreter, no GIL, no garbage collector, no PyTorch tensor allocatio
 
 ### Zig SIMD Acceleration
 
-Hot-path sampling primitives and weight conversion use a Zig SIMD backend (`rvllm-zig`). `@Vector(16, f32)` maps to NEON on aarch64 and AVX-512 on x86_64 servers. Benchmarked on Apple M5 (128K vocab = LLaMA-3 scale):
+Hot-path sampling primitives and weight conversion use a Zig SIMD backend (`rvllm-zig`). `@Vector(16, f32)` maps to NEON on aarch64, AVX-512 on x86_64 servers (`-mcpu=x86_64_v4`). Benchmarked on Apple M5 (128K vocab = LLaMA-3 scale):
 
 | Operation | Zig SIMD | Rust (scalar) | Speedup |
 |---|---:|---:|---|
-| softmax (128K) | 111 us | 169 us | **1.52x** |
-| argmax (128K) | 9.0 us | 60.4 us | **6.73x** |
-| scale (128K) | 6.9 us | 6.9 us | 1.0x (memory-bound) |
-| bf16->f16 (16M) | 710 us | -- | -- |
-| f32->f16 (16M) | 1.22 ms | -- | -- |
+| softmax (128K) | 134 us | 192 us | **1.44x** |
+| argmax (128K) | 9.2 us | 58 us | **6.31x** |
+| argmax+logprob fused (128K) | 131 us | 213 us | **1.62x** |
+| scale (128K) | 6.9 us | 6.8 us | 1.0x (memory-bound) |
+| bf16->f16 (16M) | 637 us | -- | -- |
+| f32->f16 (16M) | 1.07 ms | -- | -- |
 
-End-to-end sampling improvement (criterion, 128K vocab):
+The fused `argmax_logprob` kernel computes greedy token selection + log-probability in 2 SIMD passes (argmax+exp-sum) instead of 4 separate scalar passes. `apply_min_p` uses a logit-space threshold (`max + ln(min_p)`) to avoid softmax allocation entirely.
+
+End-to-end sampling improvement (criterion, 128K vocab, vs pure Rust):
 
 | Sampler | Change |
 |---|---|
-| greedy | **-12%** |
-| top-k | **-9%** |
-| top-p | **-5%** |
-| repetition penalty | **-13%** |
+| greedy (128K) | **-17%** (141 us) |
+| greedy (32K) | **-10%** (35 us) |
+| repetition penalty | **-7%** (143 us) |
+| top-p | no change (1.20 ms, sort-dominated) |
+| top-k | no change (358 us, quickselect-dominated) |
 
 Weight conversion throughput (16M elements = one 4096x4096 weight matrix):
 
 | Conversion | Throughput |
 |---|---|
-| bf16 -> f16 | 47.9 GB/s |
-| f32 -> f16 | 56.3 GB/s |
+| bf16 -> f16 | 48.9 GB/s |
+| f32 -> f16 | 58.3 GB/s |
 
 Zig is a hard build dependency -- no fallbacks.
 
