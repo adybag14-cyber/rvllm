@@ -45,13 +45,22 @@ PROMPTS = [
 ]
 
 
-async def send_request(session, url, prompt, max_tokens=128, model="default"):
+async def send_request(
+    session,
+    url,
+    prompt,
+    max_tokens=128,
+    model="default",
+    temperature=0.0,
+    top_p=1.0,
+):
     """Send a non-streaming completion request and measure wall-clock latency."""
     payload = {
         "model": model,
         "prompt": prompt,
         "max_tokens": max_tokens,
-        "temperature": 0.8,
+        "temperature": temperature,
+        "top_p": top_p,
         "stream": False,
     }
 
@@ -80,7 +89,15 @@ async def send_request(session, url, prompt, max_tokens=128, model="default"):
     }
 
 
-async def run_benchmark(url, num_prompts, concurrency, max_tokens=128, model="default"):
+async def run_benchmark(
+    url,
+    num_prompts,
+    concurrency,
+    max_tokens=128,
+    model="default",
+    temperature=0.0,
+    top_p=1.0,
+):
     prompts = [PROMPTS[i % len(PROMPTS)] for i in range(num_prompts)]
     semaphore = asyncio.Semaphore(concurrency)
     results = []
@@ -89,7 +106,15 @@ async def run_benchmark(url, num_prompts, concurrency, max_tokens=128, model="de
     async def limited_request(session, prompt):
         nonlocal errors
         async with semaphore:
-            result = await send_request(session, url, prompt, max_tokens, model)
+            result = await send_request(
+                session,
+                url,
+                prompt,
+                max_tokens,
+                model,
+                temperature,
+                top_p,
+            )
             if result is None:
                 errors += 1
             else:
@@ -121,6 +146,8 @@ async def run_benchmark(url, num_prompts, concurrency, max_tokens=128, model="de
         "successful_requests": len(results),
         "concurrency": concurrency,
         "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
         "total_time_sec": total_time,
         "total_prompt_tokens": total_prompt_tokens,
         "total_completion_tokens": total_completion_tokens,
@@ -147,15 +174,28 @@ def main():
     parser.add_argument("--num-prompts", type=int, default=200)
     parser.add_argument("--concurrent", type=int, default=16)
     parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--output", default="results.json")
     args = parser.parse_args()
 
     print(f"Benchmarking {args.url} (non-streaming)")
     print(f"  Model: {args.model}")
-    print(f"  Prompts: {args.num_prompts}, Concurrency: {args.concurrent}, Max tokens: {args.max_tokens}")
+    print(
+        f"  Prompts: {args.num_prompts}, Concurrency: {args.concurrent}, "
+        f"Max tokens: {args.max_tokens}, Temperature: {args.temperature}, Top-p: {args.top_p}"
+    )
 
     result = asyncio.run(
-        run_benchmark(args.url, args.num_prompts, args.concurrent, args.max_tokens, args.model)
+        run_benchmark(
+            args.url,
+            args.num_prompts,
+            args.concurrent,
+            args.max_tokens,
+            args.model,
+            args.temperature,
+            args.top_p,
+        )
     )
 
     if result:

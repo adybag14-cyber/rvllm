@@ -22,23 +22,27 @@ RVLLM_CMD = [
     "/root/rvllm/target/release/rvllm", "serve",
     "--model", MODEL,
     "--dtype", "half",
-    "--gpu-memory-utilization", "1.0",
-    "--gpu-memory-reserve-gb", "2.0",
+    "--max-model-len", "2048",
+    "--gpu-memory-utilization", "0.90",
+    "--gpu-memory-reserve-gb", "0.0",
     "--port", "8000",
 ]
 
 VLLM_CMD = [
     "/root/venv/bin/vllm", "serve", MODEL,
     "--dtype", "half",
+    "--max-model-len", "2048",
     "--gpu-memory-utilization", "0.90",
     "--host", "0.0.0.0",
     "--port", "8000",
 ]
 
 HEALTH_TIMEOUT = 300
-CONCURRENCY = 64
+CONCURRENCY = 32
 TARGET_COMPLETION_TOKENS = 10_000
 MAX_TOKENS = 128
+TEMPERATURE = 0.0
+TOP_P = 1.0
 # 128 * 128 = 16,384 max completion tokens. This gives plenty of headroom while
 # keeping the race small and stable.
 NUM_REQUESTS = max(CONCURRENCY * 2, math.ceil(TARGET_COMPLETION_TOKENS / MAX_TOKENS) + CONCURRENCY)
@@ -104,6 +108,8 @@ def run_benchmark_via_client(port: int, output_path: Path):
         "--num-prompts", str(NUM_REQUESTS),
         "--concurrent", str(CONCURRENCY),
         "--max-tokens", str(MAX_TOKENS),
+        "--temperature", str(TEMPERATURE),
+        "--top-p", str(TOP_P),
         "--output", str(output_path),
     ]
 
