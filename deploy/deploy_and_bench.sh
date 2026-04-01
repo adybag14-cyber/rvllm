@@ -221,7 +221,7 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
     BUILD_START=$(date +%s)
 
     if command -v nvcc &>/dev/null; then
-        cargo build --release --features cuda -p rvllm-server \
+        cargo build --release --features cuda,cublaslt -p rvllm-server \
             --manifest-path "$REPO_DIR/Cargo.toml" 2>&1 | tail -5
     else
         cargo build --release -p rvllm-server \
@@ -265,7 +265,7 @@ start_server() {
     RVLLM_PTX_DIR="${RVLLM_PTX_DIR}" "$BINARY" serve \
         --model "$MODEL" \
         --port "$PORT" \
-        --gpu-memory-utilization 0.90 \
+        --gpu-memory-utilization 0.98 \
         --dtype half \
         $extra_args \
         > /tmp/rvllm_deploy.log 2>&1 &
