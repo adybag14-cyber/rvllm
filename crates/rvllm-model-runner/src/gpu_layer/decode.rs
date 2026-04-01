@@ -486,7 +486,7 @@ impl GpuTransformerLayer {
                 .arg(&mut gate_up_out).arg(&mut residual_out2)
                 .arg(residual_ref).arg(&attn_proj).arg(post_norm_w).arg(fused_gate_up_w)
                 .arg(&cfg.rms_norm_eps).arg(&(hidden as i32)).arg(&(gate_up_dim as i32))
-                .launch(LaunchConfig { grid_dim: ((gate_up_dim as u32 + 31) / 32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem })
+                .launch(LaunchConfig { grid_dim: ((gate_up_dim as u32 + rpb - 1) / rpb, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem })
                 .map_err(|e| LLMError::GpuError(format!("fused add_norm_gateup: {e}")))?;
         }
         let mlp = self.fused_silu_down(weights, &gate_up_out, hidden, intermediate)?;

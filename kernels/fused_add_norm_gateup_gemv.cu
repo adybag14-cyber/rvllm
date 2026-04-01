@@ -20,7 +20,7 @@
 #include <cuda_fp8.h>
 
 #define THREADS 256
-#define ROWS_PER_BLOCK 32
+#define ROWS_PER_BLOCK 8
 
 __device__ __forceinline__ float warp_reduce_sum_angv(float val) {
     #pragma unroll
@@ -113,16 +113,12 @@ fused_cute_add_norm_gateup_gemv(
     }
     __syncthreads();
 
-    // ---- Phase 2: GEMV -- warp-per-row, multi-row per warp, 128-bit loads ----
-    // Each warp handles ROWS_PER_WARP consecutive rows to reduce block count
-    // and amortize smem norm computation across more output rows.
+    // ---- Phase 2: GEMV -- warp-per-row, 128-bit vectorized weight loads ----
     {
-        const int h8 = hidden_size / 8;
-        const int ROWS_PER_WARP = 4;  // 8 warps * 4 = 32 rows per block
-        for (int rr = 0; rr < ROWS_PER_WARP; rr++) {
-            const int row = block_row_base + warp_id * ROWS_PER_WARP + rr;
-            if (row >= gate_up_dim) break;
+        const int row = block_row_base + warp_id;
+        if (row < gate_up_dim) {
             const int4* w4 = (const int4*)(proj_weight + (long long)row * hidden_size);
+            const int h8 = hidden_size / 8;
             float acc = 0.0f;
             #pragma unroll 4
             for (int i = lane_id; i < h8; i += 32) {
@@ -228,11 +224,9 @@ fused_cute_add_norm_gateup_fp8_gemv(
     }
     __syncthreads();
 
-    // ---- Phase 2: GEMV with FP8 weights -- multi-row per warp ----
+    // ---- Phase 2: GEMV with FP8 weights -- warp-per-row ----
     {
-        const int ROWS_PER_WARP_FP8 = 4;
-        for (int rr = 0; rr < ROWS_PER_WARP_FP8; rr++) {
-        const int row = block_row_base + warp_id * ROWS_PER_WARP_FP8 + rr;
+        const int row = block_row_base + warp_id;
         if (row < gate_up_dim) {
             const unsigned char* w_row = proj_weight + (long long)row * hidden_size;
             float row_sc = __half2float(weight_scale[row]);
@@ -265,6 +259,5 @@ fused_cute_add_norm_gateup_fp8_gemv(
                 output[row] = __float2half(acc);
             }
         }
-        } // rr loop
     }
 }
