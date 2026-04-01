@@ -8,10 +8,6 @@
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
   onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]});"></script>
-<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://unpkg.com/recharts/umd/Recharts.min.js"></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 html{font-size:17px;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
@@ -48,8 +44,20 @@ header .links a:hover{color:#fff}
 .hero-chart-legend{display:flex;flex-wrap:wrap;gap:0.75rem 1rem;margin-bottom:0.9rem;font-size:0.72rem;color:#96a0ae}
 .hero-chart-legend span{display:inline-flex;align-items:center;gap:0.45rem}
 .hero-chart-legend i{display:inline-block;width:10px;height:10px;border-radius:999px}
-.hero-chart-frame{height:360px}
-.hero-chart-http{height:360px}
+.hero-static-block{display:grid;gap:0.7rem}
+.hero-static-row{display:grid;grid-template-columns:52px 1fr;gap:0.8rem;align-items:start}
+.hero-static-label{font-size:0.72rem;color:#9aa5b4;padding-top:0.2rem}
+.hero-static-bars{display:grid;gap:0.35rem}
+.hero-static-track{position:relative;height:18px;border-radius:999px;background:#0c1016;border:1px solid #141a23;overflow:hidden}
+.hero-static-fill{height:100%;border-radius:999px}
+.hero-static-meta{display:flex;justify-content:space-between;gap:0.8rem;font-size:0.7rem;color:#8f9aab}
+.hero-static-meta strong{font-weight:600}
+.hero-static-series{display:inline-flex;align-items:center;gap:0.35rem}
+.hero-static-series i{display:inline-block;width:8px;height:8px;border-radius:999px}
+.hero-static-http{display:grid;gap:0.85rem}
+.hero-static-http-row{display:grid;gap:0.45rem}
+.hero-static-http-head{display:flex;justify-content:space-between;gap:0.75rem;font-size:0.76rem;color:#d6dde7}
+.hero-static-http-head strong{color:#fff}
 .hero-chart-notes{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:0.8rem;margin-top:0.9rem}
 .hero-chart-pill{border-radius:999px;padding:0.7rem 0.9rem;border:1px solid #1c2430;background:#0a0d12;font-size:0.76rem;color:#cfd6df}
 .hero-chart-pill strong{display:block;color:#fff;font-size:0.98rem;margin-bottom:0.1rem}
@@ -106,9 +114,9 @@ footer a:hover{color:#999}
   .hero-graphic{padding:0.8rem 0.75rem 0.7rem}
   .hero-chart-root{padding:0.8rem}
   .hero-chart-grid{grid-template-columns:1fr}
-  .hero-chart-frame,.hero-chart-http{height:300px}
   .hero-chart-notes{grid-template-columns:1fr}
   .hero-chart-row{grid-template-columns:1fr}
+  .hero-static-row{grid-template-columns:1fr}
   .container{padding:0 1.2rem}
   table{font-size:0.75rem}
   thead th,tbody td{padding:0.3rem 0.5rem}
@@ -135,7 +143,146 @@ footer a:hover{color:#999}
   <div class="hero-graphic">
     <div class="hero-graphic-title">Verified H100 Comparison</div>
     <div class="hero-graphic-sub">Three-way benchmark: stock vLLM vs rvllm-lite vs rvLLM, with both direct-engine and HTTP serving results.</div>
-    <div id="hero-chart-root" class="hero-chart-root" aria-label="rvLLM H100 comparison chart"></div>
+    <div class="hero-chart-root" aria-label="rvLLM H100 comparison chart">
+      <div class="hero-chart-legend">
+        <span><i style="background:#78CFFF"></i>stock vLLM 0.6.3.post1</span>
+        <span><i style="background:#F09FC2"></i>rvllm-lite</span>
+        <span><i style="background:#84E6B7"></i>rvLLM</span>
+      </div>
+
+      <div class="hero-chart-grid">
+        <div class="hero-chart-card">
+          <div class="hero-chart-head">
+            <div>
+              <h3>Direct Engine Throughput</h3>
+              <p>Rawer kernel/runtime view across increasing concurrency.</p>
+            </div>
+          </div>
+          <div class="hero-static-block">
+            <div class="hero-static-row">
+              <div class="hero-static-label">N=1</div>
+              <div class="hero-static-bars">
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:4.2%;background:#78CFFF"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:4.2%;background:#F09FC2"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:3.8%;background:#84E6B7"></div></div>
+                <div class="hero-static-meta">
+                  <span class="hero-static-series"><i style="background:#78CFFF"></i>133.7</span>
+                  <span class="hero-static-series"><i style="background:#F09FC2"></i>133.9</span>
+                  <span class="hero-static-series"><i style="background:#84E6B7"></i>120.6</span>
+                </div>
+              </div>
+            </div>
+            <div class="hero-static-row">
+              <div class="hero-static-label">N=4</div>
+              <div class="hero-static-bars">
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:17.0%;background:#78CFFF"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:17.0%;background:#F09FC2"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:13.4%;background:#84E6B7"></div></div>
+                <div class="hero-static-meta">
+                  <span class="hero-static-series"><i style="background:#78CFFF"></i>543.3</span>
+                  <span class="hero-static-series"><i style="background:#F09FC2"></i>542.8</span>
+                  <span class="hero-static-series"><i style="background:#84E6B7"></i>427.9</span>
+                </div>
+              </div>
+            </div>
+            <div class="hero-static-row">
+              <div class="hero-static-label">N=8</div>
+              <div class="hero-static-bars">
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:29.0%;background:#78CFFF"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:28.9%;background:#F09FC2"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:26.5%;background:#84E6B7"></div></div>
+                <div class="hero-static-meta">
+                  <span class="hero-static-series"><i style="background:#78CFFF"></i>926.1</span>
+                  <span class="hero-static-series"><i style="background:#F09FC2"></i>925.4</span>
+                  <span class="hero-static-series"><i style="background:#84E6B7"></i>845.8</span>
+                </div>
+              </div>
+            </div>
+            <div class="hero-static-row">
+              <div class="hero-static-label">N=16</div>
+              <div class="hero-static-bars">
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:60.5%;background:#78CFFF"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:52.1%;background:#F09FC2"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:51.6%;background:#84E6B7"></div></div>
+                <div class="hero-static-meta">
+                  <span class="hero-static-series"><i style="background:#78CFFF"></i>1934.5</span>
+                  <span class="hero-static-series"><i style="background:#F09FC2"></i>1664.8</span>
+                  <span class="hero-static-series"><i style="background:#84E6B7"></i>1648.9</span>
+                </div>
+              </div>
+            </div>
+            <div class="hero-static-row">
+              <div class="hero-static-label">N=32</div>
+              <div class="hero-static-bars">
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:100%;background:#78CFFF"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:93.7%;background:#F09FC2"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:99.2%;background:#84E6B7"></div></div>
+                <div class="hero-static-meta">
+                  <span class="hero-static-series"><i style="background:#78CFFF"></i>3197.1 tok/s</span>
+                  <span class="hero-static-series"><i style="background:#F09FC2"></i>2994.5 tok/s</span>
+                  <span class="hero-static-series"><i style="background:#84E6B7"></i>3170.0 tok/s</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="hero-chart-card">
+          <div class="hero-chart-head">
+            <div>
+              <h3>HTTP Serving Throughput</h3>
+              <p>200 requests, concurrency 32, max_tokens=256.</p>
+            </div>
+          </div>
+          <div class="hero-static-http">
+            <div class="hero-static-http-row">
+              <div class="hero-static-http-head"><strong>stock vLLM</strong><span>2861.9 tok/s</span></div>
+              <div class="hero-static-track"><div class="hero-static-fill" style="width:100%;background:#78CFFF"></div></div>
+            </div>
+            <div class="hero-static-http-row">
+              <div class="hero-static-http-head"><strong>rvllm-lite</strong><span>131.8 tok/s</span></div>
+              <div class="hero-static-track"><div class="hero-static-fill" style="width:4.6%;background:#F09FC2"></div></div>
+            </div>
+            <div class="hero-static-http-row">
+              <div class="hero-static-http-head"><strong>rvLLM</strong><span>2723.2 tok/s</span></div>
+              <div class="hero-static-track"><div class="hero-static-fill" style="width:95.2%;background:#84E6B7"></div></div>
+            </div>
+          </div>
+          <div class="hero-chart-table">
+            <div class="hero-chart-row">
+              <strong>stock vLLM</strong>
+              <span>single 41.0 tok/s</span>
+              <span>2061.9 ms avg latency, 71.9 GiB idle VRAM</span>
+            </div>
+            <div class="hero-chart-row">
+              <strong>rvllm-lite</strong>
+              <span>single 128.6 tok/s</span>
+              <span>43334.9 ms avg latency, 71.9 GiB idle VRAM</span>
+            </div>
+            <div class="hero-chart-row">
+              <strong>rvLLM</strong>
+              <span>single 120.2 tok/s</span>
+              <span>2685.2 ms avg latency, 75.2 GiB idle VRAM</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="hero-chart-notes">
+        <div class="hero-chart-pill">
+          <strong>0.99x at N=32</strong>
+          rvLLM closes to near parity with stock vLLM on direct engine at the highest tested concurrency.
+        </div>
+        <div class="hero-chart-pill">
+          <strong>HTTP class is real</strong>
+          rvLLM lands near stock vLLM on practical HTTP throughput instead of collapsing in the serving layer.
+        </div>
+        <div class="hero-chart-pill">
+          <strong>lite exposes the gap</strong>
+          rvllm-lite stays near stock direct-engine, then falls apart once the Python serving path is involved.
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -337,209 +484,5 @@ Decode paths (N=1):
 </footer>
 
 </div>
-<script type="text/babel">
-const {
-  ResponsiveContainer,
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  Legend,
-  Cell,
-  LabelList,
-} = Recharts;
-
-const COLORS = {
-  vllm: "#78CFFF",
-  lite: "#F09FC2",
-  rvllm: "#84E6B7",
-  grid: "#1A2130",
-  tick: "#97A3B6",
-  label: "#E8EDF5",
-  tooltipBg: "#0B0F16",
-  tooltipBorder: "#1E2735",
-};
-
-const directData = [
-  { n: "N=1", "stock vLLM": 133.7, "rvllm-lite": 133.9, rvLLM: 120.6 },
-  { n: "N=4", "stock vLLM": 543.3, "rvllm-lite": 542.8, rvLLM: 427.9 },
-  { n: "N=8", "stock vLLM": 926.1, "rvllm-lite": 925.4, rvLLM: 845.8 },
-  { n: "N=16", "stock vLLM": 1934.5, "rvllm-lite": 1664.8, rvLLM: 1648.9 },
-  { n: "N=32", "stock vLLM": 3197.1, "rvllm-lite": 2994.5, rvLLM: 3170.0 },
-];
-
-const httpData = [
-  { name: "stock vLLM", throughput: 2861.9, single: 41.0, latency: 2061.9, vram: 71.9, fill: COLORS.vllm },
-  { name: "rvllm-lite", throughput: 131.8, single: 128.6, latency: 43334.9, vram: 71.9, fill: COLORS.lite },
-  { name: "rvLLM", throughput: 2723.2, single: 120.2, latency: 2685.2, vram: 75.2, fill: COLORS.rvllm },
-];
-
-const tooltipStyle = {
-  backgroundColor: COLORS.tooltipBg,
-  border: `1px solid ${COLORS.tooltipBorder}`,
-  borderRadius: "12px",
-  color: COLORS.label,
-  boxShadow: "0 12px 30px rgba(0,0,0,0.35)",
-};
-
-function DirectTooltip({ active, payload, label }) {
-  if (!active || !payload?.length) return null;
-  return (
-    <div style={tooltipStyle}>
-      <div style={{ padding: "10px 12px 4px", color: COLORS.label, fontWeight: 700 }}>{label}</div>
-      <div style={{ padding: "0 12px 10px" }}>
-        {payload.map((entry) => (
-          <div key={entry.name} style={{ color: entry.color, fontSize: 13, marginTop: 4 }}>
-            {entry.name}: {entry.value.toFixed(1)} tok/s
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function HttpTooltip({ active, payload }) {
-  if (!active || !payload?.length) return null;
-  const row = payload[0].payload;
-  return (
-    <div style={tooltipStyle}>
-      <div style={{ padding: "10px 12px 4px", color: COLORS.label, fontWeight: 700 }}>{row.name}</div>
-      <div style={{ padding: "0 12px 10px", fontSize: 13, color: "#C9D2DD" }}>
-        <div>Load throughput: {row.throughput.toFixed(1)} tok/s</div>
-        <div>Single request: {row.single.toFixed(1)} tok/s</div>
-        <div>Avg latency: {row.latency.toFixed(1)} ms</div>
-        <div>Idle VRAM: {row.vram.toFixed(1)} GiB</div>
-      </div>
-    </div>
-  );
-}
-
-function HeroChart() {
-  return (
-    <div>
-      <div className="hero-chart-legend">
-        <span><i style={{ background: COLORS.vllm }}></i>stock vLLM 0.6.3.post1</span>
-        <span><i style={{ background: COLORS.lite }}></i>rvllm-lite</span>
-        <span><i style={{ background: COLORS.rvllm }}></i>rvLLM</span>
-      </div>
-
-      <div className="hero-chart-grid">
-        <div className="hero-chart-card">
-          <div className="hero-chart-head">
-            <div>
-              <h3>Direct Engine Throughput</h3>
-              <p>Rawer kernel/runtime view across increasing concurrency.</p>
-            </div>
-          </div>
-          <div className="hero-chart-frame">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart
-                data={directData}
-                margin={{ top: 8, right: 8, left: -18, bottom: 0 }}
-                barCategoryGap={12}
-              >
-                <CartesianGrid stroke={COLORS.grid} vertical={false} />
-                <XAxis
-                  dataKey="n"
-                  tick={{ fill: COLORS.tick, fontSize: 12 }}
-                  axisLine={{ stroke: COLORS.grid }}
-                  tickLine={false}
-                />
-                <YAxis
-                  tick={{ fill: COLORS.tick, fontSize: 12 }}
-                  axisLine={{ stroke: COLORS.grid }}
-                  tickLine={false}
-                  width={42}
-                />
-                <Tooltip content={<DirectTooltip />} cursor={{ fill: "rgba(255,255,255,0.03)" }} />
-                <Legend wrapperStyle={{ color: COLORS.tick, fontSize: 12, paddingTop: 8 }} />
-                <Bar dataKey="stock vLLM" fill={COLORS.vllm} radius={[8, 8, 0, 0]} />
-                <Bar dataKey="rvllm-lite" fill={COLORS.lite} radius={[8, 8, 0, 0]} />
-                <Bar dataKey="rvLLM" fill={COLORS.rvllm} radius={[8, 8, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
-
-        <div className="hero-chart-card">
-          <div className="hero-chart-head">
-            <div>
-              <h3>HTTP Serving Throughput</h3>
-              <p>200 requests, concurrency 32, max_tokens=256.</p>
-            </div>
-          </div>
-          <div className="hero-chart-http">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart
-                data={httpData}
-                layout="vertical"
-                margin={{ top: 8, right: 8, left: 10, bottom: 0 }}
-                barSize={28}
-              >
-                <CartesianGrid stroke={COLORS.grid} horizontal={false} />
-                <XAxis
-                  type="number"
-                  tick={{ fill: COLORS.tick, fontSize: 12 }}
-                  axisLine={{ stroke: COLORS.grid }}
-                  tickLine={false}
-                />
-                <YAxis
-                  type="category"
-                  dataKey="name"
-                  tick={{ fill: COLORS.label, fontSize: 12 }}
-                  axisLine={false}
-                  tickLine={false}
-                  width={84}
-                />
-                <Tooltip content={<HttpTooltip />} cursor={{ fill: "rgba(255,255,255,0.03)" }} />
-                <Bar dataKey="throughput" radius={[0, 10, 10, 0]}>
-                  {httpData.map((entry) => (
-                    <Cell key={entry.name} fill={entry.fill} />
-                  ))}
-                  <LabelList
-                    dataKey="throughput"
-                    position="right"
-                    formatter={(value) => `${value.toFixed(1)} tok/s`}
-                    style={{ fill: COLORS.label, fontSize: 12, fontWeight: 600 }}
-                  />
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-          <div className="hero-chart-table">
-            {httpData.map((row) => (
-              <div className="hero-chart-row" key={row.name}>
-                <strong>{row.name}</strong>
-                <span>single {row.single.toFixed(1)} tok/s</span>
-                <span>{row.latency.toFixed(1)} ms avg latency, {row.vram.toFixed(1)} GiB idle VRAM</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
-
-      <div className="hero-chart-notes">
-        <div className="hero-chart-pill">
-          <strong>0.99x at N=32</strong>
-          rvLLM closes to near parity with stock vLLM on direct engine at the highest tested concurrency.
-        </div>
-        <div className="hero-chart-pill">
-          <strong>HTTP class is real</strong>
-          rvLLM lands near stock vLLM on practical HTTP throughput instead of collapsing in the serving layer.
-        </div>
-        <div className="hero-chart-pill">
-          <strong>lite exposes the gap</strong>
-          rvllm-lite stays near stock direct-engine, then falls apart once the Python serving path is involved.
-        </div>
-      </div>
-    </div>
-  );
-}
-
-const root = ReactDOM.createRoot(document.getElementById("hero-chart-root"));
-root.render(<HeroChart />);
-</script>
 </body>
 </html>
