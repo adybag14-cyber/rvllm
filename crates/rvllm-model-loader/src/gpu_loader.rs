@@ -269,14 +269,27 @@ mod inner {
                         numel
                     )));
                 }
-                let src = unsafe {
-                    std::slice::from_raw_parts(bytes.as_ptr() as *const u16, numel)
-                };
-                let mut out = vec![half::f16::ZERO; numel];
-                rvllm_zig::bf16_to_f16(src, unsafe {
-                    std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u16, numel)
-                });
-                Ok(out)
+                #[cfg(feature = "zig")]
+                {
+                    let src = unsafe {
+                        std::slice::from_raw_parts(bytes.as_ptr() as *const u16, numel)
+                    };
+                    let mut out = vec![half::f16::ZERO; numel];
+                    rvllm_zig::bf16_to_f16(src, unsafe {
+                        std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u16, numel)
+                    });
+                    Ok(out)
+                }
+                #[cfg(not(feature = "zig"))]
+                {
+                    let mut out = Vec::with_capacity(numel);
+                    for i in 0..numel {
+                        let bits = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+                        let bf = half::bf16::from_bits(bits);
+                        out.push(half::f16::from_f32(bf.to_f32()));
+                    }
+                    Ok(out)
+                }
             }
             "F32" => {
                 if bytes.len() != numel * 4 {
@@ -289,11 +302,22 @@ mod inner {
                 }
                 let src =
                     unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, numel) };
-                let mut out = vec![half::f16::ZERO; numel];
-                rvllm_zig::f32_to_f16(src, unsafe {
-                    std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u16, numel)
-                });
-                Ok(out)
+                #[cfg(feature = "zig")]
+                {
+                    let mut out = vec![half::f16::ZERO; numel];
+                    rvllm_zig::f32_to_f16(src, unsafe {
+                        std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u16, numel)
+                    });
+                    Ok(out)
+                }
+                #[cfg(not(feature = "zig"))]
+                {
+                    let mut out = Vec::with_capacity(numel);
+                    for &v in src {
+                        out.push(half::f16::from_f32(v));
+                    }
+                    Ok(out)
+                }
             }
             _ => Err(LLMError::ModelError(format!(
                 "gpu_loader: unsupported dtype '{}' for tensor '{}', only F32/F16/BF16 supported",

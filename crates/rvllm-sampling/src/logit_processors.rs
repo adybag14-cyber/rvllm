@@ -10,7 +10,16 @@ pub fn apply_temperature(logits: &mut [f32], temperature: f32) {
     if temperature <= 0.0 || temperature == 1.0 {
         return;
     }
-    rvllm_zig::temperature_scale(logits, 1.0 / temperature);
+    let inv = 1.0 / temperature;
+    #[cfg(feature = "zig")]
+    {
+        rvllm_zig::temperature_scale(logits, inv);
+        return;
+    }
+    #[cfg(not(feature = "zig"))]
+    for l in logits.iter_mut() {
+        *l *= inv;
+    }
 }
 
 /// Keep only the top-k highest logits; set the rest to -inf.
@@ -90,14 +99,17 @@ pub fn apply_top_p(logits: &mut [f32], p: f32) {
 }
 
 /// Min-p filter: discard tokens whose probability is below min_p * max_prob.
-/// Uses logit-space threshold to avoid softmax allocation:
-/// softmax(x_i) >= min_p * softmax(x_max) simplifies to x_i >= max + ln(min_p).
+/// Uses logit-space threshold: x_i >= max + ln(min_p). No softmax needed.
 #[inline]
 pub fn apply_min_p(logits: &mut [f32], min_p: f32) {
     if min_p <= 0.0 || min_p >= 1.0 {
         return;
     }
+    #[cfg(feature = "zig")]
     let max_logit = rvllm_zig::max_f32(logits);
+    #[cfg(not(feature = "zig"))]
+    let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
     let threshold = max_logit + min_p.ln();
     for l in logits.iter_mut() {
         if *l < threshold {

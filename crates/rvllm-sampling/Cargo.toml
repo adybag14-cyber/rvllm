@@ -14,11 +14,12 @@ categories = ["algorithms", "science"]
 [features]
 default = []
 cuda = ["rvllm-gpu/cuda"]
+zig = ["dep:rvllm-zig"]
 
 [dependencies]
 rvllm-core.workspace = true
 rvllm-gpu.workspace = true
-rvllm-zig.workspace = true
+rvllm-zig = { workspace = true, optional = true }
 rand.workspace = true
 rand_chacha.workspace = true
 thiserror.workspace = true

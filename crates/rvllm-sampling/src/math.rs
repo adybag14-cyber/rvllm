@@ -1,13 +1,14 @@
 //! Numerical primitives: softmax, log-softmax, top-logprobs extraction.
-//! All hot paths use Zig SIMD (rvllm_zig).
+//! With `zig` feature: Zig SIMD backend. Without: chunk-based Rust.
 
 use rvllm_core::prelude::TokenId;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
+const CHUNK: usize = 8;
+
 // -- softmax ----------------------------------------------------------------
 
-/// Numerically stable softmax over logits.
 #[inline]
 pub fn softmax(logits: &[f32]) -> Vec<f32> {
     let mut out = vec![0.0f32; logits.len()];
@@ -15,19 +16,64 @@ pub fn softmax(logits: &[f32]) -> Vec<f32> {
     out
 }
 
-/// Softmax writing into a caller-provided buffer.
 #[inline]
 pub fn softmax_into(logits: &[f32], out: &mut [f32]) {
-    debug_assert!(out.len() >= logits.len());
-    if logits.is_empty() {
+    let n = logits.len();
+    debug_assert!(out.len() >= n);
+    if n == 0 {
         return;
     }
-    rvllm_zig::softmax_into(logits, out);
+
+    #[cfg(feature = "zig")]
+    {
+        rvllm_zig::softmax_into(logits, out);
+        return;
+    }
+
+    #[cfg(not(feature = "zig"))]
+    {
+        let max = max_f32(logits);
+        let mut sum = 0.0f32;
+        let chunks = n / CHUNK;
+        let rem = n % CHUNK;
+        for c in 0..chunks {
+            let base = c * CHUNK;
+            let mut buf = [0.0f32; CHUNK];
+            for j in 0..CHUNK {
+                buf[j] = (logits[base + j] - max).exp();
+            }
+            for j in 0..CHUNK {
+                sum += buf[j];
+                out[base + j] = buf[j];
+            }
+        }
+        let tail = chunks * CHUNK;
+        for i in tail..tail + rem {
+            let e = (logits[i] - max).exp();
+            sum += e;
+            out[i] = e;
+        }
+        if sum == 0.0 {
+            for v in out[..n].iter_mut() {
+                *v = 0.0;
+            }
+            return;
+        }
+        let inv_sum = 1.0 / sum;
+        for c in 0..chunks {
+            let base = c * CHUNK;
+            for j in 0..CHUNK {
+                out[base + j] *= inv_sum;
+            }
+        }
+        for i in tail..tail + rem {
+            out[i] *= inv_sum;
+        }
+    }
 }
 
 // -- log_softmax ------------------------------------------------------------
 
-/// Numerically stable log-softmax over logits.
 #[inline]
 pub fn log_softmax(logits: &[f32]) -> Vec<f32> {
     let mut out = vec![0.0f32; logits.len()];
@@ -35,30 +81,102 @@ pub fn log_softmax(logits: &[f32]) -> Vec<f32> {
     out
 }
 
-/// Log-softmax writing into a caller-provided buffer.
 #[inline]
 pub fn log_softmax_into(logits: &[f32], out: &mut [f32]) {
-    debug_assert!(out.len() >= logits.len());
-    if logits.is_empty() {
+    let n = logits.len();
+    debug_assert!(out.len() >= n);
+    if n == 0 {
         return;
     }
-    rvllm_zig::log_softmax_into(logits, out);
+
+    #[cfg(feature = "zig")]
+    {
+        rvllm_zig::log_softmax_into(logits, out);
+        return;
+    }
+
+    #[cfg(not(feature = "zig"))]
+    {
+        let max = max_f32(logits);
+        let mut sum = 0.0f32;
+        let chunks = n / CHUNK;
+        let rem = n % CHUNK;
+        for c in 0..chunks {
+            let base = c * CHUNK;
+            let mut buf = [0.0f32; CHUNK];
+            for j in 0..CHUNK {
+                buf[j] = (logits[base + j] - max).exp();
+            }
+            for j in 0..CHUNK {
+                sum += buf[j];
+            }
+        }
+        let tail = chunks * CHUNK;
+        for i in tail..tail + rem {
+            sum += (logits[i] - max).exp();
+        }
+        let lse = max + sum.ln();
+        for c in 0..chunks {
+            let base = c * CHUNK;
+            for j in 0..CHUNK {
+                out[base + j] = logits[base + j] - lse;
+            }
+        }
+        for i in tail..tail + rem {
+            out[i] = logits[i] - lse;
+        }
+    }
 }
 
 // -- greedy_sample (argmax) -------------------------------------------------
 
-/// Greedy (argmax) sampling: pick the token with the highest logit.
 #[inline]
 pub fn greedy_sample(logits: &[f32]) -> TokenId {
     if logits.is_empty() {
         return 0;
     }
-    rvllm_zig::argmax(logits)
+
+    #[cfg(feature = "zig")]
+    {
+        return rvllm_zig::argmax(logits);
+    }
+
+    #[cfg(not(feature = "zig"))]
+    {
+        let n = logits.len();
+        let chunks = n / CHUNK;
+        let rem = n % CHUNK;
+        let mut best_val = f32::NEG_INFINITY;
+        let mut best_idx: usize = 0;
+        for c in 0..chunks {
+            let base = c * CHUNK;
+            let mut local_val = logits[base];
+            let mut local_idx = 0usize;
+            for j in 1..CHUNK {
+                let v = logits[base + j];
+                if v > local_val {
+                    local_val = v;
+                    local_idx = j;
+                }
+            }
+            if local_val > best_val {
+                best_val = local_val;
+                best_idx = base + local_idx;
+            }
+        }
+        let tail = chunks * CHUNK;
+        for i in tail..tail + rem {
+            if logits[i] > best_val {
+                best_val = logits[i];
+                best_idx = i;
+            }
+        }
+        best_idx as TokenId
+    }
 }
 
 // -- multinomial_sample -----------------------------------------------------
 
-/// Multinomial sampling: draw one token from a probability distribution.
 #[inline]
 pub fn multinomial_sample(probs: &[f32], rng: &mut impl rand::Rng) -> TokenId {
     let r: f32 = rng.gen();
@@ -95,7 +213,6 @@ impl Ord for OrdF32 {
     }
 }
 
-/// Return the top-n (token_id, log_prob) pairs sorted by descending log-prob.
 #[inline]
 pub fn top_logprobs(logits: &[f32], n: usize) -> Vec<(TokenId, f32)> {
     if n == 0 || logits.is_empty() {
@@ -126,6 +243,44 @@ pub fn top_logprobs(logits: &[f32], n: usize) -> Vec<(TokenId, f32)> {
         .collect();
     result.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     result
+}
+
+// -- helpers ----------------------------------------------------------------
+
+#[inline]
+fn max_f32(xs: &[f32]) -> f32 {
+    #[cfg(feature = "zig")]
+    {
+        return rvllm_zig::max_f32(xs);
+    }
+
+    #[cfg(not(feature = "zig"))]
+    {
+        let n = xs.len();
+        let chunks = n / CHUNK;
+        let rem = n % CHUNK;
+        let mut best = f32::NEG_INFINITY;
+        for c in 0..chunks {
+            let base = c * CHUNK;
+            let mut local = xs[base];
+            for j in 1..CHUNK {
+                let v = xs[base + j];
+                if v > local {
+                    local = v;
+                }
+            }
+            if local > best {
+                best = local;
+            }
+        }
+        let tail = chunks * CHUNK;
+        for i in tail..tail + rem {
+            if xs[i] > best {
+                best = xs[i];
+            }
+        }
+        best
+    }
 }
 
 #[cfg(test)]

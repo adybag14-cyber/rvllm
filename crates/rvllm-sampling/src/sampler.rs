@@ -91,13 +91,22 @@ impl Sampler {
         // Sample + compute logprob of selected token.
         let (token_id, logprob) = if is_greedy {
             if needs_logprobs {
-                // Need full log-softmax for top_logprobs anyway
                 let tid = math::greedy_sample(&work);
                 let log_probs = math::log_softmax(&work);
                 (tid, log_probs[tid as usize])
             } else {
-                // Fused argmax + logprob: 2 passes instead of 4
-                rvllm_zig::argmax_logprob(&work)
+                #[cfg(feature = "zig")]
+                {
+                    // Fused argmax + logprob: 2 passes instead of 4
+                    rvllm_zig::argmax_logprob(&work)
+                }
+                #[cfg(not(feature = "zig"))]
+                {
+                    let tid = math::greedy_sample(&work);
+                    let max = work.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let sum: f32 = work.iter().map(|x| (x - max).exp()).sum();
+                    (tid, (work[tid as usize] - max) - sum.ln())
+                }
             }
         } else {
             let probs = math::softmax(&work);
