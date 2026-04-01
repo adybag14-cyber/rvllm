@@ -46,6 +46,29 @@ impl Drop for Fp8Plan {
     }
 }
 
+/// Cached plan for an autotuned f16 GEMM shape.
+struct F16Plan {
+    desc: lt_sys::cublasLtMatmulDesc_t,
+    layout_a: lt_sys::cublasLtMatrixLayout_t,
+    layout_b: lt_sys::cublasLtMatrixLayout_t,
+    layout_c: lt_sys::cublasLtMatrixLayout_t,
+    algo: lt_sys::cublasLtMatmulAlgo_t,
+}
+
+unsafe impl Send for F16Plan {}
+unsafe impl Sync for F16Plan {}
+
+impl Drop for F16Plan {
+    fn drop(&mut self) {
+        unsafe {
+            lt_sys::cublasLtMatrixLayoutDestroy(self.layout_a);
+            lt_sys::cublasLtMatrixLayoutDestroy(self.layout_b);
+            lt_sys::cublasLtMatrixLayoutDestroy(self.layout_c);
+            lt_sys::cublasLtMatmulDescDestroy(self.desc);
+        }
+    }
+}
+
 /// Wrapper around cudarc's `CudaBlasLT` with workspace for heuristic algo selection.
 pub struct CublasLtOps {
     handle: CudaBlasLT,
@@ -54,6 +77,8 @@ pub struct CublasLtOps {
     workspace: CudaSlice<u8>,
     /// Cached FP8 plans keyed by (m, n, k).
     fp8_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize), Fp8Plan>>,
+    /// Cached autotuned f16 plans keyed by (m, n, k).
+    f16_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize), F16Plan>>,
 }
 
 impl CublasLtOps {
@@ -62,7 +87,71 @@ impl CublasLtOps {
             .map_err(|e| LLMError::GpuError(format!("CudaBlasLT init failed: {e}")))?;
         let workspace = unsafe { stream.alloc::<u8>(FP8_WORKSPACE_SIZE) }
             .map_err(|e| LLMError::GpuError(format!("cublasLt workspace alloc: {e}")))?;
-        Ok(Self { handle, stream, workspace, fp8_cache: std::cell::RefCell::new(std::collections::HashMap::new()) })
+        Ok(Self {
+            handle,
+            stream,
+            workspace,
+            fp8_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            f16_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+        })
+    }
+
+    /// Install autotuned algorithms. Call after `CublasAutotuner::autotune_model`.
+    /// Creates cached descriptors + layouts for each shape so the hot path
+    /// skips heuristic lookup entirely.
+    pub fn install_autotuned(&self, tuner: &crate::cublas_autotune::CublasAutotuner) {
+        use std::ffi::c_void;
+
+        let handle = unsafe { *self.handle.handle() };
+        let mut cache = self.f16_cache.borrow_mut();
+
+        for (&(m, n, k), result) in tuner.iter() {
+            unsafe {
+                let mut desc: lt_sys::cublasLtMatmulDesc_t = std::ptr::null_mut();
+                let s = lt_sys::cublasLtMatmulDescCreate(
+                    &mut desc,
+                    lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    lt_sys::cudaDataType_t::CUDA_R_32F,
+                );
+                if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                    tracing::warn!(m, n, k, "install_autotuned: desc create failed");
+                    continue;
+                }
+                let trans_a = lt_sys::cublasOperation_t::CUBLAS_OP_T;
+                let trans_b = lt_sys::cublasOperation_t::CUBLAS_OP_N;
+                lt_sys::cublasLtMatmulDescSetAttribute(
+                    desc,
+                    lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+                    &trans_a as *const _ as *const c_void,
+                    std::mem::size_of_val(&trans_a),
+                );
+                lt_sys::cublasLtMatmulDescSetAttribute(
+                    desc,
+                    lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+                    &trans_b as *const _ as *const c_void,
+                    std::mem::size_of_val(&trans_b),
+                );
+
+                let f16_type = lt_sys::cudaDataType_t::CUDA_R_16F;
+                let mut la: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
+                let mut lb: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
+                let mut lc: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
+                lt_sys::cublasLtMatrixLayoutCreate(&mut la, f16_type, k as u64, n as u64, k as i64);
+                lt_sys::cublasLtMatrixLayoutCreate(&mut lb, f16_type, k as u64, m as u64, k as i64);
+                lt_sys::cublasLtMatrixLayoutCreate(&mut lc, f16_type, n as u64, m as u64, n as i64);
+
+                cache.insert((m, n, k), F16Plan {
+                    desc,
+                    layout_a: la,
+                    layout_b: lb,
+                    layout_c: lc,
+                    algo: result.algo,
+                });
+                let _ = handle; // suppress unused warning
+            }
+            tracing::debug!(m, n, k, time_us = result.time_us, "installed autotuned algo");
+        }
+        tracing::info!(count = cache.len(), "autotuned algos installed into cublasLt cache");
     }
 
     pub fn stream(&self) -> &Arc<CudaStream> {
@@ -124,6 +213,10 @@ impl CublasLtOps {
 
     /// Row-major HGEMM into a view via cublasLt. Accepts any DevicePtr/DevicePtrMut
     /// so callers can pass CudaViewMut (sub-slices of a larger buffer).
+    ///
+    /// If an autotuned algo exists for this (m,n,k) shape, uses the cached plan
+    /// (zero descriptor creation, zero heuristic lookup). Otherwise falls back
+    /// to top-1 heuristic.
     pub fn hgemm_a_bt_into(
         &self,
         m: usize,
@@ -143,6 +236,39 @@ impl CublasLtOps {
         let (ws_ptr, _gw) = DevicePtr::device_ptr(&self.workspace, &self.stream);
         let cu_stream = self.stream.cu_stream();
 
+        // Fast path: use cached autotuned plan (no descriptor/layout creation)
+        let cache = self.f16_cache.borrow();
+        if let Some(plan) = cache.get(&(m, n, k)) {
+            let alpha_f32 = alpha;
+            let beta_f32 = beta;
+            unsafe {
+                let s = lt_sys::cublasLtMatmul(
+                    *self.handle.handle(),
+                    plan.desc,
+                    &alpha_f32 as *const f32 as *const c_void,
+                    b_ptr as *const c_void,
+                    plan.layout_a,
+                    a_ptr as *const c_void,
+                    plan.layout_b,
+                    &beta_f32 as *const f32 as *const c_void,
+                    c_ptr as *mut c_void,
+                    plan.layout_c,
+                    c_ptr as *mut c_void,
+                    plan.layout_c,
+                    &plan.algo,
+                    ws_ptr as *mut c_void,
+                    FP8_WORKSPACE_SIZE,
+                    lt_sys::cu_stream_to_cuda_stream(cu_stream),
+                );
+                if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                    return Err(LLMError::GpuError(format!("hgemm_a_bt_into (autotuned) matmul: {s:?}")));
+                }
+            }
+            return Ok(());
+        }
+        drop(cache);
+
+        // Slow path: create descriptors, get top-1 heuristic
         unsafe {
             let handle = *self.handle.handle();
             let mut desc: lt_sys::cublasLtMatmulDesc_t = std::ptr::null_mut();

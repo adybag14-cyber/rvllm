@@ -277,6 +277,42 @@ mod cuda_impl {
             #[cfg(feature = "cublaslt")]
             let blas_lt = rvllm_gpu::cublaslt_ops::CublasLtOps::new(stream.clone()).ok();
 
+            // Autotune cublasLt algorithms for all GEMM shapes
+            #[cfg(feature = "cublaslt")]
+            if let Some(ref lt) = blas_lt {
+                let hidden = config.hidden_size;
+                let num_heads = config.num_attention_heads;
+                let head_dim = hidden / num_heads;
+                let q_dim = num_heads * head_dim;
+                let num_kv_heads = config.num_key_value_heads.unwrap_or(num_heads);
+                let kv_dim = num_kv_heads * head_dim;
+                let qkv_dim = q_dim + kv_dim + kv_dim;
+                let intermediate = config.intermediate_size;
+                let gate_up_dim = intermediate * 2;
+
+                match rvllm_gpu::CublasAutotuner::autotune_model(
+                    lt,
+                    rvllm_gpu::GemmDtype::F16,
+                    hidden,
+                    q_dim,
+                    qkv_dim,
+                    intermediate,
+                    gate_up_dim,
+                ) {
+                    Ok(tuner) => {
+                        info!(
+                            shapes = tuner.len(),
+                            max_ws = tuner.max_workspace_size(),
+                            "cublasLt autotuning complete, installing into hot path"
+                        );
+                        lt.install_autotuned(&tuner);
+                    }
+                    Err(e) => {
+                        tracing::warn!(%e, "cublasLt autotuning failed, using heuristics");
+                    }
+                }
+            }
+
             // Load CUTLASS shared library (compiled by build_cutlass_so.sh).
             // Try arch-specific path first, then fallback paths.
             let cutlass = {

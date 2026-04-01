@@ -344,7 +344,8 @@ impl CublasAutotuner {
         }
     }
 
-    /// Autotune all GEMM shapes for the model at M=1 and M=128.
+    /// Autotune all GEMM shapes for the model across decode + prefill batch sizes.
+    /// Covers M=1,2,4,8,16,32,64,128 x all projection shapes.
     pub fn autotune_model(
         lt_ops: &CublasLtOps,
         dtype: GemmDtype,
@@ -354,23 +355,28 @@ impl CublasAutotuner {
         intermediate: usize,
         gate_up_dim: usize,
     ) -> Result<Self> {
-        let shapes: &[(usize, usize, usize)] = &[
-            // QKV projection
-            (1, qkv_dim, hidden),
-            (128, qkv_dim, hidden),
-            // O-proj (q_dim -> hidden)
-            (1, hidden, q_dim),
-            (128, hidden, q_dim),
-            // GateUp
-            (1, gate_up_dim, hidden),
-            (128, gate_up_dim, hidden),
-            // Down
-            (1, hidden, intermediate),
-            (128, hidden, intermediate),
+        let m_values: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128];
+        let nk_shapes: &[(usize, usize)] = &[
+            (qkv_dim, hidden),        // QKV projection
+            (hidden, q_dim),           // O-proj
+            (gate_up_dim, hidden),     // GateUp
+            (hidden, intermediate),    // Down
         ];
 
+        let mut shapes = Vec::new();
+        for &m in m_values {
+            for &(n, k) in nk_shapes {
+                shapes.push((m, n, k));
+            }
+        }
+
         let mut tuner = Self::new();
-        for &(m, n, k) in shapes {
+        tracing::info!(
+            num_shapes = shapes.len(),
+            m_values = ?m_values,
+            "autotuning cublasLt algos"
+        );
+        for &(m, n, k) in &shapes {
             tracing::info!(m, n, k, ?dtype, "autotune start");
             match Self::autotune_shape(lt_ops, m, n, k, dtype) {
                 Ok(result) => {
@@ -402,6 +408,11 @@ impl CublasAutotuner {
 
     pub fn is_empty(&self) -> bool {
         self.results.is_empty()
+    }
+
+    /// Iterate over all autotuned (m, n, k) -> algo mappings.
+    pub fn iter(&self) -> impl Iterator<Item = (&(usize, usize, usize), &AutotunedAlgo)> {
+        self.results.iter()
     }
 
     /// Maximum workspace size across all autotuned algorithms.
