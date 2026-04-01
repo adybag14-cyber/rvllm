@@ -41,6 +41,11 @@ pub use rvllm_core::prelude::{LLMError, Result};
 #[cfg(feature = "cuda")]
 pub use cuda_allocator::CudaGpuAllocator;
 
+#[cfg(feature = "cublaslt")]
+pub use cublas_autotune::{CublasAutotuner, GemmDtype};
+#[cfg(feature = "cublaslt")]
+pub use cublaslt_ops::{CublasLtOps, CUBLASLT_M_THRESHOLD};
+
 #[cfg(feature = "cuda")]
 pub use cudarc::driver::CudaContext;
 #[cfg(feature = "cuda")]
