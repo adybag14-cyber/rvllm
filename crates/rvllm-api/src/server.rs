@@ -36,6 +36,19 @@ pub trait InferenceEngine: Send + Sync {
         RequestId,
         tokio_stream::wrappers::ReceiverStream<rvllm_core::prelude::RequestOutput>,
     )>;
+
+    async fn generate_with_mode(
+        &self,
+        prompt: String,
+        params: rvllm_core::prelude::SamplingParams,
+        emit_intermediate: bool,
+    ) -> rvllm_core::prelude::Result<(
+        RequestId,
+        tokio_stream::wrappers::ReceiverStream<rvllm_core::prelude::RequestOutput>,
+    )> {
+        let _ = emit_intermediate;
+        self.generate(prompt, params).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -51,6 +64,18 @@ impl InferenceEngine for rvllm_engine::AsyncGpuLLMEngine {
         tokio_stream::wrappers::ReceiverStream<rvllm_core::prelude::RequestOutput>,
     )> {
         self.generate(prompt, params).await
+    }
+
+    async fn generate_with_mode(
+        &self,
+        prompt: String,
+        params: rvllm_core::prelude::SamplingParams,
+        emit_intermediate: bool,
+    ) -> rvllm_core::prelude::Result<(
+        RequestId,
+        tokio_stream::wrappers::ReceiverStream<rvllm_core::prelude::RequestOutput>,
+    )> {
+        self.generate_with_mode(prompt, params, emit_intermediate).await
     }
 }
 

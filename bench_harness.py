@@ -25,6 +25,7 @@ RVLLM_CMD = [
     "--max-model-len", "2048",
     "--gpu-memory-utilization", "0.90",
     "--gpu-memory-reserve-gb", "0.0",
+    "--max-num-batched-tokens", "8192",
     "--port", "8000",
 ]
 

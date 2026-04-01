@@ -2,11 +2,22 @@
 
 A from-scratch Rust rewrite of [vLLM](https://github.com/vllm-project/vllm) focused on single-card, high-throughput serving with explicit control over kernels, memory, and startup behavior.
 
+## Reproduce the Benchmark
+
+One command spins up a fresh vast.ai H100, builds rvLLM from source, pulls the model from HuggingFace, runs the lifecycle race against stock vLLM, and drops the results locally:
+
+```bash
+VASTAI_API_KEY=<your_key> ./race.sh
+```
+
+Results land in `bench/combined_results_h100_lifecycle.json`. The instance stays up after the run so you can inspect logs; destroy it with the printed `vastai destroy instance <id>` command when done.
+
 ## What Is Already Clearly Better
 
 - **HTTP stack is already competitive**: `rvLLM` reaches `2,723 tok/s` over HTTP vs `2,862 tok/s` for stock `vLLM`.
 - **Direct engine gets close by `N=32`**: `rvLLM` reaches `3,170 tok/s` vs `3,197 tok/s` for stock `vLLM`.
 - **`rvllm-lite` cleanly exposes serving overhead**: near-stock direct engine, then `131.8 tok/s` over HTTP.
+- **The 10k lifecycle path is now verified on real GPU**: `rvLLM` completes `11,666` completion tokens at concurrency `32` in `30.99s` end-to-end (`26.04s` startup, `4.44s` benchmark, `0.51s` shutdown).
 - **VRAM startup is safer to drive hard**: reserve-based fill via `--gpu-memory-reserve-gb`, plus explicit `--num-gpu-blocks` and `--num-cpu-blocks`.
 - **Kernel behavior is explicit**: 54 CUDA kernels, no-fallback validation, and a Rust PTX fusion path with measured `2-7.5x` decode microbench wins vs our hand-written CUDA equivalents.
 
@@ -41,6 +52,18 @@ All measurements below use the same setup. Stock `vLLM` was benchmarked through 
 The key result is that `rvllm-lite` keeps near-stock direct-engine speed but collapses over HTTP, which isolates most of the practical overhead to the Python serving/scheduling layer rather than the underlying `vLLM` engine. `rvLLM`'s server path is in the same practical class as stock `vLLM`, but the direct engine still needs more work to win consistently.
 
 Historical phase-by-phase numbers, including the earlier `12,312 tok/s @ N=128` run, live in [docs/benchmark-history.md](docs/benchmark-history.md).
+
+### rvLLM 10k Lifecycle
+
+Verified on an isolated H100 SXM 80GB instance with Qwen2.5-7B f16. This is the `rvLLM` side only, using the fixed lifecycle harness and `32` concurrency. The first `64`-concurrency attempt crashed in `gpu-step`, so `32` is the current stable race setting.
+
+| Engine | Concurrency | startup_sec | benchmark_wall_sec | shutdown_sec | end_to_end_sec | completion_tokens | throughput_tok_per_sec | avg_latency_ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| rvLLM | 32 | 26.04 | 4.44 | 0.51 | 30.99 | 11,666 | 2,627.7 | 1,193.5 |
+
+Artifacts:
+- `rvLLM` result: `/root/bench_results/rvllm_result_c32.json`
+- `rvLLM` benchmark output: `/root/bench_results/rvllm_bench.json`
 
 ### FA3 v3 Attention Kernel
 
@@ -333,3 +356,5 @@ Both engines serve the same OpenAI-compatible `/v1/completions` endpoint. Direct
 Each engine runs on its own vast.ai H100 SXM 80GB instance -- separate GPUs, clean CUDA state, no cross-contamination.
 
 See [docs/arch.md](docs/arch.md) for the full forward pass trace, [docs/benchmark-history.md](docs/benchmark-history.md) for optimization history, and [docs/cutlass-epilogue-spec.md](docs/cutlass-epilogue-spec.md) for the CUTLASS fusion roadmap.
+
+To run the full lifecycle race yourself, see [Reproduce the Benchmark](#reproduce-the-benchmark) at the top.

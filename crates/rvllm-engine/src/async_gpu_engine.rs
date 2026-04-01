@@ -49,8 +49,14 @@ mod inner {
         prompt: String,
         sampling_params: SamplingParams,
         output_tx: mpsc::Sender<RequestOutput>,
+        emit_intermediate: bool,
         /// Sends back the assigned RequestId once the engine accepts the request.
         id_tx: oneshot::Sender<Result<RequestId>>,
+    }
+
+    struct OutputSink {
+        tx: mpsc::Sender<RequestOutput>,
+        emit_intermediate: bool,
     }
 
     // -------------------------------------------------------------------
@@ -132,6 +138,15 @@ mod inner {
             prompt: String,
             params: SamplingParams,
         ) -> Result<(RequestId, ReceiverStream<RequestOutput>)> {
+            self.generate_with_mode(prompt, params, true).await
+        }
+
+        pub async fn generate_with_mode(
+            &self,
+            prompt: String,
+            params: SamplingParams,
+            emit_intermediate: bool,
+        ) -> Result<(RequestId, ReceiverStream<RequestOutput>)> {
             let (output_tx, output_rx) = mpsc::channel(64);
             let (id_tx, id_rx) = oneshot::channel();
 
@@ -140,6 +155,7 @@ mod inner {
                     prompt,
                     sampling_params: params,
                     output_tx,
+                    emit_intermediate,
                     id_tx,
                 })
                 .await
@@ -203,7 +219,7 @@ mod inner {
             mut gen_rx: mpsc::Receiver<GpuEngineRequest>,
             cancel: CancellationToken,
         ) {
-            let mut output_channels: HashMap<RequestId, mpsc::Sender<RequestOutput>> =
+            let mut output_channels: HashMap<RequestId, OutputSink> =
                 HashMap::new();
             let next_request_id: Arc<AtomicU64> = engine.request_id_counter();
 
@@ -373,7 +389,7 @@ mod inner {
             cmd_rx: &mut mpsc::Receiver<GpuEngineCommand>,
             request_queue: &RequestQueue,
             abort_queue: &AbortQueue,
-            output_channels: &mut HashMap<RequestId, mpsc::Sender<RequestOutput>>,
+            output_channels: &mut HashMap<RequestId, OutputSink>,
         ) {
             loop {
                 match cmd_rx.try_recv() {
@@ -393,7 +409,7 @@ mod inner {
             cmd: GpuEngineCommand,
             request_queue: &RequestQueue,
             abort_queue: &AbortQueue,
-            output_channels: &mut HashMap<RequestId, mpsc::Sender<RequestOutput>>,
+            output_channels: &mut HashMap<RequestId, OutputSink>,
         ) {
             match cmd {
                 GpuEngineCommand::AddRequest {
@@ -426,7 +442,7 @@ mod inner {
         fn drain_generate_requests_to_queue(
             gen_rx: &mut mpsc::Receiver<GpuEngineRequest>,
             request_queue: &RequestQueue,
-            output_channels: &mut HashMap<RequestId, mpsc::Sender<RequestOutput>>,
+            output_channels: &mut HashMap<RequestId, OutputSink>,
             next_id: &Arc<AtomicU64>,
         ) {
             loop {
@@ -446,7 +462,7 @@ mod inner {
         fn handle_generate_to_queue(
             req: GpuEngineRequest,
             request_queue: &RequestQueue,
-            output_channels: &mut HashMap<RequestId, mpsc::Sender<RequestOutput>>,
+            output_channels: &mut HashMap<RequestId, OutputSink>,
             next_id: &Arc<AtomicU64>,
         ) {
             let rid = RequestId(next_id.fetch_add(1, Ordering::Relaxed));
@@ -458,13 +474,19 @@ mod inner {
             });
 
             let _ = req.id_tx.send(Ok(rid));
-            output_channels.insert(rid, req.output_tx);
+            output_channels.insert(
+                rid,
+                OutputSink {
+                    tx: req.output_tx,
+                    emit_intermediate: req.emit_intermediate,
+                },
+            );
         }
 
         /// Process step outputs: fan out to per-request streaming channels.
         async fn send_outputs(
             outputs: Result<Vec<RequestOutput>>,
-            output_channels: &mut HashMap<RequestId, mpsc::Sender<RequestOutput>>,
+            output_channels: &mut HashMap<RequestId, OutputSink>,
             abort_queue: &AbortQueue,
         ) {
             match outputs {
@@ -473,8 +495,11 @@ mod inner {
                         let rid = output.request_id;
                         let finished = output.finished;
 
-                        if let Some(tx) = output_channels.get(&rid) {
-                            if tx.send(output).await.is_err() {
+                        if let Some(sink) = output_channels.get(&rid) {
+                            if !finished && !sink.emit_intermediate {
+                                continue;
+                            }
+                            if sink.tx.send(output).await.is_err() {
                                 debug!(%rid, "GPU output receiver dropped, aborting");
                                 abort_queue.lock().unwrap().push(rid);
                                 output_channels.remove(&rid);

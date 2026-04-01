@@ -78,7 +78,7 @@ pub async fn create_completion(
         // Non-streaming: collect all outputs from the stream until finished.
         let (_request_id, mut output_stream) = state
             .engine
-            .generate(req.prompt, sampling_params)
+            .generate_with_mode(req.prompt, sampling_params, false)
             .await
             .map_err(ApiError::from)?;
 
