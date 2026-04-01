@@ -17,7 +17,7 @@ Results land in `bench/combined_results_h100_lifecycle.json`. The instance stays
 - **HTTP stack is already competitive**: `rvLLM` reaches `2,723 tok/s` over HTTP vs `2,862 tok/s` for stock `vLLM`.
 - **Direct engine gets close by `N=32`**: `rvLLM` reaches `3,170 tok/s` vs `3,197 tok/s` for stock `vLLM`.
 - **`rvllm-lite` cleanly exposes serving overhead**: near-stock direct engine, then `131.8 tok/s` over HTTP.
-- **The 10k lifecycle path is now verified on real GPU**: `rvLLM` completes `11,666` completion tokens at concurrency `32` in `30.99s` end-to-end (`26.04s` startup, `4.44s` benchmark, `0.51s` shutdown).
+- **The 10k lifecycle path is now verified on real GPU**: `rvLLM` completes `14,080` completion tokens at concurrency `32` in `30.33s` launch-to-finished (`26.04s` to first completion, `4.12s` bench tail, `3,419.4 tok/s`).
 - **VRAM startup is safer to drive hard**: reserve-based fill via `--gpu-memory-reserve-gb`, plus explicit `--num-gpu-blocks` and `--num-cpu-blocks`.
 - **Kernel behavior is explicit**: 54 CUDA kernels, no-fallback validation, and a Rust PTX fusion path with measured `2-7.5x` decode microbench wins vs our hand-written CUDA equivalents.
 
@@ -57,9 +57,11 @@ Historical phase-by-phase numbers, including the earlier `12,312 tok/s @ N=128` 
 
 Verified on an isolated H100 SXM 80GB instance with Qwen2.5-7B f16. This is the `rvLLM` side only, using the fixed lifecycle harness and `32` concurrency. The first `64`-concurrency attempt crashed in `gpu-step`, so `32` is the current stable race setting.
 
-| Engine | Concurrency | startup_sec | benchmark_wall_sec | shutdown_sec | end_to_end_sec | completion_tokens | throughput_tok_per_sec | avg_latency_ms |
+| Engine | Concurrency | first_completion_sec | benchmark_wall_sec | shutdown_sec | launch_to_finished_tokens_sec | completion_tokens | throughput_tok_per_sec | avg_latency_ms |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| rvLLM | 32 | 26.04 | 4.44 | 0.51 | 30.99 | 11,666 | 2,627.7 | 1,193.5 |
+| rvLLM | 32 | 26.04 | 4.12 | 0.51 | 30.33 | 14,080 | 3,419.4 | 1,043.3 |
+
+This run matters because it lines up with the direct-engine `0.99x` parity result at `N=32`: the remaining shortfall is in the HTTP + prefill + request-handling path, not in some giant raw decode-kernel deficit.
 
 Artifacts:
 - `rvLLM` result: `/root/bench_results/rvllm_result_c32.json`

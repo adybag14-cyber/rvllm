@@ -139,7 +139,7 @@ footer a:hover{color:#999}
 
 <div class="hero">
   <div class="big">3,170 tok/s</div>
-  <div class="sub">Qwen2.5-7B on H100, direct engine, N=32. 0.99x stock vLLM in the latest apples-to-apples run. HTTP throughput: 2,723 tok/s at 200 requests / concurrency 32.</div>
+  <div class="sub">Qwen2.5-7B on H100, direct engine, N=32. 0.99x stock vLLM in the latest apples-to-apples run. Latest rvLLM lifecycle run: 30.33s launch-to-finished, 3,419 tok/s. Remaining gap is HTTP + prefill path, not raw direct-engine parity.</div>
   <div class="hero-graphic">
     <div class="hero-graphic-title">Verified H100 Comparison</div>
     <div class="hero-graphic-sub">Three-way benchmark: stock vLLM vs rvllm-lite vs rvLLM, with both direct-engine and HTTP serving results.</div>
@@ -274,8 +274,8 @@ footer a:hover{color:#999}
           rvLLM closes to near parity with stock vLLM on direct engine at the highest tested concurrency.
         </div>
         <div class="hero-chart-pill">
-          <strong>HTTP class is real</strong>
-          rvLLM lands near stock vLLM on practical HTTP throughput instead of collapsing in the serving layer.
+          <strong>HTTP path still has room</strong>
+          direct-engine parity is already near real at N=32, so the remaining delta is in HTTP, prefill, and request handling rather than the base decode kernels.
         </div>
         <div class="hero-chart-pill">
           <strong>lite exposes the gap</strong>

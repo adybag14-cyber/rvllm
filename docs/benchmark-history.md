@@ -30,6 +30,21 @@ The key diagnostic result is `rvllm-lite`: it stays near stock `vLLM` on direct 
 but collapses under HTTP load, which isolates the practical serving overhead to the
 Python server/scheduler layer rather than the underlying `vLLM` engine.
 
+## Phase 9 (2026-04-01) -- rvLLM 10k lifecycle, fresh H100 SXM
+
+Launch-to-finished lifecycle timing on a clean H100 SXM 80GB box with Qwen2.5-7B f16.
+This is `rvLLM` only, fixed-length greedy decode, `14,080` completion tokens total, and
+`32` concurrency. The stable number from the clean run is:
+
+| Engine | first_completion_sec | benchmark_wall_sec | shutdown_sec | launch_to_finished_tokens_sec | completion_tokens | throughput_tok_per_sec | avg_latency_ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| rvLLM | 26.04 | 4.12 | 0.51 | 30.33 | 14,080 | 3,419.4 | 1,043.3 |
+
+This is the useful read:
+- direct engine is already `0.99x` stock `vLLM` at `N=32`
+- the remaining gap is in the HTTP + prefill + request-handling path
+- that is why the lifecycle result is still slower than the direct-engine parity story suggests
+
 ## Phase 7 (2026-04-01) -- Architecture hardening + INT4 GEMV (H100 SXM 80GB)
 
 Focus: correctness fixes, portability, and new quantization kernel. No throughput regression at high concurrency (12,312 tok/s N=128 unchanged). N=1 improved from 98 to 121 tok/s via fused GEMV + 128-bit vectorized loads.
