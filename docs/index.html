@@ -8,6 +8,10 @@
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
   onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]});"></script>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/recharts/umd/Recharts.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 html{font-size:17px;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
@@ -31,7 +35,27 @@ header .links a:hover{color:#fff}
 .hero-graphic{margin-top:1.6rem;padding:1rem;background:linear-gradient(180deg,#07090d,#030405);border:1px solid #111;border-radius:18px}
 .hero-graphic-title{font-size:0.68rem;text-transform:uppercase;letter-spacing:0.12em;color:#9a9a9a;margin-bottom:0.35rem}
 .hero-graphic-sub{font-size:0.82rem;color:#666;margin-bottom:0.9rem}
-.hero-graphic img{display:block;width:100%;height:auto;border-radius:14px;border:1px solid #171b22;background:#05070b}
+.hero-chart-root{border-radius:14px;border:1px solid #171b22;background:
+  radial-gradient(circle at top left,rgba(120,207,255,0.08),transparent 28%),
+  radial-gradient(circle at top right,rgba(132,230,183,0.08),transparent 25%),
+  linear-gradient(180deg,#0a0d13,#05070b);
+  padding:1rem}
+.hero-chart-grid{display:grid;grid-template-columns:1.25fr 0.95fr;gap:1rem}
+.hero-chart-card{background:rgba(7,10,15,0.82);border:1px solid #171c25;border-radius:16px;padding:1rem}
+.hero-chart-head{display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;margin-bottom:0.8rem}
+.hero-chart-card h3{margin:0;font-size:0.92rem;letter-spacing:-0.02em;text-transform:none;color:#fff}
+.hero-chart-card p{margin:0.2rem 0 0;color:#7f8896;font-size:0.78rem}
+.hero-chart-legend{display:flex;flex-wrap:wrap;gap:0.75rem 1rem;margin-bottom:0.9rem;font-size:0.72rem;color:#96a0ae}
+.hero-chart-legend span{display:inline-flex;align-items:center;gap:0.45rem}
+.hero-chart-legend i{display:inline-block;width:10px;height:10px;border-radius:999px}
+.hero-chart-frame{height:360px}
+.hero-chart-http{height:360px}
+.hero-chart-notes{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:0.8rem;margin-top:0.9rem}
+.hero-chart-pill{border-radius:999px;padding:0.7rem 0.9rem;border:1px solid #1c2430;background:#0a0d12;font-size:0.76rem;color:#cfd6df}
+.hero-chart-pill strong{display:block;color:#fff;font-size:0.98rem;margin-bottom:0.1rem}
+.hero-chart-table{margin-top:0.8rem;display:grid;gap:0.45rem}
+.hero-chart-row{display:grid;grid-template-columns:1.1fr 1fr 1fr;gap:0.75rem;font-size:0.74rem;color:#9ea8b7;padding-top:0.45rem;border-top:1px solid #121722}
+.hero-chart-row strong{color:#fff;font-weight:600}
 
 section{padding:2rem 0;border-bottom:1px solid #111}
 section:last-of-type{border-bottom:none}
@@ -80,8 +104,11 @@ footer a:hover{color:#999}
   header h1{font-size:2rem}
   .hero .big{font-size:2.4rem}
   .hero-graphic{padding:0.8rem 0.75rem 0.7rem}
-  .hero-graphic-head{flex-direction:column;align-items:flex-start}
-  .hero-legend{justify-content:flex-start}
+  .hero-chart-root{padding:0.8rem}
+  .hero-chart-grid{grid-template-columns:1fr}
+  .hero-chart-frame,.hero-chart-http{height:300px}
+  .hero-chart-notes{grid-template-columns:1fr}
+  .hero-chart-row{grid-template-columns:1fr}
   .container{padding:0 1.2rem}
   table{font-size:0.75rem}
   thead th,tbody td{padding:0.3rem 0.5rem}
@@ -108,7 +135,7 @@ footer a:hover{color:#999}
   <div class="hero-graphic">
     <div class="hero-graphic-title">Verified H100 Comparison</div>
     <div class="hero-graphic-sub">Three-way benchmark: stock vLLM vs rvllm-lite vs rvLLM, with both direct-engine and HTTP serving results.</div>
-    <img src="assets/h100-comparison.svg" alt="rvLLM H100 comparison chart">
+    <div id="hero-chart-root" class="hero-chart-root" aria-label="rvLLM H100 comparison chart"></div>
   </div>
 </div>
 
@@ -310,5 +337,209 @@ Decode paths (N=1):
 </footer>
 
 </div>
+<script type="text/babel">
+const {
+  ResponsiveContainer,
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  Legend,
+  Cell,
+  LabelList,
+} = Recharts;
+
+const COLORS = {
+  vllm: "#78CFFF",
+  lite: "#F09FC2",
+  rvllm: "#84E6B7",
+  grid: "#1A2130",
+  tick: "#97A3B6",
+  label: "#E8EDF5",
+  tooltipBg: "#0B0F16",
+  tooltipBorder: "#1E2735",
+};
+
+const directData = [
+  { n: "N=1", "stock vLLM": 133.7, "rvllm-lite": 133.9, rvLLM: 120.6 },
+  { n: "N=4", "stock vLLM": 543.3, "rvllm-lite": 542.8, rvLLM: 427.9 },
+  { n: "N=8", "stock vLLM": 926.1, "rvllm-lite": 925.4, rvLLM: 845.8 },
+  { n: "N=16", "stock vLLM": 1934.5, "rvllm-lite": 1664.8, rvLLM: 1648.9 },
+  { n: "N=32", "stock vLLM": 3197.1, "rvllm-lite": 2994.5, rvLLM: 3170.0 },
+];
+
+const httpData = [
+  { name: "stock vLLM", throughput: 2861.9, single: 41.0, latency: 2061.9, vram: 71.9, fill: COLORS.vllm },
+  { name: "rvllm-lite", throughput: 131.8, single: 128.6, latency: 43334.9, vram: 71.9, fill: COLORS.lite },
+  { name: "rvLLM", throughput: 2723.2, single: 120.2, latency: 2685.2, vram: 75.2, fill: COLORS.rvllm },
+];
+
+const tooltipStyle = {
+  backgroundColor: COLORS.tooltipBg,
+  border: `1px solid ${COLORS.tooltipBorder}`,
+  borderRadius: "12px",
+  color: COLORS.label,
+  boxShadow: "0 12px 30px rgba(0,0,0,0.35)",
+};
+
+function DirectTooltip({ active, payload, label }) {
+  if (!active || !payload?.length) return null;
+  return (
+    <div style={tooltipStyle}>
+      <div style={{ padding: "10px 12px 4px", color: COLORS.label, fontWeight: 700 }}>{label}</div>
+      <div style={{ padding: "0 12px 10px" }}>
+        {payload.map((entry) => (
+          <div key={entry.name} style={{ color: entry.color, fontSize: 13, marginTop: 4 }}>
+            {entry.name}: {entry.value.toFixed(1)} tok/s
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function HttpTooltip({ active, payload }) {
+  if (!active || !payload?.length) return null;
+  const row = payload[0].payload;
+  return (
+    <div style={tooltipStyle}>
+      <div style={{ padding: "10px 12px 4px", color: COLORS.label, fontWeight: 700 }}>{row.name}</div>
+      <div style={{ padding: "0 12px 10px", fontSize: 13, color: "#C9D2DD" }}>
+        <div>Load throughput: {row.throughput.toFixed(1)} tok/s</div>
+        <div>Single request: {row.single.toFixed(1)} tok/s</div>
+        <div>Avg latency: {row.latency.toFixed(1)} ms</div>
+        <div>Idle VRAM: {row.vram.toFixed(1)} GiB</div>
+      </div>
+    </div>
+  );
+}
+
+function HeroChart() {
+  return (
+    <div>
+      <div className="hero-chart-legend">
+        <span><i style={{ background: COLORS.vllm }}></i>stock vLLM 0.6.3.post1</span>
+        <span><i style={{ background: COLORS.lite }}></i>rvllm-lite</span>
+        <span><i style={{ background: COLORS.rvllm }}></i>rvLLM</span>
+      </div>
+
+      <div className="hero-chart-grid">
+        <div className="hero-chart-card">
+          <div className="hero-chart-head">
+            <div>
+              <h3>Direct Engine Throughput</h3>
+              <p>Rawer kernel/runtime view across increasing concurrency.</p>
+            </div>
+          </div>
+          <div className="hero-chart-frame">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart
+                data={directData}
+                margin={{ top: 8, right: 8, left: -18, bottom: 0 }}
+                barCategoryGap={12}
+              >
+                <CartesianGrid stroke={COLORS.grid} vertical={false} />
+                <XAxis
+                  dataKey="n"
+                  tick={{ fill: COLORS.tick, fontSize: 12 }}
+                  axisLine={{ stroke: COLORS.grid }}
+                  tickLine={false}
+                />
+                <YAxis
+                  tick={{ fill: COLORS.tick, fontSize: 12 }}
+                  axisLine={{ stroke: COLORS.grid }}
+                  tickLine={false}
+                  width={42}
+                />
+                <Tooltip content={<DirectTooltip />} cursor={{ fill: "rgba(255,255,255,0.03)" }} />
+                <Legend wrapperStyle={{ color: COLORS.tick, fontSize: 12, paddingTop: 8 }} />
+                <Bar dataKey="stock vLLM" fill={COLORS.vllm} radius={[8, 8, 0, 0]} />
+                <Bar dataKey="rvllm-lite" fill={COLORS.lite} radius={[8, 8, 0, 0]} />
+                <Bar dataKey="rvLLM" fill={COLORS.rvllm} radius={[8, 8, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+
+        <div className="hero-chart-card">
+          <div className="hero-chart-head">
+            <div>
+              <h3>HTTP Serving Throughput</h3>
+              <p>200 requests, concurrency 32, max_tokens=256.</p>
+            </div>
+          </div>
+          <div className="hero-chart-http">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart
+                data={httpData}
+                layout="vertical"
+                margin={{ top: 8, right: 8, left: 10, bottom: 0 }}
+                barSize={28}
+              >
+                <CartesianGrid stroke={COLORS.grid} horizontal={false} />
+                <XAxis
+                  type="number"
+                  tick={{ fill: COLORS.tick, fontSize: 12 }}
+                  axisLine={{ stroke: COLORS.grid }}
+                  tickLine={false}
+                />
+                <YAxis
+                  type="category"
+                  dataKey="name"
+                  tick={{ fill: COLORS.label, fontSize: 12 }}
+                  axisLine={false}
+                  tickLine={false}
+                  width={84}
+                />
+                <Tooltip content={<HttpTooltip />} cursor={{ fill: "rgba(255,255,255,0.03)" }} />
+                <Bar dataKey="throughput" radius={[0, 10, 10, 0]}>
+                  {httpData.map((entry) => (
+                    <Cell key={entry.name} fill={entry.fill} />
+                  ))}
+                  <LabelList
+                    dataKey="throughput"
+                    position="right"
+                    formatter={(value) => `${value.toFixed(1)} tok/s`}
+                    style={{ fill: COLORS.label, fontSize: 12, fontWeight: 600 }}
+                  />
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="hero-chart-table">
+            {httpData.map((row) => (
+              <div className="hero-chart-row" key={row.name}>
+                <strong>{row.name}</strong>
+                <span>single {row.single.toFixed(1)} tok/s</span>
+                <span>{row.latency.toFixed(1)} ms avg latency, {row.vram.toFixed(1)} GiB idle VRAM</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div className="hero-chart-notes">
+        <div className="hero-chart-pill">
+          <strong>0.99x at N=32</strong>
+          rvLLM closes to near parity with stock vLLM on direct engine at the highest tested concurrency.
+        </div>
+        <div className="hero-chart-pill">
+          <strong>HTTP class is real</strong>
+          rvLLM lands near stock vLLM on practical HTTP throughput instead of collapsing in the serving layer.
+        </div>
+        <div className="hero-chart-pill">
+          <strong>lite exposes the gap</strong>
+          rvllm-lite stays near stock direct-engine, then falls apart once the Python serving path is involved.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("hero-chart-root"));
+root.render(<HeroChart />);
+</script>
 </body>
 </html>
