@@ -1255,6 +1255,11 @@ mod cuda_impl {
 
         fn resolve_forward_path(&self, num_tokens: usize, is_prefill: bool) -> ForwardPath {
             if num_tokens == 1 && !is_prefill {
+                // cuBLAS decode: separate norm + cuBLAS GEMM (higher BW)
+                // Enable with RVLLM_CUBLAS_DECODE=1
+                if std::env::var("RVLLM_CUBLAS_DECODE").map_or(false, |v| v == "1") {
+                    return ForwardPath::CublasGemvDecode;
+                }
                 // Megakernel: all 28 layers in one kernel launch
                 // Enable with RVLLM_MEGAKERNEL=1
                 if std::env::var("RVLLM_MEGAKERNEL").map_or(false, |v| v == "1") {

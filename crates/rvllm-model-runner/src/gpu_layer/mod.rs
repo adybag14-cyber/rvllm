@@ -111,6 +111,9 @@ mod inner {
         /// T=1 decode: single cooperative kernel executes the entire transformer layer.
         /// Requires persistent_layer_decode cubin. Eliminates ~6 kernel launches per layer.
         PersistentDecode,
+        /// T=1 decode with separate norm + cuBLAS GEMM (better BW than fused GEMV).
+        /// Enable with RVLLM_CUBLAS_DECODE=1.
+        CublasGemvDecode,
         /// All 28 layers + LM head in ONE kernel launch via interpreter.
         /// Enable with RVLLM_MEGAKERNEL=1.
         MegakernelDecode,
@@ -177,6 +180,9 @@ mod inner {
                 }
                 ForwardPath::PersistentDecode => {
                     Ok(Some(self.forward_persistent_decode(input, weights, prev_mlp_out)?))
+                }
+                ForwardPath::CublasGemvDecode => {
+                    Ok(Some(self.forward_cublas_decode(input, weights, blas, lt, prev_mlp_out)?))
                 }
                 ForwardPath::MegakernelDecode => {
                     Err(LLMError::GpuError("MegakernelDecode is handled at the runner level, not per-layer".into()))

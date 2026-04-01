@@ -494,7 +494,87 @@ impl GpuTransformerLayer {
     }
 
     // ================================================================
-    // PATH 3: Persistent cooperative-groups decode (T=1)
+    // PATH 3: cuBLAS GEMM decode (T=1) -- separate norm + cuBLAS HGEMM
+    // Higher bandwidth than fused CuTE GEMV (84% vs 68% on H100).
+    // ================================================================
+
+    pub(crate) fn forward_cublas_decode(
+        &self,
+        input: &GpuLayerInput<'_>,
+        weights: &GpuLayerWeights<'_>,
+        blas: &CublasHandle,
+        lt: Option<&crate::CublasLtRef>,
+        prev_mlp_out: Option<&CudaSlice<f16>>,
+    ) -> Result<(CudaSlice<f16>, CudaSlice<f16>)> {
+        let cfg = &self.config;
+        let hidden = cfg.hidden_size;
+        let num_heads = cfg.num_heads;
+        let num_kv_heads = cfg.num_kv_heads;
+        let head_dim = cfg.head_dim;
+        let intermediate = cfg.intermediate_size;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let qkv_dim = q_dim + kv_dim + kv_dim;
+
+        let fused_qkv_w = weights.fused_qkv.expect("CublasGemvDecode requires fused_qkv weight");
+        let fused_gate_up_w = weights.fused_gate_up.expect("CublasGemvDecode requires fused_gate_up weight");
+
+        // Step 1: RMSNorm (or fused residual add + RMSNorm)
+        let (normed, residual_ref) = if let Some(prev_mlp) = prev_mlp_out {
+            let (n, r) = Self::fused_residual_rmsnorm_f16(
+                &self.stream, &self.loader, input.hidden_states, prev_mlp,
+                weights.input_layernorm, cfg.rms_norm_eps, 1, hidden)?;
+            (n, r)
+        } else {
+            let n = Self::rms_norm_f16(&self.stream, &self.loader, input.hidden_states,
+                weights.input_layernorm, cfg.rms_norm_eps, 1, hidden)?;
+            (n, input.hidden_states.clone())
+        };
+
+        // Step 2: QKV via cuBLAS HGEMM
+        let mut qkv = Self::hgemm_dispatch(&self.stream, blas, lt, &normed, fused_qkv_w, 1, qkv_dim, hidden, &self.loader)?;
+
+        // Step 3: QKV bias
+        if let Some(bias) = weights.qkv_bias {
+            let mut qkv_view = qkv.slice_mut(..qkv_dim);
+            Self::add_bias_f16_view(&self.stream, &self.loader, &mut qkv_view, bias, 1, qkv_dim)?;
+        }
+
+        // Step 4: Fused RoPE + KV cache write
+        Self::fused_rope_cache_write(&self.stream, &self.loader, &mut qkv,
+            input, q_dim, kv_dim, num_heads, num_kv_heads, head_dim, 1)?;
+
+        // Step 5: Attention (FA3)
+        let attn_out = Self::decode_attention_f16io(
+            &self.stream, &self.loader,
+            &qkv.slice(..q_dim),
+            input.key_cache, input.value_cache,
+            &input.block_tables, &input.context_lens,
+            1, input.num_seqs, num_heads, num_kv_heads, head_dim,
+            input.max_context_len, input.block_size)?;
+
+        // Step 6: O-proj via cuBLAS HGEMM
+        let attn_proj = Self::hgemm_dispatch(&self.stream, blas, lt, &attn_out, weights.o_proj, 1, hidden, q_dim, &self.loader)?;
+
+        // Step 7: Post-attention fused residual add + RMSNorm
+        let (normed2, residual2) = Self::fused_residual_rmsnorm_f16(
+            &self.stream, &self.loader, &residual_ref, &attn_proj,
+            weights.post_attention_layernorm, cfg.rms_norm_eps, 1, hidden)?;
+
+        // Step 8: GateUp via cuBLAS HGEMM
+        let gate_up = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, fused_gate_up_w, 1, intermediate * 2, hidden, &self.loader)?;
+
+        // Step 9: SiLU * mul
+        let activated = Self::fused_silu_mul_f16_split(&self.stream, &self.loader, &gate_up, intermediate)?;
+
+        // Step 10: Down via cuBLAS HGEMM
+        let mlp_out = Self::hgemm_dispatch(&self.stream, blas, lt, &activated, weights.down_proj, 1, hidden, intermediate, &self.loader)?;
+
+        Ok((residual2, mlp_out))
+    }
+
+    // ================================================================
+    // PATH 4: Persistent decode (T=1)
     // ================================================================
 
     /// Single cooperative kernel launch that executes an entire transformer layer.
