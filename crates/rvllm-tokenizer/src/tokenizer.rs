@@ -8,7 +8,7 @@ use rvllm_core::prelude::{hf_auth_hint, hf_token_from_env, LLMError, Result, Tok
 use tokenizers::Tokenizer as HfTokenizer;
 use tracing::{debug, info};
 
-use crate::chat::{apply_chatml, ChatMessage};
+use crate::chat::{apply_chatml, apply_harmony, ChatMessage, ChatTemplate};
 use crate::incremental::IncrementalDecoder;
 
 const TOKENIZER_JSON: &str = "tokenizer.json";
@@ -89,6 +89,7 @@ pub struct Tokenizer {
     bos_token_id: Option<TokenId>,
     pad_token_id: Option<TokenId>,
     incremental: IncrementalDecoder,
+    chat_template: ChatTemplate,
 }
 
 impl Tokenizer {
@@ -178,12 +179,21 @@ impl Tokenizer {
         special_tokens.sort_unstable();
         special_tokens.dedup();
 
+        // Detect Harmony template: presence of <|im_sep|> in the vocabulary distinguishes
+        // GPT-OSS/Harmony from plain ChatML which only uses <|im_start|>/<|im_end|>.
+        let chat_template = if hf.get_vocab(true).contains_key("<|im_sep|>") {
+            ChatTemplate::Harmony
+        } else {
+            ChatTemplate::ChatML
+        };
+
         debug!(
             vocab_size = hf.get_vocab_size(true),
             special_count = special_tokens.len(),
             eos = ?eos_token_id,
             bos = ?bos_token_id,
             pad = ?pad_token_id,
+            ?chat_template,
             "tokenizer loaded"
         );
 
@@ -194,6 +204,7 @@ impl Tokenizer {
             bos_token_id,
             pad_token_id,
             incremental: IncrementalDecoder::new(),
+            chat_template,
         }
     }
 
@@ -254,13 +265,21 @@ impl Tokenizer {
     }
 
     /// Apply a chat template to format messages for the model.
-    /// Falls back to ChatML format.
+    /// Selects Harmony or ChatML based on the tokenizer's detected vocabulary.
     pub fn apply_chat_template(
         &self,
         messages: &[ChatMessage],
         add_generation_prompt: bool,
     ) -> Result<String> {
-        apply_chatml(messages, add_generation_prompt)
+        match self.chat_template {
+            ChatTemplate::Harmony => apply_harmony(messages, add_generation_prompt),
+            ChatTemplate::ChatML => apply_chatml(messages, add_generation_prompt),
+        }
+    }
+
+    /// The chat template detected for this tokenizer.
+    pub fn chat_template(&self) -> ChatTemplate {
+        self.chat_template
     }
 
     /// Access the underlying HuggingFace tokenizer.

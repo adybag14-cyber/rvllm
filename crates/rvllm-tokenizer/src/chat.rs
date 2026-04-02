@@ -2,6 +2,16 @@
 
 use rvllm_core::prelude::{LLMError, Result};
 
+/// Chat template variant to use when formatting messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChatTemplate {
+    /// ChatML: `<|im_start|>role\ncontent<|im_end|>\n`
+    #[default]
+    ChatML,
+    /// Harmony (GPT-OSS): `<|im_start|>role<|im_sep|>\ncontent\n<|im_end|>\n`
+    Harmony,
+}
+
 /// Role in a chat conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatRole {
@@ -78,6 +88,30 @@ pub(crate) fn apply_chatml(
     Ok(out)
 }
 
+/// Apply a Harmony-style template to messages (used by GPT-OSS family).
+/// Format: `<|im_start|>role<|im_sep|>\ncontent\n<|im_end|>\n`
+pub(crate) fn apply_harmony(
+    messages: &[ChatMessage],
+    add_generation_prompt: bool,
+) -> Result<String> {
+    if messages.is_empty() {
+        return Err(LLMError::TokenizerError("empty message list".into()));
+    }
+
+    let mut out = String::new();
+    for msg in messages {
+        out.push_str("<|im_start|>");
+        out.push_str(&msg.role);
+        out.push_str("<|im_sep|>\n");
+        out.push_str(&msg.content);
+        out.push_str("\n<|im_end|>\n");
+    }
+    if add_generation_prompt {
+        out.push_str("<|im_start|>assistant<|im_sep|>\n");
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,6 +145,30 @@ mod tests {
         assert_eq!(ChatRole::System.to_string(), "system");
         assert_eq!(ChatRole::User.to_string(), "user");
         assert_eq!(ChatRole::Assistant.to_string(), "assistant");
+    }
+
+    #[test]
+    fn harmony_basic() {
+        let msgs = vec![
+            ChatMessage::system("You are helpful."),
+            ChatMessage::user("Hello"),
+        ];
+        let result = apply_harmony(&msgs, true).unwrap();
+        assert!(result.contains("<|im_start|>system<|im_sep|>\nYou are helpful.\n<|im_end|>"));
+        assert!(result.contains("<|im_start|>user<|im_sep|>\nHello\n<|im_end|>"));
+        assert!(result.ends_with("<|im_start|>assistant<|im_sep|>\n"));
+    }
+
+    #[test]
+    fn harmony_no_generation_prompt() {
+        let msgs = vec![ChatMessage::user("Hi")];
+        let result = apply_harmony(&msgs, false).unwrap();
+        assert!(!result.contains("<|im_start|>assistant"));
+    }
+
+    #[test]
+    fn harmony_empty_errors() {
+        assert!(apply_harmony(&[], true).is_err());
     }
 
     #[test]

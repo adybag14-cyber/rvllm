@@ -9,7 +9,7 @@ pub mod incremental;
 pub mod tokenizer;
 pub mod tool_parser;
 
-pub use chat::{ChatMessage, ChatRole};
+pub use chat::{ChatMessage, ChatRole, ChatTemplate};
 pub use incremental::IncrementalDecoder;
 pub use tokenizer::Tokenizer;
 pub use tool_parser::{
