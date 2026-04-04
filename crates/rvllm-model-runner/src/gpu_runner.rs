@@ -606,7 +606,7 @@ mod cuda_impl {
         pub fn prepare_fp16_runtime(&mut self) -> Result<()> {
             if self.f16_scratch.borrow().is_none() {
                 info!(num_layers = self.layers.len(), "prepared zero-copy unfused fp16 runtime state");
-                self.alloc_scratch()?;
+                self.alloc_scratch(256)?;
             }
             Ok(())
         }
