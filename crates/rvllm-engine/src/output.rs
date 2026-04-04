@@ -66,7 +66,10 @@ impl OutputProcessor {
         }
 
         // Track reasoning tokens between <think> and </think>
-        Self::update_reasoning_state(state, params);
+        // Only scan when a reasoning budget is set (avoids O(n) text scan per token)
+        if params.reasoning_budget.is_some() {
+            Self::update_reasoning_state(state, params);
+        }
 
         // Check stop conditions
         if state.finish_reason.is_none() {
