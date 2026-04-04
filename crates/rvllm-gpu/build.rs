@@ -54,6 +54,54 @@ fn cc_to_sm(cc: &str) -> Option<&'static str> {
     }
 }
 
+fn nvcc_version(nvcc: &Path) -> Option<(u32, u32)> {
+    let output = Command::new(nvcc).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!(
+        "{}
+{}",
+        stdout, stderr
+    );
+    for line in combined.lines() {
+        if let Some(idx) = line.find("release ") {
+            let ver = &line[idx + 8..];
+            let ver = ver.split(',').next().unwrap_or(ver).trim();
+            let mut parts = ver.split('.');
+            let major = parts.next()?.trim().parse().ok()?;
+            let minor = parts.next().unwrap_or("0").trim().parse().ok()?;
+            return Some((major, minor));
+        }
+    }
+    None
+}
+
+fn arch_supported_by_nvcc(arch: &str, ver: Option<(u32, u32)>) -> bool {
+    let Some((major, minor)) = ver else {
+        return true;
+    };
+    match arch {
+        "sm_89" => (major, minor) >= (11, 8),
+        "sm_90" | "sm_90a" => major >= 12,
+        "sm_100" | "sm_100a" => major >= 12,
+        "sm_120" | "sm_122" => major >= 13,
+        _ => true,
+    }
+}
+
+fn fallback_arch_for_nvcc(arch: &str) -> String {
+    match arch {
+        "sm_89" => "sm_86".to_string(),
+        "sm_90" | "sm_90a" => "sm_86".to_string(),
+        "sm_100" | "sm_100a" => "sm_90".to_string(),
+        "sm_120" | "sm_122" => "sm_90".to_string(),
+        _ => arch.to_string(),
+    }
+}
+
 /// Auto-detect GPU architectures via nvidia-smi.
 /// Returns a deduplicated list of sm_ strings for all installed GPUs.
 fn detect_gpu_archs() -> Vec<String> {
@@ -101,7 +149,20 @@ fn resolve_archs() -> Vec<String> {
 }
 
 fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
-    let archs = resolve_archs();
+    let nvcc_ver = nvcc_version(nvcc);
+    let mut archs = resolve_archs();
+    for arch in &mut archs {
+        if !arch_supported_by_nvcc(arch, nvcc_ver) {
+            let fallback = fallback_arch_for_nvcc(arch);
+            println!(
+                "cargo:warning=nvcc does not support {}, falling back to {}",
+                arch, fallback
+            );
+            *arch = fallback;
+        }
+    }
+    archs.sort();
+    archs.dedup();
     println!(
         "cargo:warning=Target CUDA architectures: {}",
         archs.join(", ")
@@ -168,7 +229,9 @@ fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
                     Ok(o) => {
                         println!(
                             "cargo:warning=nvcc cubin failed for {}.cu [{}] (exit {}), skipping",
-                            stem, arch, o.status.code().unwrap_or(-1)
+                            stem,
+                            arch,
+                            o.status.code().unwrap_or(-1)
                         );
                         let stderr = String::from_utf8_lossy(&o.stderr);
                         for line in stderr.lines() {
@@ -197,7 +260,9 @@ fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
                     Ok(s) => {
                         println!(
                             "cargo:warning=nvcc failed for {}.cu [{}] (exit {}), skipping",
-                            stem, arch, s.code().unwrap_or(-1)
+                            stem,
+                            arch,
+                            s.code().unwrap_or(-1)
                         );
                     }
                     Err(e) => {
@@ -230,15 +295,25 @@ fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
         .join("ptx");
 
     if let Err(e) = fs::create_dir_all(&workspace_ptx) {
-        println!("cargo:warning=Could not create {}: {e}", workspace_ptx.display());
+        println!(
+            "cargo:warning=Could not create {}: {e}",
+            workspace_ptx.display()
+        );
     } else {
         if let Ok(entries) = fs::read_dir(&ptx_dir) {
             for entry in entries.flatten() {
                 let src = entry.path();
-                if matches!(src.extension().and_then(|e| e.to_str()), Some("ptx") | Some("cubin")) {
+                if matches!(
+                    src.extension().and_then(|e| e.to_str()),
+                    Some("ptx") | Some("cubin")
+                ) {
                     let dst = workspace_ptx.join(src.file_name().unwrap());
                     if let Err(e) = fs::copy(&src, &dst) {
-                        println!("cargo:warning=Failed to copy {} -> {}: {e}", src.display(), dst.display());
+                        println!(
+                            "cargo:warning=Failed to copy {} -> {}: {e}",
+                            src.display(),
+                            dst.display()
+                        );
                     }
                 }
             }

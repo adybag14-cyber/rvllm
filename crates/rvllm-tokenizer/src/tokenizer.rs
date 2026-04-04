@@ -50,6 +50,93 @@ fn find_cached_tokenizer_json(model_name_or_path: &str) -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
+fn find_local_tokenizer_near_path(path: &Path) -> Option<PathBuf> {
+    let mut cur = if path.is_dir() {
+        Some(path)
+    } else {
+        path.parent()
+    };
+    for _ in 0..4 {
+        let dir = cur?;
+        let tok_json = dir.join(TOKENIZER_JSON);
+        if tok_json.exists() {
+            return Some(tok_json);
+        }
+        let tok_model = dir.join(TOKENIZER_MODEL);
+        if tok_model.exists() {
+            return Some(tok_model);
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+fn infer_hf_tokenizer_repo_for_gguf(path: &Path) -> Option<&'static str> {
+    let lower = path.to_string_lossy().to_lowercase();
+    if lower.contains("nemotron-cascade-2-30b-a3b") {
+        return Some("nvidia/Nemotron-Cascade-2-30B-A3B");
+    }
+    if lower.contains("qwen3.5-4b") {
+        return Some("Qwen/Qwen3.5-4B");
+    }
+    if lower.contains("qwen3.5-27b") {
+        return Some("Qwen/Qwen3.5-27B");
+    }
+    None
+}
+
+fn resolve_tokenizer_source(model_name_or_path: &str) -> Result<Option<String>> {
+    let path = Path::new(model_name_or_path);
+    if path.is_file() && path.extension() == Some(OsStr::new("gguf")) {
+        if let Some(local) = find_local_tokenizer_near_path(path) {
+            if local.file_name() == Some(OsStr::new(TOKENIZER_MODEL)) {
+                return Err(unsupported_sentencepiece_error(&local));
+            }
+            return Ok(Some(local.display().to_string()));
+        }
+        if let Some(repo) = infer_hf_tokenizer_repo_for_gguf(path) {
+            return Ok(Some(repo.to_string()));
+        }
+        return Err(LLMError::TokenizerError(format!(
+            "unable to resolve tokenizer for GGUF model {}. Provide --tokenizer with a compatible tokenizer repo/path that includes {}",
+            path.display(), TOKENIZER_JSON
+        )));
+    }
+    if path.is_dir() {
+        let tokenizer_file = path.join(TOKENIZER_JSON);
+        if tokenizer_file.exists() {
+            return Ok(Some(tokenizer_file.display().to_string()));
+        }
+        let tok_model = path.join(TOKENIZER_MODEL);
+        if tok_model.exists() {
+            return Err(unsupported_sentencepiece_error(&tok_model));
+        }
+        let has_gguf = std::fs::read_dir(path)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .any(|p| p.extension() == Some(OsStr::new("gguf")));
+        if has_gguf {
+            if let Some(local) = find_local_tokenizer_near_path(path) {
+                if local.file_name() == Some(OsStr::new(TOKENIZER_MODEL)) {
+                    return Err(unsupported_sentencepiece_error(&local));
+                }
+                return Ok(Some(local.display().to_string()));
+            }
+            if let Some(repo) = infer_hf_tokenizer_repo_for_gguf(path) {
+                return Ok(Some(repo.to_string()));
+            }
+            return Err(LLMError::TokenizerError(format!(
+                "directory {} contains GGUF weights but no {}. Provide --tokenizer with a compatible tokenizer repo/path",
+                path.display(), TOKENIZER_JSON
+            )));
+        }
+    }
+    Ok(None)
+}
+
 fn missing_tokenizer_error(path: &Path) -> LLMError {
     let tokenizer_model = path.join(TOKENIZER_MODEL);
     if tokenizer_model.exists() {
@@ -96,6 +183,13 @@ impl Tokenizer {
     /// Load a tokenizer from a HuggingFace model name or local directory.
     pub fn from_pretrained(model_name_or_path: &str) -> Result<Self> {
         info!(model = model_name_or_path, "loading tokenizer");
+
+        if let Some(resolved) = resolve_tokenizer_source(model_name_or_path)? {
+            if resolved != model_name_or_path {
+                info!(requested = model_name_or_path, resolved = %resolved, "resolved tokenizer source");
+                return Self::from_pretrained(&resolved);
+            }
+        }
 
         // Check HF cache first (avoids network round-trip when model is already downloaded)
         if let Some(tokenizer_path) = find_cached_tokenizer_json(model_name_or_path) {
@@ -423,6 +517,26 @@ mod tests {
         let err = err.to_string();
         assert!(err.contains(TOKENIZER_MODEL));
         assert!(err.contains(TOKENIZER_JSON));
+    }
+
+    #[test]
+    fn infer_hf_tokenizer_repo_for_gguf_nemotron() {
+        let p = Path::new("/tmp/Nemotron-Cascade-2-30B-A3B.i1-IQ4_XS.gguf");
+        assert_eq!(
+            infer_hf_tokenizer_repo_for_gguf(p),
+            Some("nvidia/Nemotron-Cascade-2-30B-A3B")
+        );
+    }
+
+    #[test]
+    fn resolve_local_tokenizer_next_to_gguf() {
+        let dir = tempfile::tempdir().unwrap();
+        let gguf = dir.path().join("model.gguf");
+        let tok = dir.path().join(TOKENIZER_JSON);
+        std::fs::write(&gguf, b"GGUF").unwrap();
+        std::fs::write(&tok, b"{}").unwrap();
+        let resolved = resolve_tokenizer_source(gguf.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, Some(tok.display().to_string()));
     }
 
     #[test]
