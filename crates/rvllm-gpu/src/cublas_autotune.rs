@@ -360,7 +360,10 @@ impl CublasAutotuner {
         gate_up_dim: usize,
         gpu_name: &str,
     ) -> Result<Self> {
-        let m_values: &[usize] = &[1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128];
+        // Cap at M=32 to avoid OOM during autotuning (large gate_up shapes
+        // at M=128 need ~300MB per benchmark buffer). Model load happens after
+        // autotuning, so we can't use all VRAM.
+        let m_values: &[usize] = &[1, 2, 4, 8, 16, 32];
         let nk_shapes: &[(usize, usize)] = &[
             (qkv_dim, hidden),        // QKV projection
             (hidden, q_dim),           // O-proj
