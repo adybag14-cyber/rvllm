@@ -24,6 +24,15 @@ pub const CUBLASLT_M_THRESHOLD: usize = 32;
 /// 4 MiB workspace for split-K heuristics in cublasLt.
 const FP8_WORKSPACE_SIZE: usize = 4 * 1024 * 1024;
 
+fn is_retryable_cached_algo_failure(status: lt_sys::cublasStatus_t) -> bool {
+    matches!(
+        status,
+        lt_sys::cublasStatus_t::CUBLAS_STATUS_NOT_SUPPORTED
+            | lt_sys::cublasStatus_t::CUBLAS_STATUS_INVALID_VALUE
+            | lt_sys::cublasStatus_t::CUBLAS_STATUS_EXECUTION_FAILED
+    )
+}
+
 /// Cached FP8 matmul plan (descriptors + algo) for a specific (M, N, K) shape.
 struct Fp8Plan {
     desc: lt_sys::cublasLtMatmulDesc_t,
@@ -233,6 +242,7 @@ impl CublasLtOps {
         let cu_stream = self.stream.cu_stream();
 
         // Fast path: use cached autotuned plan (no descriptor/layout creation)
+        let mut retry_without_cache = false;
         let cache = self.f16_cache.borrow();
         if let Some(plan) = cache.get(&(m, n, k)) {
             let alpha_f32 = alpha;
@@ -257,16 +267,30 @@ impl CublasLtOps {
                     lt_sys::cu_stream_to_cuda_stream(cu_stream),
                 );
                 if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                    return Err(LLMError::GpuError(format!(
-                        "AUTOTUNED cublasLt GEMM FAILED: status={s:?} shape=({m},{n},{k}). \
-                         The cached algorithm does not support this configuration. \
-                         Delete ~/.cache/rvllm/autotune.json and re-run to retune."
-                    )));
+                    if is_retryable_cached_algo_failure(s) {
+                        retry_without_cache = true;
+                    } else {
+                        return Err(LLMError::GpuError(format!(
+                            "AUTOTUNED cublasLt GEMM FAILED: status={s:?} shape=({m},{n},{k})"
+                        )));
+                    }
                 }
             }
-            return Ok(());
+            if !retry_without_cache {
+                return Ok(());
+            }
         }
         drop(cache);
+
+        if retry_without_cache {
+            self.f16_cache.borrow_mut().remove(&(m, n, k));
+            tracing::warn!(
+                m,
+                n,
+                k,
+                "cached cublasLt algo rejected at runtime, evicting in-memory plan and retrying"
+            );
+        }
 
         // Slow path: create descriptors, get top-1 heuristic
         unsafe {

@@ -25,6 +25,8 @@ pub struct AutotuneCacheEntry {
     pub workspace_size: usize,
     pub time_us: f64,
     pub algo_index: i32,
+    #[serde(default)]
+    pub algo_blob: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +112,10 @@ impl AutotuneCache {
         self.entries.insert(key, entry);
     }
 
+    pub fn remove(&mut self, key: &AutotuneCacheKey) -> Option<AutotuneCacheEntry> {
+        self.entries.remove(key)
+    }
+
     pub fn cache_path() -> PathBuf {
         if let Ok(p) = std::env::var("RVLLM_AUTOTUNE_CACHE") {
             return PathBuf::from(p);
@@ -142,6 +148,7 @@ mod tests {
             workspace_size: 4194304,
             time_us: 12.5,
             algo_index: 3,
+            algo_blob: Some(vec![1, 2, 3, 4]),
         };
         cache.insert(key.clone(), entry);
 
@@ -153,6 +160,7 @@ mod tests {
         assert_eq!(got.workspace_size, 4194304);
         assert!((got.time_us - 12.5).abs() < 1e-9);
         assert_eq!(got.algo_index, 3);
+        assert_eq!(got.algo_blob.as_deref(), Some(&[1, 2, 3, 4][..]));
     }
 
     #[test]
@@ -174,6 +182,7 @@ mod tests {
                     workspace_size: 1024 * (i + 1),
                     time_us: 10.0 + i as f64,
                     algo_index: i as i32,
+                    algo_blob: Some(vec![i as u8; 8]),
                 },
             );
         }
@@ -192,6 +201,7 @@ mod tests {
         let got = loaded.get(&key).unwrap();
         assert_eq!(got.workspace_size, 3072);
         assert_eq!(got.algo_index, 2);
+        assert_eq!(got.algo_blob.as_deref(), Some(&[2u8; 8][..]));
     }
 
     #[test]
@@ -232,11 +242,13 @@ mod tests {
             workspace_size: 100,
             time_us: 5.0,
             algo_index: 1,
+            algo_blob: None,
         });
         cache.insert(key_a100.clone(), AutotuneCacheEntry {
             workspace_size: 200,
             time_us: 8.0,
             algo_index: 2,
+            algo_blob: None,
         });
 
         assert_eq!(cache.entries.len(), 2);

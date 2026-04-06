@@ -111,6 +111,30 @@ fn check_lt(s: lt_sys::cublasStatus_t, ctx: &str) -> Result<()> {
 }
 
 impl CublasAutotuner {
+    fn serialize_algo(algo: &lt_sys::cublasLtMatmulAlgo_t) -> Vec<u8> {
+        unsafe {
+            std::slice::from_raw_parts(
+                algo as *const _ as *const u8,
+                std::mem::size_of::<lt_sys::cublasLtMatmulAlgo_t>(),
+            ).to_vec()
+        }
+    }
+
+    fn deserialize_algo(bytes: &[u8]) -> Option<lt_sys::cublasLtMatmulAlgo_t> {
+        if bytes.len() != std::mem::size_of::<lt_sys::cublasLtMatmulAlgo_t>() {
+            return None;
+        }
+        let mut algo = unsafe { std::mem::zeroed::<lt_sys::cublasLtMatmulAlgo_t>() };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                &mut algo as *mut _ as *mut u8,
+                bytes.len(),
+            );
+        }
+        Some(algo)
+    }
+
     pub fn new() -> Self {
         Self {
             results: HashMap::new(),
@@ -410,14 +434,24 @@ impl CublasAutotuner {
 
             if !no_cache {
                 if let Some(entry) = disk_cache.get(&cache_key) {
-                    tracing::debug!(m, n, k, "autotune cache hit");
-                    tuner.results.insert((m, n, k), AutotunedAlgo {
-                        algo: unsafe { std::mem::zeroed() },
-                        workspace_size: entry.workspace_size,
-                        time_us: entry.time_us,
-                    });
-                    cached_count += 1;
-                    continue;
+                    if let Some(algo_blob) = entry.algo_blob.as_deref() {
+                        if let Some(algo) = Self::deserialize_algo(algo_blob) {
+                            tracing::debug!(m, n, k, "autotune cache hit");
+                            tuner.results.insert((m, n, k), AutotunedAlgo {
+                                algo,
+                                workspace_size: entry.workspace_size,
+                                time_us: entry.time_us,
+                            });
+                            cached_count += 1;
+                            continue;
+                        }
+                    }
+                    tracing::warn!(
+                        m,
+                        n,
+                        k,
+                        "autotune cache entry missing usable algo bytes, retuning shape"
+                    );
                 }
             }
 
@@ -434,6 +468,7 @@ impl CublasAutotuner {
                         workspace_size: result.workspace_size,
                         time_us: result.time_us,
                         algo_index: 0,
+                        algo_blob: Some(Self::serialize_algo(&result.algo)),
                     });
                     tuner.results.insert((m, n, k), result);
                 }
