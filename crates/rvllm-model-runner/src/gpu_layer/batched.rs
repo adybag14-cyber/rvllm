@@ -17,6 +17,14 @@ use rvllm_gpu::cublas::CublasHandle;
 
 use super::{BatchedLayerPhaseTimings, GemmStrategy, GpuLayerInput, GpuLayerWeights, GpuTransformerLayer, LayerScratchRef};
 
+#[derive(Clone, Copy)]
+struct BatchedPipelinePolicy {
+    use_cutlass_qkv: bool,
+    use_cutlass_oproj: bool,
+    use_cutlass_gateup: bool,
+    use_cutlass_gate_aux: bool,
+}
+
 impl GpuTransformerLayer {
     #[inline]
     fn use_cutlass_qkv(strategy: GemmStrategy) -> bool {
@@ -61,6 +69,30 @@ impl GpuTransformerLayer {
         )
     }
 
+    pub(crate) fn forward_batched_v2(
+        &self,
+        input: &GpuLayerInput<'_>,
+        weights: &GpuLayerWeights<'_>,
+        blas: &CublasHandle,
+        lt: Option<&crate::CublasLtRef>,
+        prev_mlp_out: Option<&CudaSlice<f16>>,
+        scratch: &mut LayerScratchRef<'_>,
+        gemm_strategy: GemmStrategy,
+        cutlass: Option<&rvllm_gpu::cutlass_ffi::CutlassKernels>,
+    ) -> Result<()> {
+        self.forward_batched_v2_profiled(
+            input,
+            weights,
+            blas,
+            lt,
+            prev_mlp_out,
+            scratch,
+            None,
+            gemm_strategy,
+            cutlass,
+        )
+    }
+
     pub(crate) fn forward_batched_profiled(
         &self,
         input: &GpuLayerInput<'_>,
@@ -72,6 +104,103 @@ impl GpuTransformerLayer {
         mut phase_timings: Option<&mut BatchedLayerPhaseTimings>,
         gemm_strategy: GemmStrategy,
         cutlass: Option<&rvllm_gpu::cutlass_ffi::CutlassKernels>,
+    ) -> Result<()> {
+        let policy = Self::legacy_batched_policy(gemm_strategy, input, weights, cutlass);
+        self.forward_batched_with_policy(
+            input,
+            weights,
+            blas,
+            lt,
+            prev_mlp_out,
+            scratch,
+            phase_timings,
+            gemm_strategy,
+            cutlass,
+            policy,
+        )
+    }
+
+    pub(crate) fn forward_batched_v2_profiled(
+        &self,
+        input: &GpuLayerInput<'_>,
+        weights: &GpuLayerWeights<'_>,
+        blas: &CublasHandle,
+        lt: Option<&crate::CublasLtRef>,
+        prev_mlp_out: Option<&CudaSlice<f16>>,
+        scratch: &mut LayerScratchRef<'_>,
+        phase_timings: Option<&mut BatchedLayerPhaseTimings>,
+        gemm_strategy: GemmStrategy,
+        cutlass: Option<&rvllm_gpu::cutlass_ffi::CutlassKernels>,
+    ) -> Result<()> {
+        let policy = Self::batched_v2_policy(input, weights, cutlass);
+        self.forward_batched_with_policy(
+            input,
+            weights,
+            blas,
+            lt,
+            prev_mlp_out,
+            scratch,
+            phase_timings,
+            gemm_strategy,
+            cutlass,
+            policy,
+        )
+    }
+
+    fn legacy_batched_policy(
+        gemm_strategy: GemmStrategy,
+        input: &GpuLayerInput<'_>,
+        weights: &GpuLayerWeights<'_>,
+        cutlass: Option<&rvllm_gpu::cutlass_ffi::CutlassKernels>,
+    ) -> BatchedPipelinePolicy {
+        BatchedPipelinePolicy {
+            use_cutlass_qkv: Self::use_cutlass_qkv(gemm_strategy) && cutlass.is_some(),
+            use_cutlass_oproj: Self::use_cutlass_oproj(gemm_strategy) && cutlass.is_some(),
+            use_cutlass_gateup: Self::use_cutlass_gateup(gemm_strategy) && cutlass.is_some(),
+            use_cutlass_gate_aux: Self::use_cutlass_gateup(gemm_strategy)
+                && cutlass.is_some()
+                && !input.is_prefill
+                && weights.fused_gate_up_fp8.is_none()
+                && weights.down_proj_fp8.is_none()
+                && std::env::var("RVLLM_CUTLASS_GATE_AUX").map_or(true, |v| v != "0"),
+        }
+    }
+
+    fn batched_v2_policy(
+        input: &GpuLayerInput<'_>,
+        weights: &GpuLayerWeights<'_>,
+        cutlass: Option<&rvllm_gpu::cutlass_ffi::CutlassKernels>,
+    ) -> BatchedPipelinePolicy {
+        let cutlass_loaded = cutlass.is_some();
+        let gateup =
+            cutlass_loaded && std::env::var("RVLLM_V2_CUTLASS_GATEUP").map_or(false, |v| v == "1");
+        let gate_aux = gateup
+            && !input.is_prefill
+            && weights.fused_gate_up_fp8.is_none()
+            && weights.down_proj_fp8.is_none()
+            && std::env::var("RVLLM_V2_CUTLASS_GATE_AUX").map_or(false, |v| v == "1");
+        BatchedPipelinePolicy {
+            use_cutlass_qkv: cutlass_loaded
+                && std::env::var("RVLLM_V2_CUTLASS_QKV").map_or(false, |v| v == "1"),
+            use_cutlass_oproj: cutlass_loaded
+                && std::env::var("RVLLM_V2_CUTLASS_OPROJ").map_or(false, |v| v == "1"),
+            use_cutlass_gateup: gateup,
+            use_cutlass_gate_aux: gate_aux,
+        }
+    }
+
+    fn forward_batched_with_policy(
+        &self,
+        input: &GpuLayerInput<'_>,
+        weights: &GpuLayerWeights<'_>,
+        blas: &CublasHandle,
+        lt: Option<&crate::CublasLtRef>,
+        prev_mlp_out: Option<&CudaSlice<f16>>,
+        scratch: &mut LayerScratchRef<'_>,
+        mut phase_timings: Option<&mut BatchedLayerPhaseTimings>,
+        gemm_strategy: GemmStrategy,
+        cutlass: Option<&rvllm_gpu::cutlass_ffi::CutlassKernels>,
+        policy: BatchedPipelinePolicy,
     ) -> Result<()> {
         let cfg = &self.config;
         let num_tokens = input.num_tokens;
@@ -151,17 +280,21 @@ impl GpuTransformerLayer {
         }
 
         // 2-3. QKV GEMM + bias (before taking residual_ref to avoid borrow conflict)
-        let used_fused_cutlass = self.batched_qkv_cutlass(
-            weights,
-            scratch,
-            cutlass,
-            gemm_strategy,
-            num_tokens,
-            qkv_dim,
-            hidden,
-            q_dim,
-            kv_dim,
-        )?;
+        let used_fused_cutlass = if policy.use_cutlass_qkv {
+            self.batched_qkv_cutlass(
+                weights,
+                scratch,
+                cutlass,
+                gemm_strategy,
+                num_tokens,
+                qkv_dim,
+                hidden,
+                q_dim,
+                kv_dim,
+            )?
+        } else {
+            false
+        };
 
         if !used_fused_cutlass {
             self.batched_qkv_gemm(
@@ -279,7 +412,7 @@ impl GpuTransformerLayer {
         }
 
         // 7-8. O projection + residual + post-norm
-        if Self::use_cutlass_oproj(gemm_strategy) {
+        if policy.use_cutlass_oproj {
             let ck = cutlass.expect("GemmStrategy::Cutlass requires loaded CUTLASS kernels");
             let m = num_tokens as i32;
             let n = hidden as i32;
@@ -358,12 +491,7 @@ impl GpuTransformerLayer {
             LLMError::GpuError("Batched path requires fused_gate_up weight".into())
         })?;
         let gate_up_dim = intermediate * 2;
-        let use_cutlass_gate_aux = Self::use_cutlass_gateup(gemm_strategy)
-            && cutlass.is_some()
-            && !input.is_prefill
-            && weights.fused_gate_up_fp8.is_none()
-            && weights.down_proj_fp8.is_none()
-            && std::env::var("RVLLM_CUTLASS_GATE_AUX").map_or(true, |v| v != "0");
+        let use_cutlass_gate_aux = policy.use_cutlass_gate_aux;
 
         if use_cutlass_gate_aux {
             let ck = cutlass.expect("CUTLASS gate-aux path requires loaded CUTLASS kernels");
@@ -414,7 +542,7 @@ impl GpuTransformerLayer {
             )
             .map_err(LLMError::GpuError)?;
         } else {
-            if Self::use_cutlass_gateup(gemm_strategy) {
+            if policy.use_cutlass_gateup {
                 let ck = cutlass.expect("GemmStrategy::Cutlass requires loaded CUTLASS kernels");
                 let m = num_tokens as i32;
                 let n = gate_up_dim as i32;

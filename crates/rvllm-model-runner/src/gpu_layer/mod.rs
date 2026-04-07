@@ -86,7 +86,7 @@ mod inner {
     }
 
     /// Pre-allocated scratch buffers for the batched forward path.
-    /// Required (not optional) for ForwardPath::Batched.
+    /// Required (not optional) for ForwardPath::Batched and ForwardPath::BatchedV2.
     pub struct LayerScratchRef<'a> {
         pub normed: &'a mut CudaSlice<f16>,
         pub residual: &'a mut CudaSlice<f16>,
@@ -141,6 +141,8 @@ mod inner {
         /// T>=1 batched decode or prefill with cuBLAS/CUTLASS GEMMs.
         /// Always requires scratch buffers.
         Batched,
+        /// T>=1 batched decode or prefill with the new clean batched pipeline.
+        BatchedV2,
     }
 
     /// GEMM implementation strategy for the batched path.
@@ -259,6 +261,20 @@ mod inner {
                     )?;
                     Ok(None)
                 }
+                ForwardPath::BatchedV2 => {
+                    let scratch = scratch.expect("BatchedV2 path requires scratch buffers");
+                    self.forward_batched_v2(
+                        input,
+                        weights,
+                        blas,
+                        lt,
+                        prev_mlp_out,
+                        scratch,
+                        gemm_strategy,
+                        cutlass,
+                    )?;
+                    Ok(None)
+                }
             }
         }
 
@@ -279,6 +295,21 @@ mod inner {
                 ForwardPath::Batched => {
                     let scratch = scratch.expect("Batched path requires scratch buffers");
                     self.forward_batched_profiled(
+                        input,
+                        weights,
+                        blas,
+                        lt,
+                        prev_mlp_out,
+                        scratch,
+                        Some(phase_timings),
+                        gemm_strategy,
+                        cutlass,
+                    )?;
+                    Ok(None)
+                }
+                ForwardPath::BatchedV2 => {
+                    let scratch = scratch.expect("BatchedV2 path requires scratch buffers");
+                    self.forward_batched_v2_profiled(
                         input,
                         weights,
                         blas,

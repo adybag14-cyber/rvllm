@@ -988,10 +988,11 @@ mod cuda_impl {
             let packed_buf = meta_packed.slice();
             let offsets = self.meta_packed_offsets.get();
             let path = self.resolve_forward_path(num_tokens, is_prefill);
-            if is_prefill || path != ForwardPath::Batched {
+            if is_prefill || !matches!(path, ForwardPath::Batched | ForwardPath::BatchedV2) {
                 phase_profile = None;
             }
-            let use_scratch = num_tokens > 1 || is_prefill || path == ForwardPath::Batched;
+            let use_scratch =
+                num_tokens > 1 || is_prefill || matches!(path, ForwardPath::Batched | ForwardPath::BatchedV2);
             if use_scratch {
                 self.ensure_scratch_capacity(num_tokens)?;
             }
@@ -1456,7 +1457,8 @@ mod cuda_impl {
             let layers_to_run = max_layers.min(self.layers.len());
             let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
             let path = self.resolve_forward_path(num_tokens, is_prefill);
-            let use_scratch = num_tokens > 1 || is_prefill || path == ForwardPath::Batched;
+            let use_scratch =
+                num_tokens > 1 || is_prefill || matches!(path, ForwardPath::Batched | ForwardPath::BatchedV2);
             if use_scratch {
                 self.ensure_scratch_capacity(num_tokens)?;
             }
@@ -1800,7 +1802,8 @@ mod cuda_impl {
             }
             // Double-buffered scratch for batched decode/prefill and optional
             // batch-1 decode experiments: zero per-layer allocations.
-            let use_scratch = num_tokens > 1 || is_prefill || path == ForwardPath::Batched;
+            let use_scratch =
+                num_tokens > 1 || is_prefill || matches!(path, ForwardPath::Batched | ForwardPath::BatchedV2);
             if use_scratch {
                 self.ensure_scratch_capacity(num_tokens)?;
             }
@@ -2014,6 +2017,7 @@ mod cuda_impl {
                     | ForwardPath::PersistentV3Decode
                     | ForwardPath::CublasGemvDecode
                     | ForwardPath::Batched
+                    | ForwardPath::BatchedV2
             )
         }
 
@@ -2031,7 +2035,11 @@ mod cuda_impl {
 
         fn resolve_forward_path(&self, num_tokens: usize, is_prefill: bool) -> ForwardPath {
             if num_tokens != 1 || is_prefill {
-                ForwardPath::Batched
+                if std::env::var("RVLLM_BATCHED_PIPELINE_V2").map_or(false, |v| v == "1") {
+                    ForwardPath::BatchedV2
+                } else {
+                    ForwardPath::Batched
+                }
             } else if let Some(path) = self.experimental_decode_path_override() {
                 path
             } else if std::env::var("RVLLM_BATCHED_DECODE_1").map_or(true, |v| v != "0") {
@@ -2167,7 +2175,8 @@ mod cuda_impl {
             }
             // Double-buffered scratch for batched decode/prefill and optional
             // batch-1 decode experiments: zero per-layer allocations.
-            let use_scratch = num_tokens > 1 || is_prefill || path == ForwardPath::Batched;
+            let use_scratch =
+                num_tokens > 1 || is_prefill || matches!(path, ForwardPath::Batched | ForwardPath::BatchedV2);
             if use_scratch {
                 self.ensure_scratch_capacity(num_tokens)?;
             }
