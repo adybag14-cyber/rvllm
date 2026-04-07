@@ -371,6 +371,12 @@ pub struct GpuWorker {
     decode_input_scratch: input::DecodeInputScratch,
 }
 
+enum PreparedForwardInput {
+    Model(ModelInput),
+    #[cfg(feature = "cuda")]
+    DecodeGraph(DecodeGraphDispatch),
+}
+
 impl GpuWorker {
     pub fn new(config: WorkerConfig) -> Result<Self> {
         let device_id = config.device_id;
@@ -538,11 +544,10 @@ impl GpuWorker {
     }
 
     #[cfg(feature = "cuda")]
-    fn try_gpu_forward_persistent_decode(
+    fn prepare_decode_forward_input(
         &mut self,
         metadata: &[SequenceGroupMetadata],
-        _greedy_only: bool,
-    ) -> Result<Option<ForwardOutput>> {
+    ) -> Result<Option<PreparedForwardInput>> {
         if metadata.is_empty() || metadata.iter().any(|g| g.is_prompt) {
             return Ok(None);
         }
@@ -556,8 +561,7 @@ impl GpuWorker {
         }
 
         let dispatch = self.decode_graph_dispatch(batch, false, true)?;
-        if !dispatch.execution.use_batched_v2 || matches!(dispatch.action, DecodeGraphAction::Raw)
-        {
+        if !dispatch.execution.use_batched_v2 {
             return Ok(None);
         }
 
@@ -572,31 +576,65 @@ impl GpuWorker {
             runner.graph_max_blocks(),
         )?;
 
-        let output = match dispatch.action {
-            DecodeGraphAction::Replay => self.replay_decode_graph(dispatch.execution, None)?,
-            DecodeGraphAction::Capture => match self.capture_decode_graph(dispatch.execution, None) {
-                Ok(output) => output,
-                Err(e) => {
-                    warn!(
-                        graph_batch = dispatch.execution.graph_tokens,
-                        "persistent decode graph capture failed, falling back: {e}"
-                    );
-                    return Ok(None);
-                }
-            },
-            DecodeGraphAction::Raw => return Ok(None),
-        };
+        if matches!(dispatch.action, DecodeGraphAction::Raw) {
+            return Ok(Some(PreparedForwardInput::Model(
+                input::model_input_from_decode_scratch(&self.decode_input_scratch),
+            )));
+        }
 
-        Ok(Some(output))
+        Ok(Some(PreparedForwardInput::DecodeGraph(dispatch)))
     }
 
     #[cfg(not(feature = "cuda"))]
-    fn try_gpu_forward_persistent_decode(
+    fn prepare_decode_forward_input(
         &mut self,
         _metadata: &[SequenceGroupMetadata],
-        _greedy_only: bool,
-    ) -> Result<Option<ForwardOutput>> {
+    ) -> Result<Option<PreparedForwardInput>> {
         Ok(None)
+    }
+
+    fn prepare_forward_input(
+        &mut self,
+        metadata: &[SequenceGroupMetadata],
+    ) -> Result<PreparedForwardInput> {
+        if let Some(prepared) = self.prepare_decode_forward_input(metadata)? {
+            return Ok(prepared);
+        }
+        Ok(PreparedForwardInput::Model(
+            self.prepare_model_input(metadata)?,
+        ))
+    }
+
+    fn gpu_forward_from_metadata_ex(
+        &mut self,
+        metadata: &[SequenceGroupMetadata],
+        greedy_only: bool,
+    ) -> Result<ForwardOutput> {
+        self.forward_count += 1;
+        match self.prepare_forward_input(metadata)? {
+            PreparedForwardInput::Model(model_input) => {
+                self.gpu_forward_prepared_ex(&model_input, greedy_only)
+            }
+            #[cfg(feature = "cuda")]
+            PreparedForwardInput::DecodeGraph(dispatch) => match dispatch.action {
+                DecodeGraphAction::Replay => self.replay_decode_graph(dispatch.execution, None),
+                DecodeGraphAction::Capture => {
+                    match self.capture_decode_graph(dispatch.execution, None) {
+                        Ok(output) => Ok(output),
+                        Err(e) => {
+                            warn!(
+                                graph_batch = dispatch.execution.graph_tokens,
+                                "decode graph capture failed, falling back: {e}"
+                            );
+                            let model_input =
+                                input::model_input_from_decode_scratch(&self.decode_input_scratch);
+                            self.gpu_forward_prepared_ex(&model_input, greedy_only)
+                        }
+                    }
+                }
+                DecodeGraphAction::Raw => unreachable!("raw decode dispatch is normalized earlier"),
+            },
+        }
     }
 
     /// Convenience constructor from EngineConfig and model path.
@@ -1456,17 +1494,7 @@ impl GpuWorker {
             return Ok(None);
         }
         let greedy_only = Self::all_greedy(metadata);
-        if let Some(fwd_output) = self.try_gpu_forward_persistent_decode(metadata, greedy_only)? {
-            match fwd_output {
-                ForwardOutput::TokenIdsPending { actual_batch } => return Ok(Some(actual_batch)),
-                _ => {
-                    self.pending_sync_output = Some((fwd_output, metadata.to_vec()));
-                    return Ok(None);
-                }
-            }
-        }
-        let model_input = self.prepare_model_input(metadata)?;
-        let fwd_output = self.gpu_forward_ex(&model_input, greedy_only)?;
+        let fwd_output = self.gpu_forward_from_metadata_ex(metadata, greedy_only)?;
         match fwd_output {
             ForwardOutput::TokenIdsPending { actual_batch } => Ok(Some(actual_batch)),
             _ => {
@@ -1520,14 +1548,7 @@ impl GpuWorker {
         }
 
         let greedy_only = Self::all_greedy(metadata);
-        let fwd_output =
-            if let Some(fwd_output) = self.try_gpu_forward_persistent_decode(metadata, greedy_only)?
-            {
-                fwd_output
-            } else {
-                let model_input = self.prepare_model_input(metadata)?;
-                self.gpu_forward_ex(&model_input, greedy_only)?
-            };
+        let fwd_output = self.gpu_forward_from_metadata_ex(metadata, greedy_only)?;
 
         let outputs = match fwd_output {
             ForwardOutput::TokenIdsPending { actual_batch } => {
@@ -1559,42 +1580,7 @@ impl GpuWorker {
         let t_start = std::time::Instant::now();
 
         let greedy_only = Self::all_greedy(metadata);
-        let fwd_output =
-            if let Some(fwd_output) = self.try_gpu_forward_persistent_decode(metadata, greedy_only)?
-            {
-                fwd_output
-            } else {
-                let model_input = self.prepare_model_input(metadata)?;
-                let fwd_output = self.gpu_forward_ex(&model_input, greedy_only)?;
-                let t_input = t_start.elapsed();
-                let t_forward = t_start.elapsed();
-                let outputs = match fwd_output {
-                    ForwardOutput::TokenIds(ref token_ids) => {
-                        self.sample_tokens_from_gpu_argmax(token_ids, metadata)?
-                    }
-                    ForwardOutput::TokenIdsPending { actual_batch } => {
-                        self.sample_pending_tokens_from_pinned(actual_batch, metadata)?
-                    }
-                    ForwardOutput::Logits(ref logits) => self.sample_tokens(logits, metadata)?,
-                };
-                let t_sample = t_start.elapsed();
-                if self.forward_count % 64 == 0 && self.forward_count > 0 {
-                    let input_us = t_input.as_micros();
-                    let forward_us = (t_forward - t_input).as_micros();
-                    let sample_us = (t_sample - t_forward).as_micros();
-                    let total_us = t_sample.as_micros();
-                    info!(
-                        input_us,
-                        forward_us,
-                        sample_us,
-                        total_us,
-                        tokens = metadata.iter().map(|g| g.seq_data.len()).sum::<usize>(),
-                        greedy = greedy_only,
-                        "TIMING execute"
-                    );
-                }
-                return Ok(GpuWorkerOutput { outputs });
-            };
+        let fwd_output = self.gpu_forward_from_metadata_ex(metadata, greedy_only)?;
         let t_input = t_start.elapsed();
         let t_forward = t_start.elapsed();
 
@@ -1611,7 +1597,6 @@ impl GpuWorker {
         let t_sample = t_start.elapsed();
 
         // Periodic timing report (every 64 steps)
-        self.forward_count += 0; // already incremented in gpu_forward_ex
         if self.forward_count % 64 == 0 && self.forward_count > 0 {
             let input_us = t_input.as_micros();
             let forward_us = (t_forward - t_input).as_micros();
@@ -1647,14 +1632,7 @@ impl GpuWorker {
         }
 
         let greedy_only = Self::all_greedy(metadata);
-        let fwd_output =
-            if let Some(fwd_output) = self.try_gpu_forward_persistent_decode(metadata, greedy_only)?
-            {
-                fwd_output
-            } else {
-                let model_input = self.prepare_model_input(metadata)?;
-                self.gpu_forward_ex(&model_input, greedy_only)?
-            };
+        let fwd_output = self.gpu_forward_from_metadata_ex(metadata, greedy_only)?;
 
         match fwd_output {
             ForwardOutput::TokenIdsPending { .. } => {
@@ -1819,7 +1797,14 @@ impl GpuWorker {
         greedy_only: bool,
     ) -> Result<ForwardOutput> {
         self.forward_count += 1;
+        self.gpu_forward_prepared_ex(model_input, greedy_only)
+    }
 
+    fn gpu_forward_prepared_ex(
+        &mut self,
+        model_input: &ModelInput,
+        greedy_only: bool,
+    ) -> Result<ForwardOutput> {
         // FP8 KV pre-forward: dequantize FP8 blocks back to f16 cache so
         // the attention kernel reads correct data.
         #[cfg(feature = "cuda")]
