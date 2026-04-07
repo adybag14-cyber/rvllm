@@ -13,7 +13,6 @@ mod decode;
 #[cfg(feature = "cuda")]
 mod inner {
     use std::sync::Arc;
-    use std::time::Duration;
 
     use cudarc::driver::{
         CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr, DevicePtrMut, DeviceSlice,
@@ -102,13 +101,13 @@ mod inner {
 
     #[derive(Debug, Clone, Default)]
     pub struct BatchedLayerPhaseTimings {
-        pub pre_attn_norm: Duration,
-        pub qkv: Duration,
-        pub rope_cache: Duration,
-        pub attn: Duration,
-        pub oproj_norm: Duration,
-        pub gateup_silu: Duration,
-        pub down: Duration,
+        pub pre_attn_norm: std::time::Duration,
+        pub qkv: std::time::Duration,
+        pub rope_cache: std::time::Duration,
+        pub attn: std::time::Duration,
+        pub oproj_norm: std::time::Duration,
+        pub gateup_silu: std::time::Duration,
+        pub down: std::time::Duration,
     }
 
     // ===================================================================
@@ -192,7 +191,6 @@ mod inner {
             prev_mlp_out: Option<&CudaSlice<f16>>,
             lt: Option<&crate::CublasLtRef>,
             scratch: Option<&mut LayerScratchRef<'_>>,
-            phase_timings: Option<&mut BatchedLayerPhaseTimings>,
             gemm_strategy: GemmStrategy,
             cutlass: Option<&rvllm_gpu::cutlass_ffi::CutlassKernels>,
         ) -> Result<Option<(CudaSlice<f16>, CudaSlice<f16>)>> {
@@ -256,12 +254,54 @@ mod inner {
                         lt,
                         prev_mlp_out,
                         scratch,
-                        phase_timings,
                         gemm_strategy,
                         cutlass,
                     )?;
                     Ok(None)
                 }
+            }
+        }
+
+        pub fn forward_profiled(
+            &self,
+            path: ForwardPath,
+            input: &GpuLayerInput<'_>,
+            weights: &GpuLayerWeights<'_>,
+            blas: &CublasHandle,
+            prev_mlp_out: Option<&CudaSlice<f16>>,
+            lt: Option<&crate::CublasLtRef>,
+            scratch: Option<&mut LayerScratchRef<'_>>,
+            phase_timings: &mut BatchedLayerPhaseTimings,
+            gemm_strategy: GemmStrategy,
+            cutlass: Option<&rvllm_gpu::cutlass_ffi::CutlassKernels>,
+        ) -> Result<Option<(CudaSlice<f16>, CudaSlice<f16>)>> {
+            match path {
+                ForwardPath::Batched => {
+                    let scratch = scratch.expect("Batched path requires scratch buffers");
+                    self.forward_batched_profiled(
+                        input,
+                        weights,
+                        blas,
+                        lt,
+                        prev_mlp_out,
+                        scratch,
+                        Some(phase_timings),
+                        gemm_strategy,
+                        cutlass,
+                    )?;
+                    Ok(None)
+                }
+                _ => self.forward(
+                    path,
+                    input,
+                    weights,
+                    blas,
+                    prev_mlp_out,
+                    lt,
+                    scratch,
+                    gemm_strategy,
+                    cutlass,
+                ),
             }
         }
 

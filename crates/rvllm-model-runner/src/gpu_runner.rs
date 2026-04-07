@@ -926,7 +926,7 @@ mod cuda_impl {
             attn_meta: &crate::bridge::AttentionMetadata,
             is_prefill: bool,
         ) -> Result<Vec<f32>> {
-            match self.forward_ex(token_ids, positions, attn_meta, is_prefill, false, None)? {
+            match self.forward_ex(token_ids, positions, attn_meta, is_prefill, false)? {
                 ForwardOutput::Logits(logits) => Ok(logits),
                 ForwardOutput::TokenIds(_) | ForwardOutput::TokenIdsPending { .. } => {
                     unreachable!("greedy_only=false must return Logits")
@@ -934,17 +934,14 @@ mod cuda_impl {
             }
         }
 
-        /// Extended forward: when `greedy_only` is true, runs argmax on GPU and
-        /// returns only token IDs (num_tokens * 4 bytes DtoH instead of
-        /// num_tokens * vocab_size * 4 bytes).
-        pub fn forward_ex(
+        fn forward_inner(
             &self,
             token_ids: &[u32],
             positions: &[u32],
             attn_meta: &crate::bridge::AttentionMetadata,
             is_prefill: bool,
             greedy_only: bool,
-            profile_decode_bucket: Option<usize>,
+            mut phase_profile: Option<&mut DecodePhaseProfileSummary>,
         ) -> Result<ForwardOutput> {
             let num_tokens = token_ids.len();
             let num_seqs = attn_meta.context_lens.len();
@@ -991,9 +988,9 @@ mod cuda_impl {
             let packed_buf = meta_packed.slice();
             let offsets = self.meta_packed_offsets.get();
             let path = self.resolve_forward_path(num_tokens, is_prefill);
-            let mut phase_profile = profile_decode_bucket
-                .filter(|_| !is_prefill && path == ForwardPath::Batched)
-                .map(DecodePhaseProfileSummary::new);
+            if is_prefill || path != ForwardPath::Batched {
+                phase_profile = None;
+            }
             let use_scratch = num_tokens > 1 || is_prefill || path == ForwardPath::Batched;
             if use_scratch {
                 self.ensure_scratch_capacity(num_tokens)?;
@@ -1144,28 +1141,43 @@ mod cuda_impl {
                 };
                 let weights = self.layer_weights(layer_idx)?;
                 let mut scratch_ref = scratch_ref_opt;
-                let mut layer_phase = phase_profile
-                    .as_ref()
-                    .map(|_| BatchedLayerPhaseTimings::default());
-                let result = layer.forward(
-                    path,
-                    &input,
-                    &weights,
-                    &self.blas,
-                    if use_double_buf {
-                        pmo_ref
-                    } else {
-                        prev_mlp_out.as_ref()
-                    },
-                    self.cublaslt_ref(),
-                    scratch_ref.as_mut(),
-                    layer_phase.as_mut(),
-                    self.gemm_strategy,
-                    self.cutlass.as_deref(),
-                )?;
-                if let (Some(summary), Some(layer_phase)) = (phase_profile.as_mut(), layer_phase.as_ref()) {
-                    summary.observe_layer(layer_phase);
-                }
+                let result = if let Some(summary) = phase_profile.as_deref_mut() {
+                    let mut layer_phase = BatchedLayerPhaseTimings::default();
+                    let result = layer.forward_profiled(
+                        path,
+                        &input,
+                        &weights,
+                        &self.blas,
+                        if use_double_buf {
+                            pmo_ref
+                        } else {
+                            prev_mlp_out.as_ref()
+                        },
+                        self.cublaslt_ref(),
+                        scratch_ref.as_mut(),
+                        &mut layer_phase,
+                        self.gemm_strategy,
+                        self.cutlass.as_deref(),
+                    )?;
+                    summary.observe_layer(&layer_phase);
+                    result
+                } else {
+                    layer.forward(
+                        path,
+                        &input,
+                        &weights,
+                        &self.blas,
+                        if use_double_buf {
+                            pmo_ref
+                        } else {
+                            prev_mlp_out.as_ref()
+                        },
+                        self.cublaslt_ref(),
+                        scratch_ref.as_mut(),
+                        self.gemm_strategy,
+                        self.cutlass.as_deref(),
+                    )?
+                };
                 if let Some((residual, mlp_out)) = result {
                     // Non-scratch path: take ownership
                     hidden_f16 = residual;
@@ -1375,6 +1387,39 @@ mod cuda_impl {
                 summary.log(num_tokens, num_layers);
             }
             Ok(ForwardOutput::Logits(logits_cpu))
+        }
+
+        /// Extended forward: when `greedy_only` is true, runs argmax on GPU and
+        /// returns only token IDs (num_tokens * 4 bytes DtoH instead of
+        /// num_tokens * vocab_size * 4 bytes).
+        pub fn forward_ex(
+            &self,
+            token_ids: &[u32],
+            positions: &[u32],
+            attn_meta: &crate::bridge::AttentionMetadata,
+            is_prefill: bool,
+            greedy_only: bool,
+        ) -> Result<ForwardOutput> {
+            self.forward_inner(token_ids, positions, attn_meta, is_prefill, greedy_only, None)
+        }
+
+        pub fn profile_decode_bucket(
+            &self,
+            token_ids: &[u32],
+            positions: &[u32],
+            attn_meta: &crate::bridge::AttentionMetadata,
+            greedy_only: bool,
+            target_bucket: usize,
+        ) -> Result<ForwardOutput> {
+            let mut phase_profile = DecodePhaseProfileSummary::new(target_bucket);
+            self.forward_inner(
+                token_ids,
+                positions,
+                attn_meta,
+                false,
+                greedy_only,
+                Some(&mut phase_profile),
+            )
         }
 
         /// Partial forward: run only the first `max_layers` transformer layers,
@@ -1987,58 +2032,15 @@ mod cuda_impl {
         }
 
         fn resolve_forward_path(&self, num_tokens: usize, is_prefill: bool) -> ForwardPath {
-            if num_tokens == 1 && !is_prefill {
-                // v3 persistent per-layer: non-cooperative, 1024 blocks, vectorized GEMV
-                if std::env::var("RVLLM_PERSISTENT_V3").map_or(false, |v| v == "1") {
-                    if self
-                        .persistent_v2
-                        .as_ref()
-                        .map_or(false, |k| k.has_v3_kernel())
-                    {
-                        return ForwardPath::PersistentV3Decode;
-                    }
-                }
-                // v2 megakernel: all layers + LM head in one cooperative launch (TC GEMV + split-KV)
-                if std::env::var("RVLLM_MEGAKERNEL_V2").map_or(false, |v| v == "1") {
-                    if self
-                        .persistent_v2
-                        .as_ref()
-                        .map_or(false, |k| k.has_mega_kernel())
-                    {
-                        return ForwardPath::MegakernelV2Decode;
-                    }
-                }
-                // v2 persistent per-layer: cooperative TC GEMV + split-KV attention
-                if std::env::var("RVLLM_PERSISTENT_V2").map_or(false, |v| v == "1") {
-                    if self
-                        .persistent_v2
-                        .as_ref()
-                        .map_or(false, |k| k.has_layer_kernel())
-                    {
-                        return ForwardPath::PersistentV2Decode;
-                    }
-                }
-                // v1 megakernel: all 28 layers in one kernel launch (instruction tape)
-                if std::env::var("RVLLM_MEGAKERNEL").map_or(false, |v| v == "1") {
-                    return ForwardPath::MegakernelDecode;
-                }
-                // v1 DAG persistent decode: single kernel per layer (scalar GEMV)
-                if std::env::var("RVLLM_PERSISTENT").map_or(false, |v| v == "1") {
-                    return ForwardPath::PersistentDecode;
-                }
-                // Default batch-1 decode now uses the reusable batched scratch
-                // path to avoid per-layer output allocations. Set
-                // RVLLM_BATCHED_DECODE_1=0 to fall back to the legacy
-                // CublasGemvDecode / FusedDecode path family.
-                if std::env::var("RVLLM_BATCHED_DECODE_1").map_or(true, |v| v != "0") {
-                    return ForwardPath::Batched;
-                }
-                // cuBLAS decode: separate norm + cuBLAS GEMM (higher BW).
-                // Default on for normal single-token decode; set
-                // RVLLM_CUBLAS_DECODE=0 to force the legacy fused path.
-                if std::env::var("RVLLM_CUBLAS_DECODE").map_or(true, |v| v != "0") {
-                    return ForwardPath::CublasGemvDecode;
-                }
+            if num_tokens != 1 || is_prefill {
+                ForwardPath::Batched
+            } else if let Some(path) = self.experimental_decode_path_override() {
+                path
+            } else if std::env::var("RVLLM_BATCHED_DECODE_1").map_or(true, |v| v != "0") {
+                ForwardPath::Batched
+            } else if std::env::var("RVLLM_CUBLAS_DECODE").map_or(true, |v| v != "0") {
+                ForwardPath::CublasGemvDecode
+            } else {
                 #[cfg(feature = "cublaslt")]
                 if self.blas_lt.is_some()
                     && !self.fp8_fused_qkv.is_empty()
@@ -2047,9 +2049,41 @@ mod cuda_impl {
                     return ForwardPath::Fp8Decode;
                 }
                 ForwardPath::FusedDecode
-            } else {
-                ForwardPath::Batched
             }
+        }
+
+        fn experimental_decode_path_override(&self) -> Option<ForwardPath> {
+            if std::env::var("RVLLM_PERSISTENT_V3").map_or(false, |v| v == "1")
+                && self
+                    .persistent_v2
+                    .as_ref()
+                    .map_or(false, |k| k.has_v3_kernel())
+            {
+                return Some(ForwardPath::PersistentV3Decode);
+            }
+            if std::env::var("RVLLM_MEGAKERNEL_V2").map_or(false, |v| v == "1")
+                && self
+                    .persistent_v2
+                    .as_ref()
+                    .map_or(false, |k| k.has_mega_kernel())
+            {
+                return Some(ForwardPath::MegakernelV2Decode);
+            }
+            if std::env::var("RVLLM_PERSISTENT_V2").map_or(false, |v| v == "1")
+                && self
+                    .persistent_v2
+                    .as_ref()
+                    .map_or(false, |k| k.has_layer_kernel())
+            {
+                return Some(ForwardPath::PersistentV2Decode);
+            }
+            if std::env::var("RVLLM_MEGAKERNEL").map_or(false, |v| v == "1") {
+                return Some(ForwardPath::MegakernelDecode);
+            }
+            if std::env::var("RVLLM_PERSISTENT").map_or(false, |v| v == "1") {
+                return Some(ForwardPath::PersistentDecode);
+            }
+            None
         }
 
         /// Prepare the runner for CUDA graph capture.
@@ -3728,7 +3762,19 @@ mod mock_impl {
             _attn_meta: &crate::bridge::AttentionMetadata,
             _is_prefill: bool,
             _greedy_only: bool,
-            _profile_decode_bucket: Option<usize>,
+        ) -> Result<ForwardOutput> {
+            Err(LLMError::GpuError(
+                "GpuModelRunner requires the `cuda` feature".into(),
+            ))
+        }
+
+        pub fn profile_decode_bucket(
+            &self,
+            _token_ids: &[u32],
+            _positions: &[u32],
+            _attn_meta: &crate::bridge::AttentionMetadata,
+            _greedy_only: bool,
+            _target_bucket: usize,
         ) -> Result<ForwardOutput> {
             Err(LLMError::GpuError(
                 "GpuModelRunner requires the `cuda` feature".into(),

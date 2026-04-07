@@ -4,7 +4,6 @@
 //! Per-op CUTLASS vs cuBLAS routing determined by GemmStrategy (set at init time).
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use cudarc::driver::{
     CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr, DevicePtrMut, DeviceSlice,
@@ -16,10 +15,7 @@ use tracing::info;
 use rvllm_core::error::{LLMError, Result};
 use rvllm_gpu::cublas::CublasHandle;
 
-use super::{
-    BatchedLayerPhaseTimings, GemmStrategy, GpuLayerInput, GpuLayerWeights, GpuTransformerLayer,
-    LayerScratchRef,
-};
+use super::{BatchedLayerPhaseTimings, GemmStrategy, GpuLayerInput, GpuLayerWeights, GpuTransformerLayer, LayerScratchRef};
 
 impl GpuTransformerLayer {
     #[inline]
@@ -49,6 +45,30 @@ impl GpuTransformerLayer {
         lt: Option<&crate::CublasLtRef>,
         prev_mlp_out: Option<&CudaSlice<f16>>,
         scratch: &mut LayerScratchRef<'_>,
+        gemm_strategy: GemmStrategy,
+        cutlass: Option<&rvllm_gpu::cutlass_ffi::CutlassKernels>,
+    ) -> Result<()> {
+        self.forward_batched_profiled(
+            input,
+            weights,
+            blas,
+            lt,
+            prev_mlp_out,
+            scratch,
+            None,
+            gemm_strategy,
+            cutlass,
+        )
+    }
+
+    pub(crate) fn forward_batched_profiled(
+        &self,
+        input: &GpuLayerInput<'_>,
+        weights: &GpuLayerWeights<'_>,
+        blas: &CublasHandle,
+        lt: Option<&crate::CublasLtRef>,
+        prev_mlp_out: Option<&CudaSlice<f16>>,
+        scratch: &mut LayerScratchRef<'_>,
         mut phase_timings: Option<&mut BatchedLayerPhaseTimings>,
         gemm_strategy: GemmStrategy,
         cutlass: Option<&rvllm_gpu::cutlass_ffi::CutlassKernels>,
@@ -67,8 +87,6 @@ impl GpuTransformerLayer {
         let k_end = q_end + num_tokens * kv_dim;
 
         let dbg = cfg.layer_idx < 1 && std::env::var("RVLLM_DEBUG").is_ok();
-        let profile = phase_timings.is_some();
-        let mut phase_start = Instant::now();
         let dbg_dump = |label: &str, buf: &CudaSlice<f16>, stream: &Arc<CudaStream>| {
             if let Ok(vals) = stream.clone_dtoh(buf) {
                 let first5: Vec<f32> = vals.iter().take(5).map(|v| v.to_f32()).collect();
@@ -85,6 +103,7 @@ impl GpuTransformerLayer {
                 info!("DEBUG L0 {label}: first5={first5:?} last5={last5:?} max={max:.4} mean={mean:.6} nan={nan} len={}", vals.len());
             }
         };
+        let mut phase_start = std::time::Instant::now();
         let mut mark_phase =
             |slot: fn(&mut BatchedLayerPhaseTimings) -> &mut std::time::Duration| -> Result<()> {
                 if let Some(t) = phase_timings.as_deref_mut() {
@@ -92,7 +111,7 @@ impl GpuTransformerLayer {
                         .synchronize()
                         .map_err(|e| LLMError::GpuError(format!("phase profile sync: {e}")))?;
                     *slot(t) = phase_start.elapsed();
-                    phase_start = Instant::now();
+                    phase_start = std::time::Instant::now();
                 }
                 Ok(())
             };
@@ -126,7 +145,7 @@ impl GpuTransformerLayer {
             )?;
             residual_from_fused = false;
         };
-        if profile {
+        if phase_timings.is_some() {
             mark_phase(|t| &mut t.pre_attn_norm)?;
         }
 
@@ -148,7 +167,7 @@ impl GpuTransformerLayer {
                 weights, blas, lt, scratch, num_tokens, qkv_dim, hidden, q_dim, kv_dim,
             )?;
         }
-        if profile {
+        if phase_timings.is_some() {
             mark_phase(|t| &mut t.qkv)?;
         }
 
@@ -209,7 +228,7 @@ impl GpuTransformerLayer {
                 )?;
             }
         }
-        if profile {
+        if phase_timings.is_some() {
             mark_phase(|t| &mut t.rope_cache)?;
         }
 
@@ -254,7 +273,7 @@ impl GpuTransformerLayer {
         if dbg {
             dbg_dump("attn_out", &attn_out, &self.stream);
         }
-        if profile {
+        if phase_timings.is_some() {
             mark_phase(|t| &mut t.attn)?;
         }
 
@@ -329,7 +348,7 @@ impl GpuTransformerLayer {
                 scratch.residual,
             )?;
         }
-        if profile {
+        if phase_timings.is_some() {
             mark_phase(|t| &mut t.oproj_norm)?;
         }
 
@@ -466,7 +485,7 @@ impl GpuTransformerLayer {
                         .map_err(|e| LLMError::GpuError(format!("silu_interleaved: {e}")))?;
                 }
             }
-            if profile {
+            if phase_timings.is_some() {
                 mark_phase(|t| &mut t.gateup_silu)?;
             }
 
@@ -484,13 +503,13 @@ impl GpuTransformerLayer {
                 weights.down_proj_fp8,
                 scratch.down,
             )?;
-            if profile {
+            if phase_timings.is_some() {
                 mark_phase(|t| &mut t.down)?;
             }
             return Ok(());
         }
 
-        if profile {
+        if phase_timings.is_some() {
             mark_phase(|t| &mut t.gateup_silu)?;
         }
         Self::hgemm_dispatch_fp8_into(
@@ -506,7 +525,7 @@ impl GpuTransformerLayer {
             weights.down_proj_fp8,
             scratch.down,
         )?;
-        if profile {
+        if phase_timings.is_some() {
             mark_phase(|t| &mut t.down)?;
         }
 
