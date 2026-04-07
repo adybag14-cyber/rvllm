@@ -1240,7 +1240,7 @@ mod inner {
                 unsafe {
                     stream
                         .launch_builder(kernel)
-                        .arg(&mut output)
+                        .arg(output)
                         .arg(&dummy)
                         .arg(&dummy)
                         .arg(&dummy)
@@ -1280,7 +1280,7 @@ mod inner {
             unsafe {
                 stream
                     .launch_builder(kernel)
-                    .arg(&mut output)
+                    .arg(output)
                     .arg(&mut p_out)
                     .arg(&mut p_max)
                     .arg(&mut p_sum)
@@ -1308,7 +1308,7 @@ mod inner {
             unsafe {
                 stream
                     .launch_builder(&combine)
-                    .arg(&mut output)
+                    .arg(output)
                     .arg(&p_out)
                     .arg(&p_max)
                     .arg(&p_sum)

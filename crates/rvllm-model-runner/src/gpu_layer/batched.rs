@@ -430,7 +430,7 @@ impl GpuTransformerLayer {
                 p
             };
             let in_ptr = {
-                let (p, _g) = DevicePtr::device_ptr(&attn_out, &self.stream);
+                let (p, _g) = DevicePtr::device_ptr(attn_out, &self.stream);
                 p
             };
             let (w_ptr, _g2) = DevicePtr::device_ptr(weights.o_proj, &self.stream);
@@ -465,7 +465,7 @@ impl GpuTransformerLayer {
                 &self.stream,
                 blas,
                 lt,
-                &attn_out,
+                attn_out,
                 weights.o_proj,
                 num_tokens,
                 hidden,
