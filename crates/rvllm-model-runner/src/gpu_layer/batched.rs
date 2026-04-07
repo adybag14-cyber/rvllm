@@ -132,7 +132,7 @@ impl GpuTransformerLayer {
         gemm_strategy: GemmStrategy,
         cutlass: Option<&rvllm_gpu::cutlass_ffi::CutlassKernels>,
     ) -> Result<()> {
-        let policy = self.batched_v2_policy(input, weights, cutlass);
+        let policy = self.batched_v2_policy(cutlass);
         self.forward_batched_with_policy(
             input,
             weights,
@@ -168,23 +168,27 @@ impl GpuTransformerLayer {
 
     fn batched_v2_policy(
         &self,
-        input: &GpuLayerInput<'_>,
-        weights: &GpuLayerWeights<'_>,
         cutlass: Option<&rvllm_gpu::cutlass_ffi::CutlassKernels>,
     ) -> BatchedPipelinePolicy {
         let cutlass_loaded = cutlass.is_some();
-        let gateup = cutlass_loaded && self.batched_v2_policy.use_cutlass_gateup;
-        let gate_aux = gateup
-            && !input.is_prefill
-            && weights.fused_gate_up_fp8.is_none()
-            && weights.down_proj_fp8.is_none()
-            && self.batched_v2_policy.use_cutlass_gate_aux;
         BatchedPipelinePolicy {
             use_cutlass_qkv: cutlass_loaded && self.batched_v2_policy.use_cutlass_qkv,
             use_cutlass_oproj: cutlass_loaded && self.batched_v2_policy.use_cutlass_oproj,
-            use_cutlass_gateup: gateup,
-            use_cutlass_gate_aux: gate_aux,
+            use_cutlass_gateup: cutlass_loaded && self.batched_v2_policy.use_cutlass_gateup,
+            use_cutlass_gate_aux: cutlass_loaded && self.batched_v2_policy.use_cutlass_gate_aux,
         }
+    }
+
+    #[inline]
+    fn can_use_cutlass_gate_aux(
+        policy: BatchedPipelinePolicy,
+        input: &GpuLayerInput<'_>,
+        weights: &GpuLayerWeights<'_>,
+    ) -> bool {
+        policy.use_cutlass_gate_aux
+            && !input.is_prefill
+            && weights.fused_gate_up_fp8.is_none()
+            && weights.down_proj_fp8.is_none()
     }
 
     fn forward_batched_with_policy(
@@ -489,7 +493,7 @@ impl GpuTransformerLayer {
             LLMError::GpuError("Batched path requires fused_gate_up weight".into())
         })?;
         let gate_up_dim = intermediate * 2;
-        let use_cutlass_gate_aux = policy.use_cutlass_gate_aux;
+        let use_cutlass_gate_aux = Self::can_use_cutlass_gate_aux(policy, input, weights);
 
         if use_cutlass_gate_aux {
             let ck = cutlass.expect("CUTLASS gate-aux path requires loaded CUTLASS kernels");
