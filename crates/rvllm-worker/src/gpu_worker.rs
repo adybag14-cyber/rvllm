@@ -565,6 +565,10 @@ impl GpuWorker {
             return Ok(None);
         }
 
+        if matches!(dispatch.action, DecodeGraphAction::Raw) {
+            return Ok(None);
+        }
+
         let runner = self
             .gpu_model_runner
             .as_ref()
@@ -575,12 +579,6 @@ impl GpuWorker {
             self.config.block_size,
             runner.graph_max_blocks(),
         )?;
-
-        if matches!(dispatch.action, DecodeGraphAction::Raw) {
-            return Ok(Some(PreparedForwardInput::Model(
-                input::model_input_from_decode_scratch(&self.decode_input_scratch),
-            )));
-        }
 
         Ok(Some(PreparedForwardInput::DecodeGraph(dispatch)))
     }
@@ -626,8 +624,7 @@ impl GpuWorker {
                                 graph_batch = dispatch.execution.graph_tokens,
                                 "decode graph capture failed, falling back: {e}"
                             );
-                            let model_input =
-                                input::model_input_from_decode_scratch(&self.decode_input_scratch);
+                            let model_input = self.prepare_model_input(metadata)?;
                             self.gpu_forward_prepared_ex(&model_input, greedy_only)
                         }
                     }

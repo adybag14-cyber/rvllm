@@ -512,21 +512,6 @@ pub fn prepare_decode_persistent_reuse(
     Ok(())
 }
 
-pub fn model_input_from_decode_scratch(scratch: &DecodeInputScratch) -> ModelInput {
-    ModelInput {
-        token_ids: scratch.token_ids.clone(),
-        position_ids: scratch.position_ids.clone(),
-        attention_metadata: AttentionMetadata {
-            slot_mapping: scratch.slot_mapping.clone(),
-            query_lens: scratch.query_lens.clone(),
-            context_lens: scratch.context_lens.clone(),
-            block_tables: scratch.block_tables.clone(),
-            max_context_len: scratch.max_context_len(),
-        },
-        is_prefill: false,
-    }
-}
-
 fn decode_seq_len(sd: &SequenceData) -> usize {
     if sd.seq_len != 0 {
         sd.seq_len as usize
