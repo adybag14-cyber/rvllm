@@ -439,7 +439,6 @@ mod cuda_impl {
                     );
                     GemmStrategy::Cublas
                 }
-                None if cutlass.is_some() => GemmStrategy::Hybrid,
                 None => GemmStrategy::Cublas,
                 Some(other) => {
                     info!(
