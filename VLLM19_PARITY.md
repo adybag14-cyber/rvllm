@@ -4,7 +4,7 @@ Goal: stop meandering and force `main` toward one boring default execution metho
 
 Current pushed baseline:
 - branch: `main`
-- commit: `6da116677`
+- commit: `faa69fde9`
 
 Rules for this push:
 - no new branches
@@ -22,6 +22,7 @@ Target architectural state:
    - runner owns path selection
    - runner owns decode graph dispatch policy
    - worker executes the runner plan instead of recomputing policy
+   - normal decode no longer falls through legacy single-token path overrides
 
 3. Persistent decode metadata path
    - pure decode `BatchedV2` uses persistent flat request/block-table state
