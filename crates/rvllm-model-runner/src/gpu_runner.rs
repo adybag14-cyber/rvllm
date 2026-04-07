@@ -24,6 +24,13 @@ pub enum ForwardOutput {
     TokenIdsPending { actual_batch: usize },
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct DecodeExecutionPlan {
+    pub actual_tokens: usize,
+    pub graph_tokens: usize,
+    pub use_graphed_decode: bool,
+}
+
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use std::cell::RefCell;
@@ -205,6 +212,19 @@ mod cuda_impl {
                 "decode phase profile"
             );
         }
+    }
+
+    fn forward_path_graph_capture_supported(path: ForwardPath) -> bool {
+        matches!(
+            path,
+            ForwardPath::Fp8Decode
+                | ForwardPath::FusedDecode
+                | ForwardPath::PersistentDecode
+                | ForwardPath::PersistentV3Decode
+                | ForwardPath::CublasGemvDecode
+                | ForwardPath::Batched
+                | ForwardPath::BatchedV2
+        )
     }
 
     /// Element offsets into the packed metadata GPU buffer.
@@ -2006,19 +2026,49 @@ mod cuda_impl {
             &self.stream
         }
 
+        fn padded_decode_batch_size(batch: usize) -> usize {
+            if batch <= 1 {
+                return 1;
+            }
+            if batch <= 2 {
+                return 2;
+            }
+            if batch <= 4 {
+                return 4;
+            }
+            if batch <= 8 {
+                return 8;
+            }
+            if batch <= 256 {
+                return (batch + 7) & !7;
+            }
+            (batch + 31) & !31
+        }
+
+        pub fn decode_execution_plan(
+            &self,
+            num_tokens: usize,
+            is_prefill: bool,
+            is_pure_decode: bool,
+        ) -> DecodeExecutionPlan {
+            let graph_tokens = if is_pure_decode {
+                Self::padded_decode_batch_size(num_tokens)
+            } else {
+                num_tokens
+            };
+            let graph_path = self.resolve_forward_path(graph_tokens, is_prefill);
+            DecodeExecutionPlan {
+                actual_tokens: num_tokens,
+                graph_tokens,
+                use_graphed_decode: is_pure_decode
+                    && forward_path_graph_capture_supported(graph_path),
+            }
+        }
+
         /// Whether the selected forward path can be executed by
         /// `forward_gpu_only()` and therefore participate in CUDA graph capture.
         pub fn graph_capture_supported(&self, num_tokens: usize, is_prefill: bool) -> bool {
-            matches!(
-                self.resolve_forward_path(num_tokens, is_prefill),
-                ForwardPath::Fp8Decode
-                    | ForwardPath::FusedDecode
-                    | ForwardPath::PersistentDecode
-                    | ForwardPath::PersistentV3Decode
-                    | ForwardPath::CublasGemvDecode
-                    | ForwardPath::Batched
-                    | ForwardPath::BatchedV2
-            )
+            forward_path_graph_capture_supported(self.resolve_forward_path(num_tokens, is_prefill))
         }
 
         /// Get cublasLt reference (None when feature is off).
@@ -3735,7 +3785,7 @@ pub use cuda_impl::GpuModelRunner;
 // =========================================================================
 #[cfg(not(feature = "cuda"))]
 mod mock_impl {
-    use super::ForwardOutput;
+    use super::{DecodeExecutionPlan, ForwardOutput};
     use crate::bridge::{LLMError, Result};
     use crate::runner::ModelRunnerConfig;
 
@@ -3789,6 +3839,19 @@ mod mock_impl {
 
         pub fn config(&self) -> &ModelRunnerConfig {
             &self.config
+        }
+
+        pub fn decode_execution_plan(
+            &self,
+            num_tokens: usize,
+            _is_prefill: bool,
+            _is_pure_decode: bool,
+        ) -> DecodeExecutionPlan {
+            DecodeExecutionPlan {
+                actual_tokens: num_tokens,
+                graph_tokens: num_tokens,
+                use_graphed_decode: false,
+            }
         }
 
         pub fn upload_metadata(

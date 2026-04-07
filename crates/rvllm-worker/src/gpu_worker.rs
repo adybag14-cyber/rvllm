@@ -18,7 +18,7 @@ use rvllm_core::prelude::{BlockId, LLMError, Result, SamplingParams, TokenId};
 use rvllm_gpu::prelude::{CublasHandle, CudaGpuAllocator, GpuStream};
 
 use rvllm_kv_cache::CacheEngine;
-use rvllm_model_runner::gpu_runner::ForwardOutput;
+use rvllm_model_runner::gpu_runner::{DecodeExecutionPlan, ForwardOutput};
 use rvllm_model_runner::input::ModelInput;
 use rvllm_model_runner::ModelRunnerConfig;
 use rvllm_sampling::batch::make_rng;
@@ -721,13 +721,14 @@ impl GpuWorker {
             if n > max_batch {
                 break;
             }
+            let plan = runner.decode_execution_plan(n, false, true);
 
             // Skip if already captured (shouldn't happen at init, but be safe)
-            if self.graph_runner.has_graph_for_exact(n) {
+            if self.graph_runner.has_graph_for_exact(plan.graph_tokens) {
                 continue;
             }
 
-            if !runner.graph_capture_supported(n, false) {
+            if !plan.use_graphed_decode {
                 debug!(n, "skipping pre-capture for non-graph decode path");
                 skipped += 1;
                 continue;
@@ -744,12 +745,18 @@ impl GpuWorker {
             };
 
             // Warmup forward (outside capture)
-            if let Err(e) = runner.upload_metadata(&token_ids, &positions, &attn_meta) {
+            let upload_result = if plan.graph_tokens == n {
+                runner.upload_metadata(&token_ids, &positions, &attn_meta)
+            } else {
+                runner.upload_metadata_padded(&token_ids, &positions, &attn_meta, plan.graph_tokens)
+            };
+            if let Err(e) = upload_result {
                 warn!(n, "precapture upload failed: {e}");
                 skipped += 1;
                 continue;
             }
-            if let Err(e) = runner.forward_gpu_only(n, n, 1, false) {
+            if let Err(e) = runner.forward_gpu_only(plan.graph_tokens, plan.graph_tokens, 1, false)
+            {
                 let msg = format!("{e}");
                 if msg.contains("AUTOTUNED") || msg.contains("NOT_SUPPORTED") {
                     tracing::error!(n, "FATAL: {msg}");
@@ -768,7 +775,12 @@ impl GpuWorker {
             }
 
             // Re-upload for capture
-            if let Err(e) = runner.upload_metadata(&token_ids, &positions, &attn_meta) {
+            let reupload_result = if plan.graph_tokens == n {
+                runner.upload_metadata(&token_ids, &positions, &attn_meta)
+            } else {
+                runner.upload_metadata_padded(&token_ids, &positions, &attn_meta, plan.graph_tokens)
+            };
+            if let Err(e) = reupload_result {
                 warn!(n, "precapture re-upload failed: {e}");
                 skipped += 1;
                 continue;
@@ -777,29 +789,36 @@ impl GpuWorker {
             // Begin capture
             if let Err(e) = self.graph_runner.pool_mut().begin_capture_on(&cuda_stream) {
                 warn!(n, "precapture begin_capture failed: {e}");
-                self.graph_runner.mark_captured(n);
+                self.graph_runner.mark_captured(plan.graph_tokens);
                 skipped += 1;
                 continue;
             }
 
             // Forward inside capture
-            match runner.forward_gpu_only(n, n, 1, false) {
-                Ok(()) => match self.graph_runner.pool_mut().end_capture_on(&cuda_stream, n) {
+            match runner.forward_gpu_only(plan.graph_tokens, plan.graph_tokens, 1, false) {
+                Ok(()) => match self
+                    .graph_runner
+                    .pool_mut()
+                    .end_capture_on(&cuda_stream, plan.graph_tokens)
+                {
                     Ok(graph) => {
                         self.graph_runner.pool_mut().insert(graph);
-                        self.graph_runner.mark_captured(n);
+                        self.graph_runner.mark_captured(plan.graph_tokens);
                         captured += 1;
                     }
                     Err(e) => {
                         warn!(n, "precapture end_capture failed: {e}");
-                        self.graph_runner.mark_captured(n);
+                        self.graph_runner.mark_captured(plan.graph_tokens);
                         skipped += 1;
                     }
                 },
                 Err(e) => {
                     warn!(n, "precapture forward failed: {e}");
-                    let _ = self.graph_runner.pool_mut().end_capture_on(&cuda_stream, n);
-                    self.graph_runner.mark_captured(n);
+                    let _ = self
+                        .graph_runner
+                        .pool_mut()
+                        .end_capture_on(&cuda_stream, plan.graph_tokens);
+                    self.graph_runner.mark_captured(plan.graph_tokens);
                     skipped += 1;
                 }
             }
@@ -1601,28 +1620,6 @@ impl GpuWorker {
     /// Metadata uploads happen OUTSIDE graph capture/replay so the memcpy_htod
     /// updates the persistent buffer contents in-place. The graph's kernels then
     /// read fresh data from the same GPU pointers that were baked in at capture.
-    /// Pad a batch size up to the nearest "capture bucket".
-    /// Buckets: 1, 2, 4, 8, then every 8 up to 256, then every 32 up to 512.
-    fn padded_batch_size(batch: usize) -> usize {
-        if batch <= 1 {
-            return 1;
-        }
-        if batch <= 2 {
-            return 2;
-        }
-        if batch <= 4 {
-            return 4;
-        }
-        if batch <= 8 {
-            return 8;
-        }
-        if batch <= 256 {
-            // Round up to nearest 8
-            return (batch + 7) & !7;
-        }
-        // Round up to nearest 32
-        (batch + 31) & !31
-    }
 
     fn gpu_forward_ex(
         &mut self,
@@ -1648,7 +1645,6 @@ impl GpuWorker {
                 .iter()
                 .all(|&q| q == 1);
         let batch = model_input.num_tokens();
-        let padded = Self::padded_batch_size(batch);
         let result = if !is_decode || !self.graph_runner.is_enabled() {
             self.raw_gpu_forward_ex(model_input, greedy_only)
         } else {
@@ -1658,23 +1654,23 @@ impl GpuWorker {
                     .gpu_model_runner
                     .as_ref()
                     .ok_or_else(|| LLMError::GpuError("GPU model runner not initialized".into()))?;
-                let graph_capture_supported = runner.graph_capture_supported(padded, false);
+                let plan = runner.decode_execution_plan(batch, model_input.is_prefill, is_decode);
 
                 // Runner-level decode paths are not graph-safe: bypass replay/capture
                 // and let raw forward dispatch them correctly.
-                if !graph_capture_supported {
+                if !plan.use_graphed_decode {
                     self.raw_gpu_forward_ex(model_input, greedy_only)
                 // 1. Check for padded graph (hot path)
-                } else if self.graph_runner.has_graph_for_exact(padded) {
-                    self.gpu_forward_ex_graphed_padded(model_input, batch, padded, greedy_only)
+                } else if self.graph_runner.has_graph_for_exact(plan.graph_tokens) {
+                    self.gpu_forward_ex_graphed_padded(model_input, plan, greedy_only)
                 } else if self.forward_count > Self::GRAPH_WARMUP_CALLS
-                    && !self.graph_runner.was_capture_attempted(padded)
+                    && !self.graph_runner.was_capture_attempted(plan.graph_tokens)
                 {
                     // 2. Past warmup? Capture a graph for this padded batch size
-                    match self.try_capture_graph_padded(model_input, batch, padded, greedy_only) {
+                    match self.try_capture_graph_padded(model_input, plan, greedy_only) {
                         Ok(output) => Ok(output),
                         Err(e) => {
-                            warn!(padded, "graph capture failed, raw forward: {e}");
+                            warn!(graph_batch = plan.graph_tokens, "graph capture failed, raw forward: {e}");
                             self.raw_gpu_forward_ex(model_input, greedy_only)
                         }
                     }
@@ -1709,10 +1705,11 @@ impl GpuWorker {
     fn gpu_forward_ex_graphed_padded(
         &mut self,
         model_input: &ModelInput,
-        actual_batch: usize,
-        padded_batch: usize,
+        plan: DecodeExecutionPlan,
         _greedy_only: bool,
     ) -> Result<ForwardOutput> {
+        let actual_batch = plan.actual_tokens;
+        let padded_batch = plan.graph_tokens;
         self.ensure_pinned_output_capacity(actual_batch)?;
         let runner = self
             .gpu_model_runner
@@ -1763,10 +1760,11 @@ impl GpuWorker {
     fn try_capture_graph_padded(
         &mut self,
         model_input: &ModelInput,
-        actual_batch: usize,
-        padded_batch: usize,
+        plan: DecodeExecutionPlan,
         _greedy_only: bool,
     ) -> Result<ForwardOutput> {
+        let actual_batch = plan.actual_tokens;
+        let padded_batch = plan.graph_tokens;
         let max_context_len = model_input.attention_metadata.max_context_len;
         self.ensure_pinned_output_capacity(actual_batch)?;
 
@@ -1775,7 +1773,7 @@ impl GpuWorker {
             .as_ref()
             .ok_or_else(|| LLMError::GpuError("GPU model runner not initialized".into()))?;
 
-        if !runner.graph_capture_supported(padded_batch, false) {
+        if !plan.use_graphed_decode {
             return Err(LLMError::GpuError(format!(
                 "graph capture unsupported for batch {padded_batch}"
             )));
