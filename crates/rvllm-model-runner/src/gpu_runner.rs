@@ -60,7 +60,7 @@ mod cuda_impl {
     use rvllm_kv_cache::engine_cuda::CudaCacheEngine;
     use rvllm_model_loader::gpu_weights::GpuModelWeights;
 
-    use super::ForwardOutput;
+    use super::{DecodeExecutionPlan, ForwardOutput};
 
     /// Reusable GPU buffer that grows as needed, eliminating per-step CUDA
     /// allocations on the hot decode path.
