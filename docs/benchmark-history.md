@@ -2,7 +2,7 @@
 
 This file starts with the current public benchmark truth, then keeps older numbers only as historical context.
 
-## Current Public Comparison (April 4, 2026)
+## Current Public Comparison (April 7, 2026)
 
 Model: Qwen2.5-7B f16
 GPU: H100 SXM 80GB
@@ -13,18 +13,19 @@ Decode length: `output-len=128`
 
 | N | vLLM 0.19.0 tok/s | rvLLM tok/s | rvLLM / vLLM |
 |---:|---:|---:|---:|
-| 1 | 165.5 | 133.1 | 0.80x |
-| 32 | 4467.7 | 4407.5 | 0.99x |
-| 64 | 7972.1 | 8038.0 | 1.01x |
-| 128 | 13903.5 | 13110.1 | 0.94x |
+| 1 | 167.5 | 132.7 | 0.79x |
+| 32 | 4964.2 | 4494.9 | 0.91x |
+| 64 | 9312.6 | 8503.4 | 0.91x |
+| 96 | 13085.9 | 10530.6 | 0.80x |
+| 128 | 16825.3 | 13718.1 | 0.82x |
 
 ### What changed to get here
 
-Two fixes matter most:
+Two things matter most:
 
 1. **Batch-1 default-path fix**
    - normal `T=1` decode now defaults to the reusable `Batched` path
-   - this lifted the current normal batch-1 path to `133.1 tok/s`
+   - this is still the right architecture change even though current `N=1` is behind vLLM
 
 2. **Batched GEMM policy fix**
    - `GemmStrategy::Hybrid` is now real instead of half-implied
@@ -34,7 +35,17 @@ Two fixes matter most:
      - GateUp + SiLU: CUTLASS
      - Down-proj: cuBLAS / cublasLt
 
-### Explicit batched strategy sweep
+### Important correction
+
+The earlier `89f`-era "rvLLM beats vLLM at `N=64`" claim is no longer treated as valid.
+
+- the fast `89f` H100 run was real
+- but that path was fast because the CUTLASS gate-aux FFN branch skipped the FFN down-projection
+- the archived fast H100 CUTLASS library is still kept in the repo for forensic reproducibility
+
+So the current public baseline is the clean current-`main` table above, not the older `9589 tok/s` claim.
+
+### Earlier explicit batched strategy sweep
 
 On the same H100 for `N=64`, `output-len=128`:
 
@@ -48,16 +59,17 @@ That sweep is why `Hybrid` is the current default when CUTLASS is available.
 
 ## Current Read of the Gap
 
-- `N=1`: still materially behind vLLM
-- `N=32`: basically tied
-- `N=64`: effectively tied to slightly ahead
-- `N=128`: still a few percent behind
+- `N=1`: materially behind vLLM
+- `N=32`: closer, but still behind
+- `N=64`: still behind
+- `N=128`: still behind by a wider margin
 
-The remaining issues are no longer “wrong path” bugs in the normal batched stack. The biggest remaining work is:
+The biggest remaining work is:
 
 - better single-stream decode
+- a correct fast Hopper FFN path that does not skip work
 - safer `cublasLt` autotune fallback when cached algos go bad
-- a few more percent at `N=128`
+- more efficiency at `N=64` and `N=128`
 
 ## Historical Context
 

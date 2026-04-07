@@ -89,16 +89,17 @@ Same H100, same Qwen2.5-7B snapshot, direct engine, `output-len=128`:
 
 | N | vLLM 0.19.0 | rvLLM | rvLLM / vLLM |
 |---:|---:|---:|---:|
-| 1 | 165.5 | 133.1 | 0.80x |
-| 32 | 4467.7 | 4407.5 | 0.99x |
-| 64 | 7972.1 | 8038.0 | 1.01x |
-| 128 | 13903.5 | 13110.1 | 0.94x |
+| 1 | 167.5 | 132.7 | 0.79x |
+| 32 | 4964.2 | 4494.9 | 0.91x |
+| 64 | 9312.6 | 8503.4 | 0.91x |
+| 96 | 13085.9 | 10530.6 | 0.80x |
+| 128 | 16825.3 | 13718.1 | 0.82x |
 
 So the architecture story is now:
 
 - single-stream decode still needs work
-- batched decode is nearly there
-- the current public docs should be talking about the batched hybrid stack, not the old fused-default story
+- batched decode is better than it was, but still not beating current vLLM
+- the current public docs should talk about the batched hybrid stack and the invalidated `89f` gate-aux win
 
 ## Relevant Files
 
@@ -111,4 +112,5 @@ So the architecture story is now:
 
 - make the `cublasLt` autotune cache degrade safely on bad cached algos
 - keep closing the `N=1` gap
-- improve the `N=128` gap without regressing `N=32/64`
+- build a correct fast Hopper FFN path
+- improve the `N=64` and `N=128` gaps without regressing correctness

@@ -22,15 +22,15 @@ and a Rust-native PTX compiler that generates fused decode kernels
 2--7.5$\times$ faster than the hand-written CUDA baselines in the measured
 microbenchmarks. In the latest honest same-GPU comparison on H100~SXM~80\,GB
 serving Qwen2.5-7B f16 against vLLM~0.19.0 (April 2026), rvLLM reaches
-152.9~tok/s at $N\!=\!1$ (\textbf{0.91$\times$ vLLM}),
-9{,}589.1~tok/s at $N\!=\!64$ (\textbf{1.04$\times$ vLLM}), and
-15{,}479.9~tok/s at $N\!=\!128$ (\textbf{0.92$\times$ vLLM}). The most important
-changes in this revision are architectural and tooling-heavy rather than cosmetic:
+132.7~tok/s at $N\!=\!1$ (\textbf{0.79$\times$ vLLM}),
+8{,}503.4~tok/s at $N\!=\!64$ (\textbf{0.91$\times$ vLLM}), and
+13{,}718.1~tok/s at $N\!=\!128$ (\textbf{0.82$\times$ vLLM}). The most important
+changes in this revision are architectural, tooling-heavy, and corrective rather than cosmetic:
 batch-1 normal decode now defaults to the reusable batched scratch path, batched
 execution uses an explicit hybrid GEMM policy with QKV/O/down on cuBLAS or
-cublasLt, and the dominant Hopper FFN seam now uses a CUTLASS SM90
-auxiliary-epilogue gate path that computes $\mathrm{SiLU}(\mathrm{gate}) \cdot \mathrm{up}$
-without the older bad materialization boundary. rvLLM is open-source under the
+cublasLt, and the dominant Hopper FFN seam can now be profiled and reasoned about
+correctly. The earlier fast `89f` CUTLASS gate-aux path is no longer treated as
+a valid benchmark win because that branch skipped the FFN down-projection. rvLLM is open-source under the
 Apache-2.0 license.
 \end{abstract}
 
@@ -482,10 +482,12 @@ on the same GPU and model snapshot.
     \toprule
     \thead{$N$} & \thead{vLLM~0.19.0} & \thead{rvLLM} & \thead{rvLLM / vLLM} \\
     \midrule
-    1   & 167.6 & 152.9 & 0.91$\times$ \\
+    1   & 167.5 & 132.7 & 0.79$\times$ \\
+    32  & 4{,}964.2 & 4{,}494.9 & 0.91$\times$ \\
     \rowcolor{gray!8}
-    \textbf{64}  & \textbf{9{,}256.4} & \textbf{9{,}589.1} & \textbf{1.04$\times$} \\
-    128 & 16{,}904.8 & 15{,}479.9 & 0.92$\times$ \\
+    64  & 9{,}312.6 & 8{,}503.4 & 0.91$\times$ \\
+    96  & 13{,}085.9 & 10{,}530.6 & 0.80$\times$ \\
+    128 & 16{,}825.3 & 13{,}718.1 & 0.82$\times$ \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -500,15 +502,14 @@ rather than by one deep fundamental deficit.
   \item \textbf{Batch-1 default path selection was wrong.} Normal $T\!=\!1$ decode
         had already left the older fused default, but it was still staying on the
         legacy single-token family instead of the reusable \texttt{Batched} path.
-        Fixing that lifted the current normal batch-1 path to 152.9~tok/s.
   \item \textbf{The batched GEMM policy was only half-expressed.} The runner wanted
         a hybrid strategy, but the actual dispatch did not encode that cleanly, so
         QKV could still opportunistically route through CUTLASS merely because the
         shared library was present.
   \item \textbf{The dominant Hopper FFN seam was wrong.} Direct runner-side phase
         timing on the real $N\!=\!64$ decode bucket showed the \texttt{gateup\_silu}
-        to \texttt{down} transition as the main hotspot, and the old path still left
-        the wrong materialization boundary in place.
+        to \texttt{down} transition as the main hotspot, and the old `89f`
+        CUTLASS gate-aux branch turned out to skip the down-projection entirely.
 \end{enumerate}
 
 The current batched policy is now explicit:
@@ -530,15 +531,14 @@ made it possible to iterate on real SM90 collective/epilogue code directly on H1
 Table~\ref{tab:h100_direct} changes the story materially. rvLLM is no longer
 uniformly behind by $\sim$10\%. Instead, the picture is split:
 \begin{itemize}
-  \item \textbf{Batch-1 remains behind}: 0.91$\times$ vLLM at $N\!=\!1$.
-  \item \textbf{The main batched regime can now win}: 1.04$\times$ at $N\!=\!64$.
-  \item \textbf{Large batched decode still trails}: 0.92$\times$ at $N\!=\!128$.
+  \item \textbf{Batch-1 remains behind}: 0.79$\times$ vLLM at $N\!=\!1$.
+  \item \textbf{Mid-batch is improved but still behind}: 0.91$\times$ at $N\!=\!32$ and $N\!=\!64$.
+  \item \textbf{Large batched decode still trails}: 0.82$\times$ at $N\!=\!128$.
 \end{itemize}
 
 This implies that the remaining gap is not one monolithic systems-language tax. The
-normal batched stack is now competitive enough to beat vLLM on at least one real
-public workload; the largest remaining problems are the single-stream decode path
-and the last slice of high-end batched efficiency.
+largest remaining problems are the single-stream decode path, a correct fast Hopper
+FFN path, and the last slice of high-end batched efficiency.
 
 \subsection{Historical HTTP Serving Context}
 
@@ -641,12 +641,13 @@ effect of several reinforcing mechanisms:
         batched scratch route instead of the older single-token default family.
   \item \textbf{Explicit batched hybrid GEMM routing}: the best current policy keeps
         QKV/O/down on cuBLAS while using CUTLASS only where it currently wins.
-  \item \textbf{Hopper FFN gate epilogue}: the main $N\!=\!64$ batched hotspot now
-        uses a CUTLASS SM90 auxiliary-epilogue path instead of the older bad FFN seam.
+  \item \textbf{Hopper FFN investigation}: the main $N\!=\!64$ batched hotspot is still
+        the FFN seam, and the old `89f` gate-aux fast path is no longer considered
+        valid because it skipped the down-projection.
 \end{enumerate}
 
-The direct-engine table shows that these mechanisms are sufficient to make rvLLM
-beat vLLM at $N\!=\!64$, but not yet enough to win at $N\!=\!1$ or $N\!=\!128$.
+The direct-engine table shows that these mechanisms materially improved rvLLM,
+but they are not yet sufficient to beat vLLM on the clean current benchmark set.
 
 \subsection{Limitations}
 
@@ -733,15 +734,15 @@ paged KV cache support and GQA, plus a CPU reference for testing.
 
 rvLLM demonstrates that a systems-language reimplementation of LLM serving can
 beat stock vLLM on at least one real batched direct-engine workload on a current
-H100 apples-to-apples benchmark: 1.04$\times$ at $N\!=\!64$. The same benchmark
+H100 apples-to-apples benchmark: 0.91$\times$ at $N\!=\!64$. The same benchmark
 also makes the remaining weaknesses explicit: single-stream decode is still only
-0.91$\times$ vLLM at $N\!=\!1$, and large-batch decode is 0.92$\times$ at $N\!=\!128$.
+0.79$\times$ vLLM at $N\!=\!1$, and large-batch decode is 0.82$\times$ at $N\!=\!128$.
 
-The most important result of this revision is that the last large public gap was
-partly architectural self-inflicted damage. Correcting the batch-1 default path
-selection, expressing the batched hybrid GEMM policy explicitly, and fixing the
-dominant Hopper FFN seam moved the comparison from a uniform ``rvLLM is slower''
-story to a split picture: batched decode can win, single-stream decode still does not.
+The most important result of this revision is that the public benchmark story now
+matches the reproducible code. Correcting the batch-1 default path selection,
+expressing the batched hybrid GEMM policy explicitly, and debugging the dominant
+Hopper FFN seam removed an invalid fast-path claim and left a clearer target for
+future work.
 
 The current tree also demonstrates a practical development approach for this class
 of system: explicit GPU memory sizing, no-fallback kernel validation, stable

@@ -138,8 +138,8 @@ footer a:hover{color:#999}
 </header>
 
 <div class="hero">
-  <div class="big">9,589 tok/s</div>
-  <div class="sub">Qwen2.5-7B on H100, direct engine, N=64. Current rvLLM is 1.04x vLLM 0.19.0 at N=64, 0.91x at N=1, and 0.92x at N=128. These are the real April 7, 2026 apples-to-apples numbers after the Hopper FFN gate-aux epilogue landed.</div>
+  <div class="big">8,503 tok/s</div>
+  <div class="sub">Qwen2.5-7B on H100, direct engine, N=64. Current clean rvLLM is 0.91x vLLM 0.19.0 at N=64, 0.79x at N=1, and 0.82x at N=128. The earlier `89f` gate-aux win was invalid because that path skipped FFN down-proj.</div>
   <div class="hero-graphic">
     <div class="hero-graphic-title">Verified H100 Comparison</div>
     <div class="hero-graphic-sub">Current direct-engine comparison up top, older HTTP context kept below for reference.</div>
@@ -164,19 +164,19 @@ footer a:hover{color:#999}
                 <div class="hero-static-track"><div class="hero-static-fill" style="width:1.2%;background:#78CFFF"></div></div>
                 <div class="hero-static-track"><div class="hero-static-fill" style="width:0.9%;background:#84E6B7"></div></div>
                 <div class="hero-static-meta">
-                  <span class="hero-static-series"><i style="background:#78CFFF"></i>167.6</span>
-                  <span class="hero-static-series"><i style="background:#84E6B7"></i>152.9 (0.91x)</span>
+                  <span class="hero-static-series"><i style="background:#78CFFF"></i>167.5</span>
+                  <span class="hero-static-series"><i style="background:#84E6B7"></i>132.7 (0.79x)</span>
                 </div>
               </div>
             </div>
             <div class="hero-static-row">
               <div class="hero-static-label">N=64</div>
               <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:54.8%;background:#78CFFF"></div></div>
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:56.7%;background:#84E6B7"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:55.3%;background:#78CFFF"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:50.5%;background:#84E6B7"></div></div>
                 <div class="hero-static-meta">
-                  <span class="hero-static-series"><i style="background:#78CFFF"></i>9256.4</span>
-                  <span class="hero-static-series"><i style="background:#84E6B7"></i>9589.1 (1.04x)</span>
+                  <span class="hero-static-series"><i style="background:#78CFFF"></i>9312.6</span>
+                  <span class="hero-static-series"><i style="background:#84E6B7"></i>8503.4 (0.91x)</span>
                 </div>
               </div>
             </div>
@@ -186,8 +186,8 @@ footer a:hover{color:#999}
                 <div class="hero-static-track"><div class="hero-static-fill" style="width:100%;background:#78CFFF"></div></div>
                 <div class="hero-static-track"><div class="hero-static-fill" style="width:91.6%;background:#84E6B7"></div></div>
                 <div class="hero-static-meta">
-                  <span class="hero-static-series"><i style="background:#78CFFF"></i>16904.8</span>
-                  <span class="hero-static-series"><i style="background:#84E6B7"></i>15479.9 (0.92x)</span>
+                  <span class="hero-static-series"><i style="background:#78CFFF"></i>16825.3</span>
+                  <span class="hero-static-series"><i style="background:#84E6B7"></i>13718.1 (0.82x)</span>
                 </div>
               </div>
             </div>
@@ -237,16 +237,16 @@ footer a:hover{color:#999}
 
       <div class="hero-chart-notes">
         <div class="hero-chart-pill">
-          <strong>Real win at N=64</strong>
-          Current committed rvLLM is 1.04x vLLM at N=64 on the direct-engine H100 run.
+          <strong>Current clean baseline</strong>
+          Current committed rvLLM is 0.91x vLLM at N=64 on the direct-engine H100 run.
         </div>
         <div class="hero-chart-pill">
           <strong>The FFN bottleneck was real</strong>
-          Phase timing showed `gateup_silu -> down` dominating `N=64`, and the Hopper SM90 gate-aux CUTLASS epilogue is what broke through it.
+          Phase timing showed `gateup_silu -> down` dominating `N=64`, and the old `89f` fast path turned out to be invalid because it skipped that down-proj.
         </div>
         <div class="hero-chart-pill">
           <strong>Tooling mattered</strong>
-          Stable direct benchmarks, autotune-cache replay fixes, CUTLASS `.so` FFI, and H100 phase profiling made the improvement reproducible instead of anecdotal.
+          Stable direct benchmarks, autotune-cache replay fixes, CUTLASS `.so` FFI, and H100 artifact recovery made the bug reproducible instead of anecdotal.
         </div>
       </div>
     </div>
@@ -268,16 +268,16 @@ footer a:hover{color:#999}
 </p>
 <p>
   In the latest verified apples-to-apples H100 SXM 80GB comparison on Qwen2.5-7B f16,
-  rvLLM reaches <strong>152.9 tok/s at N=1</strong>, <strong>9589.1 tok/s at N=64</strong>,
-  and <strong>15479.9 tok/s at N=128</strong> on direct engine. Against <code>vLLM 0.19.0</code>,
-  that is <strong>0.91x at N=1</strong>, <strong>1.04x at N=64</strong>, and <strong>0.92x at N=128</strong>.
-  The main public win is now explicit: <strong>rvLLM is ahead at N=64</strong>.
+  rvLLM reaches <strong>132.7 tok/s at N=1</strong>, <strong>8503.4 tok/s at N=64</strong>,
+  and <strong>13718.1 tok/s at N=128</strong> on direct engine. Against <code>vLLM 0.19.0</code>,
+  that is <strong>0.79x at N=1</strong>, <strong>0.91x at N=64</strong>, and <strong>0.82x at N=128</strong>.
+  The earlier `89f` `N=64` win is no longer a public claim because that path skipped real FFN work.
 </p>
 <p>
-  The most important fixes behind the current numbers were architectural and tooling-heavy:
+  The most important lessons behind the current numbers were architectural and tooling-heavy:
   batch-1 normal decode now defaults to the reusable batched scratch path, the batched
   path now has a real explicit hybrid GEMM policy, and the dominant Hopper FFN seam
-  was replaced with an SM90 CUTLASS auxiliary-epilogue gate path after direct benchmark
+  can now be profiled and reasoned about correctly after direct benchmark
   stabilization, phase profiling, and CUTLASS shared-library iteration on the H100.
 </p>
 <p>
@@ -324,14 +324,16 @@ footer a:hover{color:#999}
 <table>
 <thead><tr><th class="r">N</th><th class="r">vLLM 0.19.0</th><th class="r">rvLLM</th><th>rvLLM / vLLM</th></tr></thead>
 <tbody>
-<tr><td class="r">1</td><td class="r">167.6</td><td class="r">152.9</td><td>0.91x</td></tr>
-<tr class="peak"><td class="r">64</td><td class="r">9256.4</td><td class="r">9589.1</td><td>1.04x</td></tr>
-<tr><td class="r">128</td><td class="r">16904.8</td><td class="r">15479.9</td><td>0.92x</td></tr>
+<tr><td class="r">1</td><td class="r">167.5</td><td class="r">132.7</td><td>0.79x</td></tr>
+<tr><td class="r">32</td><td class="r">4964.2</td><td class="r">4494.9</td><td>0.91x</td></tr>
+<tr><td class="r">64</td><td class="r">9312.6</td><td class="r">8503.4</td><td>0.91x</td></tr>
+<tr><td class="r">96</td><td class="r">13085.9</td><td class="r">10530.6</td><td>0.80x</td></tr>
+<tr><td class="r">128</td><td class="r">16825.3</td><td class="r">13718.1</td><td>0.82x</td></tr>
 </tbody>
 </table>
 </div>
 <div class="note">
-  <strong>Honest baseline</strong>: this table is the current public truth. rvLLM now has a clear win at <code>N=64</code>, but it still trails on single-stream decode and at <code>N=128</code>.
+  <strong>Honest baseline</strong>: this table is the current public truth. The earlier `89f` gate-aux `N=64` win was invalid because the fast branch skipped the FFN down-projection.
 </div>
 </section>
 
@@ -339,10 +341,10 @@ footer a:hover{color:#999}
 <h2>What Was Wrong Before</h2>
 <p class="section-sub">The April 7 architecture and tooling correction</p>
 <ol>
-<li><strong>Batch-1 default decode was wrong.</strong> Normal <code>T=1</code> execution had already moved off the older fused default, but it was still staying on the legacy single-token family. The current default is the reusable batched scratch path, which moved the real batch-1 baseline to <strong>152.9 tok/s</strong>.</li>
+<li><strong>Batch-1 default decode was wrong.</strong> Normal <code>T=1</code> execution had already moved off the older fused default, but it was still staying on the legacy single-token family. The current default is the reusable batched scratch path.</li>
 <li><strong>The batched GEMM policy was half-wired.</strong> The runner wanted a hybrid strategy, but the actual dispatch could still let QKV take CUTLASS just because the shared library existed.</li>
-<li><strong>The dominant Hopper FFN seam was wrong.</strong> Real phase timing on the H100 showed <code>gateup_silu -&gt; down</code> dominating <code>N=64</code>, and the old path still left the wrong materialization boundary in place.</li>
-<li><strong>The docs were still describing the old architecture.</strong> Public docs now match the real dispatch: batch-1 on the reusable batched path, batched path on explicit hybrid routing plus the Hopper FFN gate fix.</li>
+<li><strong>The dominant Hopper FFN seam was wrong.</strong> Real phase timing on the H100 showed <code>gateup_silu -&gt; down</code> dominating <code>N=64</code>, and the old `89f` gate-aux branch skipped the down-proj entirely.</li>
+<li><strong>The docs were still describing the wrong outcome.</strong> Public docs now match the real dispatch and the corrected benchmark story.</li>
 </ol>
 <div class="note">
   Current hybrid policy: <strong>QKV / O / down on cuBLAS or cublasLt</strong>, <strong>Gate activation on CUTLASS SM90 aux epilogue</strong>.
@@ -503,7 +505,7 @@ Model architectures:
   SentenceTransformer (embedding models)
 
 Decode paths (N=1):
-  Batched ............... 152.9 tok/s (current default normal path)
+  Batched ............... 132.7 tok/s (current default normal path)
   CublasGemvDecode ..... legacy      (older single-token cuBLAS path)
   FusedDecode .......... legacy      (older fused path, now opt-in)
   Megakernel ............ 50 tok/s  (28-layer single-launch, instruction tape)

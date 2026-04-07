@@ -1,22 +1,25 @@
-updated rvLLM and synced the public repo/docs/paper/site to the current H100 results.
+updated rvLLM and synced the public repo/docs/paper/site to the current clean H100 results.
 
 current direct-engine comparison against vLLM 0.19.0 on the same H100, same Qwen2.5-7B snapshot, same output len:
 
-- N=1: 152.9 tok/s vs 167.6
-- N=64: 9589.1 tok/s vs 9256.4
-- N=128: 15479.9 tok/s vs 16904.8
+- N=1: 132.7 tok/s vs 167.5
+- N=32: 4494.9 tok/s vs 4964.2
+- N=64: 8503.4 tok/s vs 9312.6
+- N=96: 10530.6 tok/s vs 13085.9
+- N=128: 13718.1 tok/s vs 16825.3
 
 so the honest headline is:
 
-- rvLLM now wins cleanly at N=64
-- it is much closer at N=1 than before
-- it still trails at N=128
+- current clean main is still behind vLLM across these direct-engine buckets
+- the old `89f` `N=64` win was real as a measurement, but invalid as a benchmark claim
+- that fast path skipped the FFN down-projection inside the CUTLASS gate-aux branch
 
 the important architecture corrections were:
 
 - the normal T=1 path is the reusable batched scratch path, not the old `CublasGemvDecode` story
 - the batched GEMM policy is explicit instead of half-wired
-- the real N=64 hotspot was Hopper FFN `gateup_silu -> down`, and the winning fix was a CUTLASS SM90 auxiliary-epilogue gate path
+- the real N=64 hotspot was Hopper FFN `gateup_silu -> down`
+- the recovered fast H100 CUTLASS `.so` is now archived in the repo for forensic reproducibility only
 
 the batched side is still the same explicit hybrid policy:
 
@@ -29,8 +32,9 @@ tooling mattered too:
 - fixed `cublasLt` autotune-cache replay
 - runner-side phase timing on the real decode bucket
 - CUTLASS shared-library + Rust FFI loop for real H100 epilogue work
+- artifact recovery from the original H100 so the invalid fast path could be explained instead of hand-waved
 
-still true: stock vLLM has the stronger low-batch decode stack overall, and it is still ahead at N=128. but rvLLM now has a real public batched win instead of just "near parity".
+still true: stock vLLM has the stronger decode stack overall on the current clean reproducible build.
 
 repo: https://github.com/m0at/rvllm
 site: https://m0at.github.io/rvllm/

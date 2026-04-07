@@ -96,16 +96,18 @@ Same H100, same Qwen2.5-7B snapshot, `output-len=128`, direct engine:
 
 | N | vLLM 0.19.0 | rvLLM | rvLLM / vLLM |
 |---:|---:|---:|---:|
-| 1 | 165.5 | 133.1 | 0.80x |
-| 32 | 4467.7 | 4407.5 | 0.99x |
-| 64 | 7972.1 | 8038.0 | 1.01x |
-| 128 | 13903.5 | 13110.1 | 0.94x |
+| 1 | 167.5 | 132.7 | 0.79x |
+| 32 | 4964.2 | 4494.9 | 0.91x |
+| 64 | 9312.6 | 8503.4 | 0.91x |
+| 96 | 13085.9 | 10530.6 | 0.80x |
+| 128 | 16825.3 | 13718.1 | 0.82x |
 
 ## What Is Still Behind
 
 - `N=1` decode is still materially behind vLLM.
-- `N=32` and `N=64` are basically tied now.
-- `N=128` is close, but still a few percent behind.
+- `N=32` and `N=64` are improved, but still behind.
+- `N=128` is still meaningfully behind.
+- the earlier `89f` gate-aux `N=64` win was invalid because that path skipped FFN down-proj.
 - `cublasLt` autotune cache behavior is still flaky on some shapes and should fall back more aggressively when a cached algo goes bad.
 
 ## Relevant Controls
