@@ -2695,12 +2695,14 @@ dependencies = [
 name = "rvllm-autotune"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "rvllm-core",
  "rvllm-gpu",
  "serde",
  "serde_json",
  "tempfile",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

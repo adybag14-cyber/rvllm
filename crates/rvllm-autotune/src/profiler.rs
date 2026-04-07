@@ -6,10 +6,12 @@
 //! driver and flushed after stream synchronization.
 
 use std::collections::HashMap;
-use std::ffi::CStr;
+
+#[cfg(feature = "cuda")]
 use std::sync::Mutex;
 
-use tracing::{debug, info, warn};
+#[cfg(feature = "cuda")]
+use tracing::{debug, info};
 
 /// A single kernel execution record captured by CUPTI.
 #[derive(Debug, Clone)]
