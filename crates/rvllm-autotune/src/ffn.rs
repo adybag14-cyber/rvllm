@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread::sleep;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Args;
@@ -32,6 +34,8 @@ pub struct FfnSweepArgs {
     pub label: String,
     #[arg(long, default_value_t = false)]
     pub skip_harness: bool,
+    #[arg(long, default_value_t = 20)]
+    pub harness_timeout_s: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,7 +142,14 @@ pub fn run_ffn_sweep(args: &FfnSweepArgs) -> Result<(), String> {
     if !args.skip_harness {
         if let (Some(harness_bin), Some(cutlass_so)) = (&args.harness_bin, &args.cutlass_so) {
             for &m in &shapes {
-                let harness = run_harness(harness_bin, cutlass_so, m, args.hidden, args.intermediate)?;
+                let harness = run_harness(
+                    harness_bin,
+                    cutlass_so,
+                    m,
+                    args.hidden,
+                    args.intermediate,
+                    args.harness_timeout_s,
+                )?;
                 harness_by_shape.insert(m, harness);
             }
         }
@@ -288,20 +299,46 @@ fn run_harness(
     m: usize,
     hidden: usize,
     intermediate: usize,
+    timeout_s: u64,
 ) -> Result<HarnessResult, String> {
-    let output = Command::new(harness_bin)
+    let mut child = Command::new(harness_bin)
         .arg(cutlass_so)
         .arg(m.to_string())
         .arg(hidden.to_string())
         .arg(intermediate.to_string())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("spawn harness {}: {e}", harness_bin.display()))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    let timeout = Duration::from_secs(timeout_s);
+    let started = std::time::Instant::now();
+    let output = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("poll harness {}: {e}", harness_bin.display()))?
+        {
+            let out = child
+                .wait_with_output()
+                .map_err(|e| format!("collect harness output: {e}"))?;
+            break (status.code(), out.stdout, out.stderr);
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let out = child
+                .wait_with_output()
+                .map_err(|e| format!("collect timed out harness output: {e}"))?;
+            break (None, out.stdout, out.stderr);
+        }
+        sleep(Duration::from_millis(100));
+    };
+    let (exit_code, stdout_bytes, stderr_bytes) = output;
+    let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
     Ok(HarnessResult {
         m,
-        ok: output.status.success(),
-        exit_code: output.status.code(),
+        ok: exit_code == Some(0),
+        exit_code,
         stdout,
         stderr,
     })
