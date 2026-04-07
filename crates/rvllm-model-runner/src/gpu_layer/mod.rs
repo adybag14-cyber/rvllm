@@ -167,7 +167,6 @@ mod inner {
         pub use_cutlass_qkv: bool,
         pub use_cutlass_oproj: bool,
         pub use_cutlass_gateup: bool,
-        pub use_cutlass_gate_aux: bool,
     }
 
     // ===================================================================

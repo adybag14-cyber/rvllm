@@ -22,7 +22,6 @@ struct BatchedPipelinePolicy {
     use_cutlass_qkv: bool,
     use_cutlass_oproj: bool,
     use_cutlass_gateup: bool,
-    use_cutlass_gate_aux: bool,
 }
 
 impl GpuTransformerLayer {
@@ -157,12 +156,6 @@ impl GpuTransformerLayer {
             use_cutlass_qkv: Self::use_cutlass_qkv(gemm_strategy) && cutlass.is_some(),
             use_cutlass_oproj: Self::use_cutlass_oproj(gemm_strategy) && cutlass.is_some(),
             use_cutlass_gateup: Self::use_cutlass_gateup(gemm_strategy) && cutlass.is_some(),
-            use_cutlass_gate_aux: Self::use_cutlass_gateup(gemm_strategy)
-                && cutlass.is_some()
-                && !input.is_prefill
-                && weights.fused_gate_up_fp8.is_none()
-                && weights.down_proj_fp8.is_none()
-                && std::env::var("RVLLM_CUTLASS_GATE_AUX").map_or(true, |v| v != "0"),
         }
     }
 
@@ -175,20 +168,7 @@ impl GpuTransformerLayer {
             use_cutlass_qkv: cutlass_loaded && self.batched_v2_policy.use_cutlass_qkv,
             use_cutlass_oproj: cutlass_loaded && self.batched_v2_policy.use_cutlass_oproj,
             use_cutlass_gateup: cutlass_loaded && self.batched_v2_policy.use_cutlass_gateup,
-            use_cutlass_gate_aux: cutlass_loaded && self.batched_v2_policy.use_cutlass_gate_aux,
         }
-    }
-
-    #[inline]
-    fn can_use_cutlass_gate_aux(
-        policy: BatchedPipelinePolicy,
-        input: &GpuLayerInput<'_>,
-        weights: &GpuLayerWeights<'_>,
-    ) -> bool {
-        policy.use_cutlass_gate_aux
-            && !input.is_prefill
-            && weights.fused_gate_up_fp8.is_none()
-            && weights.down_proj_fp8.is_none()
     }
 
     fn forward_batched_with_policy(
@@ -499,31 +479,15 @@ impl GpuTransformerLayer {
             LLMError::GpuError("Batched path requires fused_gate_up weight".into())
         })?;
         let gate_up_dim = intermediate * 2;
-        let use_cutlass_gate_aux = Self::can_use_cutlass_gate_aux(policy, input, weights);
-
-        if use_cutlass_gate_aux {
-            let ck = cutlass.expect("CUTLASS gate-aux path requires loaded CUTLASS kernels");
-            Self::hgemm_dispatch_fp8_into(
-                &self.stream,
-                blas,
-                lt,
-                &*scratch.normed,
-                weights.up_proj,
-                num_tokens,
-                intermediate,
-                hidden,
-                &self.loader,
-                None,
-                scratch.gate_up,
-            )?;
-
+        if policy.use_cutlass_gateup {
+            let ck = cutlass.expect("GemmStrategy::Cutlass requires loaded CUTLASS kernels");
             let m = num_tokens as i32;
-            let n = intermediate as i32;
+            let n = gate_up_dim as i32;
             let k = hidden as i32;
-            let ws_bytes = ck.gate_silu_mul_workspace_size(m, n, k);
+            let ws_bytes = ck.gateup_silu_workspace_size(m, n, k);
             if scratch.gateup_ws.len() < ws_bytes.max(1) {
                 return Err(LLMError::GpuError(format!(
-                    "cutlass gate_silu_mul workspace too small: need {} bytes, have {}",
+                    "cutlass gateup workspace too small: need {} bytes, have {}",
                     ws_bytes.max(1),
                     scratch.gateup_ws.len()
                 )));
@@ -537,113 +501,55 @@ impl GpuTransformerLayer {
                 let (p, _g) = DevicePtr::device_ptr(&*scratch.normed, &self.stream);
                 p
             };
-            let (gate_ptr, _g2) = DevicePtr::device_ptr(weights.gate_proj, &self.stream);
-            let (aux_ptr, _g3) = DevicePtr::device_ptr(&*scratch.gate_up, &self.stream);
+            let (w_ptr, _g2) = DevicePtr::device_ptr(fused_gate_up, &self.stream);
             let ws_ptr = {
                 let mut ws = scratch.gateup_ws.slice_mut(..ws_bytes.max(1));
                 let (p, _g) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
                 p
             };
             let stream_ptr = self.stream.cu_stream() as u64;
-            ck.gate_silu_mul(
-                out_ptr, in_ptr, gate_ptr, aux_ptr, m, n, k, ws_ptr, ws_bytes, stream_ptr,
+            ck.gateup_silu(
+                out_ptr, in_ptr, w_ptr, m, n, k, ws_ptr, ws_bytes, stream_ptr,
             )
-            .map_err(LLMError::GpuError)?;
+            .map_err(|e| LLMError::GpuError(e))?;
         } else {
-            if policy.use_cutlass_gateup {
-                let ck = cutlass.expect("GemmStrategy::Cutlass requires loaded CUTLASS kernels");
-                let m = num_tokens as i32;
-                let n = gate_up_dim as i32;
-                let k = hidden as i32;
-                let ws_bytes = ck.gateup_silu_workspace_size(m, n, k);
-                if scratch.gateup_ws.len() < ws_bytes.max(1) {
-                    return Err(LLMError::GpuError(format!(
-                        "cutlass gateup workspace too small: need {} bytes, have {}",
-                        ws_bytes.max(1),
-                        scratch.gateup_ws.len()
-                    )));
-                }
-                let out_ptr = {
-                    let (p, _g) =
-                        DevicePtrMut::device_ptr_mut(&mut *scratch.silu_out, &self.stream);
-                    p
-                };
-                let in_ptr = {
-                    let (p, _g) = DevicePtr::device_ptr(&*scratch.normed, &self.stream);
-                    p
-                };
-                let (w_ptr, _g2) = DevicePtr::device_ptr(fused_gate_up, &self.stream);
-                let ws_ptr = {
-                    let mut ws = scratch.gateup_ws.slice_mut(..ws_bytes.max(1));
-                    let (p, _g) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
-                    p
-                };
-                let stream_ptr = self.stream.cu_stream() as u64;
-                ck.gateup_silu(
-                    out_ptr, in_ptr, w_ptr, m, n, k, ws_ptr, ws_bytes, stream_ptr,
-                )
-                .map_err(|e| LLMError::GpuError(e))?;
-            } else {
-                Self::hgemm_dispatch_fp8_into(
-                    &self.stream,
-                    blas,
-                    lt,
-                    &*scratch.normed,
-                    fused_gate_up,
-                    num_tokens,
-                    gate_up_dim,
-                    hidden,
-                    &self.loader,
-                    weights.fused_gate_up_fp8,
-                    scratch.gate_up,
-                )?;
-                let silu_fn = self
-                    .loader
-                    .get_func("silu_mul_interleaved", "silu_mul_interleaved_f16_kernel")
-                    .map_err(|e| {
-                        LLMError::GpuError(format!(
-                            "Required silu_mul_interleaved kernel missing: {e}"
-                        ))
-                    })?;
-                let n_elems = num_tokens * intermediate;
-                let total = n_elems as u32;
-                unsafe {
-                    self.stream
-                        .launch_builder(&silu_fn)
-                        .arg(&mut *scratch.silu_out)
-                        .arg(&*scratch.gate_up)
-                        .arg(&(num_tokens as i32))
-                        .arg(&(intermediate as i32))
-                        .launch(LaunchConfig {
-                            grid_dim: ((total + 255) / 256, 1, 1),
-                            block_dim: (256, 1, 1),
-                            shared_mem_bytes: 0,
-                        })
-                        .map_err(|e| LLMError::GpuError(format!("silu_interleaved: {e}")))?;
-                }
-            }
-            if profile_enabled {
-                mark_phase(|t| &mut t.gateup_silu)?;
-            }
-
-            // 10. Down projection into scratch.down
             Self::hgemm_dispatch_fp8_into(
                 &self.stream,
                 blas,
                 lt,
-                &*scratch.silu_out,
-                weights.down_proj,
+                &*scratch.normed,
+                fused_gate_up,
                 num_tokens,
+                gate_up_dim,
                 hidden,
-                intermediate,
                 &self.loader,
-                weights.down_proj_fp8,
-                scratch.down,
+                weights.fused_gate_up_fp8,
+                scratch.gate_up,
             )?;
-            if profile_enabled {
-                mark_phase(|t| &mut t.down)?;
+            let silu_fn = self
+                .loader
+                .get_func("silu_mul_interleaved", "silu_mul_interleaved_f16_kernel")
+                .map_err(|e| {
+                    LLMError::GpuError(format!(
+                        "Required silu_mul_interleaved kernel missing: {e}"
+                    ))
+                })?;
+            let n_elems = num_tokens * intermediate;
+            let total = n_elems as u32;
+            unsafe {
+                self.stream
+                    .launch_builder(&silu_fn)
+                    .arg(&mut *scratch.silu_out)
+                    .arg(&*scratch.gate_up)
+                    .arg(&(num_tokens as i32))
+                    .arg(&(intermediate as i32))
+                    .launch(LaunchConfig {
+                        grid_dim: ((total + 255) / 256, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .map_err(|e| LLMError::GpuError(format!("silu_interleaved: {e}")))?;
             }
-            return Ok(());
         }
 
         if profile_enabled {

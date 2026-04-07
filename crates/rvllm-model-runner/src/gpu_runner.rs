@@ -486,9 +486,7 @@ mod cuda_impl {
                 use_cutlass_oproj: std::env::var("RVLLM_V2_CUTLASS_OPROJ")
                     .map_or(false, |v| v == "1"),
                 use_cutlass_gateup: std::env::var("RVLLM_V2_CUTLASS_GATEUP")
-                    .map_or(false, |v| v == "1"),
-                use_cutlass_gate_aux: std::env::var("RVLLM_V2_CUTLASS_GATE_AUX")
-                    .map_or(false, |v| v == "1"),
+                    .map_or(true, |v| v != "0"),
             };
             for i in 0..config.num_layers {
                 let layer_cfg = GpuLayerConfig {
