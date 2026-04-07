@@ -542,6 +542,9 @@ use rvllm_core::prelude::{
 
             let seq_group = ScheduledSequenceGroupState::new(request_id, seqs, 0);
             self.scheduler.add_request(seq_group);
+            let decode_prompt_token_ids = prompt_token_ids.clone();
+            let decode_prompt_len = decode_prompt_token_ids.len() as u32;
+            let decode_last_token_id = decode_prompt_token_ids.last().copied().unwrap_or(0);
 
             self.requests.insert(
                 request_id,
@@ -554,11 +557,11 @@ use rvllm_core::prelude::{
                     seq_states,
                     decode_seq_data: (0..num_seqs)
                         .map(|_| SequenceData {
-                            prompt_token_ids: prompt_token_ids.clone(),
+                            prompt_token_ids: decode_prompt_token_ids.clone(),
                             output_token_ids: Vec::new(),
                             cumulative_logprob: 0.0,
-                            seq_len: prompt_token_ids.len() as u32,
-                            last_token_id: prompt_token_ids.last().copied().unwrap_or(0),
+                            seq_len: decode_prompt_len,
+                            last_token_id: decode_last_token_id,
                         })
                         .collect(),
                 },
