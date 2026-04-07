@@ -1134,6 +1134,9 @@ mod inner {
                     loader,
                     &v3_gqa,
                     output,
+                    partial_out,
+                    partial_max,
+                    partial_sum,
                     q,
                     key_cache,
                     value_cache,
@@ -1179,6 +1182,9 @@ mod inner {
                     loader,
                     &v3_kernel,
                     output,
+                    partial_out,
+                    partial_max,
+                    partial_sum,
                     q,
                     key_cache,
                     value_cache,
@@ -1215,6 +1221,9 @@ mod inner {
             loader: &KernelLoader,
             kernel: &cudarc::driver::CudaFunction,
             output: &mut CudaSlice<f16>,
+            partial_out: Option<&mut CudaSlice<f32>>,
+            partial_max: Option<&mut CudaSlice<f32>>,
+            partial_sum: Option<&mut CudaSlice<f32>>,
             q: &CudaView<'_, f16>,
             key_cache: &CudaSlice<f16>,
             value_cache: &CudaSlice<f16>,
@@ -1273,9 +1282,9 @@ mod inner {
             }
 
             let ws_size = (num_splits as usize) * num_seqs * num_heads;
-            let mut owned_p_out = None;
-            let mut owned_p_max = None;
-            let mut owned_p_sum = None;
+            let mut owned_p_out: Option<CudaSlice<f32>> = None;
+            let mut owned_p_max: Option<CudaSlice<f32>> = None;
+            let mut owned_p_sum: Option<CudaSlice<f32>> = None;
             let p_out: &mut CudaSlice<f32> = if let Some(buf) = partial_out {
                 if buf.len() < ws_size * head_dim {
                     return Err(LLMError::GpuError(format!(
