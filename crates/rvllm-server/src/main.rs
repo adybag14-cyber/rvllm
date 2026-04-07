@@ -79,6 +79,9 @@ enum Commands {
         /// Print results as JSON (for scripted comparison)
         #[arg(long)]
         json: bool,
+        /// Write a CPU flamegraph SVG for a single-batch benchmark run
+        #[arg(long)]
+        flamegraph_out: Option<String>,
     },
 }
 
@@ -247,6 +250,7 @@ async fn main() -> anyhow::Result<()> {
             num_gpu_blocks,
             num_cpu_blocks,
             json,
+            flamegraph_out,
         } => {
             init_tracing("warn");
             let multi = n.contains(',');
@@ -334,6 +338,9 @@ async fn main() -> anyhow::Result<()> {
                 // Each batch size runs as a separate process to avoid CUDA context
                 // poisoning between different graph captures.
                 if batch_sizes.len() > 1 {
+                    if flamegraph_out.is_some() {
+                        anyhow::bail!("--flamegraph-out requires exactly one batch size");
+                    }
                     let exe = std::env::current_exe()?;
                     for &batch in &batch_sizes {
                         let mut command = std::process::Command::new(&exe);
@@ -364,6 +371,13 @@ async fn main() -> anyhow::Result<()> {
                     }
                     return Ok(()); // We handled everything via subprocesses
                 }
+
+                let flamegraph_guard = flamegraph_out.as_ref().map(|_| {
+                    pprof::ProfilerGuardBuilder::default()
+                        .frequency(999)
+                        .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+                        .build()
+                }).transpose()?;
 
                 let mut results = Vec::new();
 
@@ -443,6 +457,14 @@ async fn main() -> anyhow::Result<()> {
                             "results": results,
                         }))?
                     );
+                }
+
+                if let Some(path) = flamegraph_out.as_ref() {
+                    let guard = flamegraph_guard
+                        .ok_or_else(|| anyhow::anyhow!("flamegraph guard missing"))?;
+                    let report = guard.report().build()?;
+                    let file = std::fs::File::create(path)?;
+                    report.flamegraph(file)?;
                 }
             } // #[cfg(feature = "cuda")]
         }
