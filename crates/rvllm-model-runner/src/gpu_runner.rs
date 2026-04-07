@@ -141,6 +141,46 @@ mod cuda_impl {
             }
             Ok(())
         }
+
+        fn upload_range(
+            &mut self,
+            offset: usize,
+            data: &[i32],
+            stream: &Arc<CudaStream>,
+        ) -> std::result::Result<(), cudarc::driver::result::DriverError> {
+            let end = offset + data.len();
+            self.ensure_len(end, stream)?;
+            let mut dst = self
+                .buf
+                .as_mut()
+                .expect("ensure_len() must populate buffer")
+                .slice_mut(offset..end);
+            stream.memcpy_htod(data, &mut dst)?;
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct DecodeMetadataV2State {
+        padded_batch: usize,
+        token_ids: Vec<i32>,
+        positions: Vec<i32>,
+        context_lens: Vec<i32>,
+        slot_mapping: Vec<i32>,
+        seq_start_pos: Vec<i32>,
+        block_tables: Vec<i32>,
+    }
+
+    impl DecodeMetadataV2State {
+        fn resize(&mut self, padded_batch: usize, max_blocks: usize) {
+            self.padded_batch = padded_batch;
+            self.token_ids.resize(padded_batch, 0);
+            self.positions.resize(padded_batch, 0);
+            self.context_lens.resize(padded_batch, 0);
+            self.slot_mapping.resize(padded_batch, 0);
+            self.seq_start_pos.resize(padded_batch + 1, 0);
+            self.block_tables.resize(padded_batch * max_blocks, 0);
+        }
     }
 
     struct PersistentDecodeMetadataBuffers {
@@ -361,6 +401,8 @@ mod cuda_impl {
         graph_output: RefCell<Option<CudaSlice<i32>>>,
         /// Reusable CPU scratch buffer for packing metadata.
         cpu_scratch: RefCell<Vec<i32>>,
+        /// Host-side mirror for persistent V2 decode metadata updates.
+        decode_meta_v2_state: RefCell<DecodeMetadataV2State>,
         /// Persistent device-side decode metadata state for BatchedV2.
         persistent_decode_meta: PersistentDecodeMetadataBuffers,
         /// Fixed max blocks per sequence for CUDA graph capture/replay.
@@ -616,6 +658,7 @@ mod cuda_impl {
                 meta_packed_offsets: Cell::new(PackedMetaOffsets::default()),
                 graph_output: RefCell::new(None),
                 cpu_scratch: RefCell::new(Vec::with_capacity(4096)),
+                decode_meta_v2_state: RefCell::new(DecodeMetadataV2State::default()),
                 persistent_decode_meta: PersistentDecodeMetadataBuffers::new(),
                 graph_max_blocks,
                 fused_qkv_weights: Vec::new(),
@@ -1897,23 +1940,21 @@ mod cuda_impl {
 
             let dummy_ctx = attn_meta.context_lens.first().copied().unwrap_or(1) as i32;
             let dummy_bt = attn_meta.block_tables.first();
-
-            let mut token_ids_host = vec![0i32; padded];
-            for (dst, &src) in token_ids_host.iter_mut().zip(token_ids.iter()) {
+            let mut host = self.decode_meta_v2_state.borrow_mut();
+            host.resize(padded, max_blocks);
+            for (dst, &src) in host.token_ids.iter_mut().zip(token_ids.iter()) {
                 *dst = src as i32;
             }
-
-            let mut positions_host = vec![0i32; padded];
-            for (dst, &src) in positions_host.iter_mut().zip(positions.iter()) {
+            for (dst, &src) in host.positions.iter_mut().zip(positions.iter()) {
                 *dst = src as i32;
             }
-
-            let mut context_lens_host = vec![dummy_ctx; padded];
-            for (dst, &src) in context_lens_host.iter_mut().zip(attn_meta.context_lens.iter()) {
+            for (dst, &src) in host
+                .context_lens
+                .iter_mut()
+                .zip(attn_meta.context_lens.iter())
+            {
                 *dst = src as i32;
             }
-
-            let mut block_tables_host = vec![0i32; bt_len];
             for seq_idx in 0..padded {
                 let row = attn_meta
                     .block_tables
@@ -1923,25 +1964,18 @@ mod cuda_impl {
                     .unwrap_or(&[]);
                 let row_base = seq_idx * max_blocks;
                 for (blk_idx, &blk) in row.iter().take(max_blocks).enumerate() {
-                    block_tables_host[row_base + blk_idx] = blk as i32;
+                    host.block_tables[row_base + blk_idx] = blk as i32;
                 }
             }
-
-            let mut slot_mapping_host = vec![0i32; padded];
-            for (dst, &src) in slot_mapping_host
-                .iter_mut()
-                .zip(attn_meta.slot_mapping.iter())
-            {
+            for (dst, &src) in host.slot_mapping.iter_mut().zip(attn_meta.slot_mapping.iter()) {
                 *dst = src as i32;
             }
-
-            let mut seq_start_pos_host = vec![0i32; padded + 1];
             let mut seq_pos = 0i32;
             for idx in 0..padded {
-                seq_start_pos_host[idx] = seq_pos;
+                host.seq_start_pos[idx] = seq_pos;
                 seq_pos += attn_meta.query_lens.get(idx).copied().unwrap_or(1) as i32;
             }
-            seq_start_pos_host[padded] = seq_pos;
+            host.seq_start_pos[padded] = seq_pos;
 
             self.persistent_decode_meta
                 .ensure_len(padded, max_blocks, &self.stream)
@@ -1950,32 +1984,32 @@ mod cuda_impl {
             self.persistent_decode_meta
                 .token_ids
                 .borrow_mut()
-                .upload(&token_ids_host, &self.stream)
+                .upload(&host.token_ids, &self.stream)
                 .map_err(|e| LLMError::GpuError(format!("decode v2 token_ids HtoD: {e}")))?;
             self.persistent_decode_meta
                 .positions
                 .borrow_mut()
-                .upload(&positions_host, &self.stream)
+                .upload(&host.positions, &self.stream)
                 .map_err(|e| LLMError::GpuError(format!("decode v2 positions HtoD: {e}")))?;
             self.persistent_decode_meta
                 .context_lens
                 .borrow_mut()
-                .upload(&context_lens_host, &self.stream)
+                .upload(&host.context_lens, &self.stream)
                 .map_err(|e| LLMError::GpuError(format!("decode v2 context_lens HtoD: {e}")))?;
             self.persistent_decode_meta
                 .block_tables
                 .borrow_mut()
-                .upload(&block_tables_host, &self.stream)
+                .upload(&host.block_tables, &self.stream)
                 .map_err(|e| LLMError::GpuError(format!("decode v2 block_tables HtoD: {e}")))?;
             self.persistent_decode_meta
                 .slot_mapping
                 .borrow_mut()
-                .upload(&slot_mapping_host, &self.stream)
+                .upload(&host.slot_mapping, &self.stream)
                 .map_err(|e| LLMError::GpuError(format!("decode v2 slot_mapping HtoD: {e}")))?;
             self.persistent_decode_meta
                 .seq_start_pos
                 .borrow_mut()
-                .upload(&seq_start_pos_host, &self.stream)
+                .upload(&host.seq_start_pos, &self.stream)
                 .map_err(|e| LLMError::GpuError(format!("decode v2 seq_start_pos HtoD: {e}")))?;
 
             let mut meta = self.meta_packed.borrow_mut();
