@@ -1893,10 +1893,6 @@ impl GpuWorker {
         let padded_batch = plan.graph_tokens;
         self.ensure_pinned_output_capacity(actual_batch)?;
         self.upload_decode_graph_metadata(plan, model_input)?;
-        let runner = self
-            .gpu_model_runner
-            .as_ref()
-            .ok_or_else(|| LLMError::GpuError("GPU model runner not initialized".into()))?;
 
         let graph = self
             .graph_runner
@@ -1917,6 +1913,10 @@ impl GpuWorker {
         let dst = pinned
             .as_mut_slice()
             .map_err(|e| LLMError::GpuError(format!("pinned buf write: {e}")))?;
+        let runner = self
+            .gpu_model_runner
+            .as_ref()
+            .ok_or_else(|| LLMError::GpuError("GPU model runner not initialized".into()))?;
         runner.read_graph_output_async(actual_batch, dst)?;
         Ok(ForwardOutput::TokenIdsPending { actual_batch })
     }
@@ -1931,11 +1931,6 @@ impl GpuWorker {
         let padded_batch = plan.graph_tokens;
         self.ensure_pinned_output_capacity(actual_batch)?;
 
-        let runner = self
-            .gpu_model_runner
-            .as_ref()
-            .ok_or_else(|| LLMError::GpuError("GPU model runner not initialized".into()))?;
-
         if !plan.use_graphed_decode {
             return Err(LLMError::GpuError(format!(
                 "graph capture unsupported for batch {padded_batch}"
@@ -1948,9 +1943,14 @@ impl GpuWorker {
         );
 
         let max_context_len = self.upload_decode_graph_metadata(plan, model_input)?;
-        runner.forward_gpu_only(padded_batch, padded_batch, max_context_len, false)?;
-
-        let cuda_stream = runner.cuda_stream().clone();
+        let cuda_stream = {
+            let runner = self
+                .gpu_model_runner
+                .as_ref()
+                .ok_or_else(|| LLMError::GpuError("GPU model runner not initialized".into()))?;
+            runner.forward_gpu_only(padded_batch, padded_batch, max_context_len, false)?;
+            runner.cuda_stream().clone()
+        };
         cuda_stream
             .synchronize()
             .map_err(|e| LLMError::GpuError(format!("pre-capture sync: {e}")))?;
@@ -1964,8 +1964,13 @@ impl GpuWorker {
             return Err(LLMError::GpuError(format!("graph capture failed: {e}")));
         }
 
-        let fwd_result =
-            runner.forward_gpu_only(padded_batch, padded_batch, max_context_len, false);
+        let fwd_result = {
+            let runner = self
+                .gpu_model_runner
+                .as_ref()
+                .ok_or_else(|| LLMError::GpuError("GPU model runner not initialized".into()))?;
+            runner.forward_gpu_only(padded_batch, padded_batch, max_context_len, false)
+        };
 
         match fwd_result {
             Ok(()) => {
@@ -1982,6 +1987,10 @@ impl GpuWorker {
                 let dst = pinned
                     .as_mut_slice()
                     .map_err(|e| LLMError::GpuError(format!("pinned buf write: {e}")))?;
+                let runner = self
+                    .gpu_model_runner
+                    .as_ref()
+                    .ok_or_else(|| LLMError::GpuError("GPU model runner not initialized".into()))?;
                 runner.read_graph_output_async(actual_batch, dst)?;
                 Ok(ForwardOutput::TokenIdsPending { actual_batch })
             }
