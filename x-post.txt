@@ -2,34 +2,35 @@ updated rvLLM and synced the public repo/docs/paper/site to the current H100 res
 
 current direct-engine comparison against vLLM 0.19.0 on the same H100, same Qwen2.5-7B snapshot, same output len:
 
-- N=1: 133.1 tok/s vs 165.5
-- N=32: 4407.5 tok/s vs 4467.7
-- N=64: 8038.0 tok/s vs 7972.1
-- N=128: 13110.1 tok/s vs 13903.5
+- N=1: 152.9 tok/s vs 167.6
+- N=64: 9589.1 tok/s vs 9256.4
+- N=128: 15479.9 tok/s vs 16904.8
 
 so the honest headline is:
 
-- rvLLM is basically tied at N=32
-- slightly ahead at N=64
-- still behind at N=1 and N=128
+- rvLLM now wins cleanly at N=64
+- it is much closer at N=1 than before
+- it still trails at N=128
 
-the important architecture correction was that batch-1 had changed again.
+the important architecture corrections were:
 
-the docs previously said the normal T=1 path was `CublasGemvDecode`. that was already stale.
-the current default batch-1 path is the reusable batched scratch path, and that lifted N=1 from 127.9 to 133.1 tok/s without hurting high batch.
+- the normal T=1 path is the reusable batched scratch path, not the old `CublasGemvDecode` story
+- the batched GEMM policy is explicit instead of half-wired
+- the real N=64 hotspot was Hopper FFN `gateup_silu -> down`, and the winning fix was a CUTLASS SM90 auxiliary-epilogue gate path
 
 the batched side is still the same explicit hybrid policy:
 
 - QKV / O / down on cuBLAS or cublasLt
-- GateUp + SiLU on CUTLASS
+- gate activation on CUTLASS SM90 aux epilogue
 
-and inside the stack, some parts are still materially faster than our own earlier baselines:
+tooling mattered too:
 
-- Rust PTX JIT fused kernels are 2-7.5x faster than our hand-written CUDA in measured decode microbenches
-- FA3 v3 + no-fallback validation was a 31-42% jump over the previous rvLLM attention path
-- Zig SIMD sampling / conversion backend is faster on several hot CPU-side ops
+- stable direct benchmark harness
+- fixed `cublasLt` autotune-cache replay
+- runner-side phase timing on the real decode bucket
+- CUTLASS shared-library + Rust FFI loop for real H100 epilogue work
 
-still true: stock vLLM has the stronger low-batch decode stack overall. but rvLLM is now very close in the batched regime, and the public materials finally match the real shipped architecture instead of the previous one-step-old story.
+still true: stock vLLM has the stronger low-batch decode stack overall, and it is still ahead at N=128. but rvLLM now has a real public batched win instead of just "near parity".
 
 repo: https://github.com/m0at/rvllm
 site: https://m0at.github.io/rvllm/

@@ -16,10 +16,11 @@ Results land in `bench/combined_results_h100_lifecycle.json`. The instance stays
 
 ## Current Status
 
-**Near parity with vLLM 0.19.0 at batch 32-64, still behind at batch 1 and batch 128.** Measured on the same H100 SXM 80GB, same Qwen2.5-7B snapshot, same decode length (`output-len=128`), same date (`April 4, 2026`).
+**Beats vLLM 0.19.0 at `N=64`, still behind at `N=1` and `N=128`.** Measured on the same H100 SXM 80GB, same Qwen2.5-7B snapshot, same decode length (`output-len=128`), same date (`April 7, 2026`).
 
 What rvLLM does well:
-- **`0.99x` vLLM at `N=32` and `1.01x` at `N=64`** on direct engine
+- **`1.04x` vLLM at `N=64`** on direct engine
+- **`0.91x` vLLM at `N=1` and `0.92x` at `N=128`**, so the remaining gap is now concentrated at the ends
 - **~50 MB container image** vs ~15 GB for Python vLLM
 - **35-second build from source**, no pip, no PyTorch, no `torch.compile`
 - **54 CUDA kernels** with no-fallback validation -- silent degradation is treated as a bug
@@ -29,33 +30,45 @@ What rvLLM does well:
 What was wrong before:
 1. **Batch-1 normal decode still used the wrong default stack.** The single-token path had already been moved off the old fused default, but it was still staying on the legacy single-token family instead of the reusable batched scratch path.
 2. **Batched GEMM policy was only half-wired.** The runner thought it had a hybrid policy, but batched QKV could still opportunistically take CUTLASS just because the `.so` existed.
-3. **The docs were still describing that older architecture.** This README and the paper now reflect the current dispatch logic and the current benchmark set.
+3. **The dominant batched FFN hot path was wrong for Hopper.** The real `N=64` bottleneck was `gateup_silu -> down`, and the old path still left a bad materialization boundary and the wrong fusion shape in place.
+4. **The docs were still describing that older architecture.** This README and the paper now reflect the current dispatch logic and the current benchmark set.
 
 What changed:
 1. **Batch-1 default decode now prefers the reusable `Batched` path.**
 2. **Batched GEMM has a real `Hybrid` strategy.**
 3. **`Hybrid` now means exactly this**: QKV, O-proj, and down-proj use cuBLAS/cublasLt; GateUp+SiLU uses CUTLASS.
-4. **Explicit overrides still exist**: `RVLLM_BATCHED_DECODE_1=0` returns batch-1 to the legacy single-token family, and `RVLLM_BATCHED_GEMM_STRATEGY={cublas,hybrid,cutlass}` controls the batched GEMM policy.
+4. **The Hopper FFN path now has a real SM90 fix.** A new CUTLASS auxiliary-epilogue path computes `SiLU(gate) * up` from a gate GEMM plus an auxiliary `up` tensor, and that is the change that pushed rvLLM past vLLM at `N=64`.
+5. **The measurement/tooling stack is stronger.** We stabilized the direct benchmark harness, fixed `cublasLt` autotune-cache replay, added runner-side phase timing, and built a CUTLASS shared-library + Rust FFI workflow that let us iterate on real SM90 epilogues instead of guessing.
+6. **Explicit overrides still exist**: `RVLLM_BATCHED_DECODE_1=0` returns batch-1 to the legacy single-token family, and `RVLLM_BATCHED_GEMM_STRATEGY={cublas,hybrid,cutlass}` controls the batched GEMM policy.
 
 Where the remaining gap comes from:
 1. **Single-stream decode**: `N=1` is still materially behind vLLM.
-2. **vLLM's more mature decode stack**: FlashAttention 3 + `torch.compile` + full decode CUDA graphs.
-3. **cublasLt autotune stability**: some cached algos are still flaky on a few shapes and need better fallback handling.
+2. **Large-batch efficiency**: `N=128` is improved, but still behind vLLM.
+3. **vLLM's more mature decode stack**: FlashAttention 3 + `torch.compile` + full decode CUDA graphs.
 
 ## Current H100 Comparison
 
 Qwen2.5-7B f16 on H100 SXM 80GB, 128 output tokens per request, greedy decode (temperature=0). Both engines on the same physical GPU, clean CUDA state.
 
-### Direct Engine (April 4, 2026)
+### Direct Engine (April 7, 2026)
 
 | N | vLLM 0.19.0 tok/s | rvLLM tok/s | rvLLM / vLLM |
 |---:|---:|---:|---:|
-| 1 | 165.5 | 133.1 | 0.80x |
-| 32 | 4,467.7 | 4,407.5 | 0.99x |
-| 64 | 7,972.1 | 8,038.0 | 1.01x |
-| 128 | 13,903.5 | 13,110.1 | 0.94x |
+| 1 | 167.6 | 152.9 | 0.91x |
+| 64 | 9,256.4 | 9,589.1 | 1.04x |
+| 128 | 16,904.8 | 15,479.9 | 0.92x |
 
-This is the current honest comparison set. rvLLM is effectively tied at `N=32`, slightly ahead at `N=64`, a few percent behind at `N=128`, and still substantially behind at `N=1`.
+This is the current honest comparison set. rvLLM now has one clean public win at `N=64`, is much closer than before at `N=1`, and still trails at `N=128`.
+
+## What Unlocked The Jump
+
+The big `N=64` move was not one lucky benchmark. It took fixing both the engine path and the tooling around it:
+
+1. **Stable direct benchmarking.** The direct benchmark now uses a fixed prompt set, `ignore_eos=true`, no intermediate streaming, and the sync GPU engine. That removed fake wins and made regressions obvious.
+2. **Autotune you can trust.** `cublasLt` plans now persist real opaque algo blobs and evict bad cached plans instead of replaying poisoned entries forever.
+3. **Phase timing on the real decode bucket.** The runner-side phase profiler showed that `gateup_silu` was the dominant `N=64` batched hotspot. That stopped us from wasting time on graph-shell noise.
+4. **A real CUTLASS iteration loop.** `kernels/build_cutlass_so.sh`, the Rust CUTLASS FFI, and one-file H100 `nvcc` compiles made it possible to test real SM90 collective/epilogue changes quickly.
+5. **The actual Hopper fix.** The winning path is a new SM90 CUTLASS auxiliary-epilogue gate kernel in [cutlass_gateup_silu.cu](/Users/andy/rvllm/kernels/cutlass_gateup_silu.cu) that computes `SiLU(gate) * up` directly from a gate GEMM and an auxiliary `up` tensor. That removed the bad FFN seam that was holding `N=64` back.
 
 ### Historical Comparison (vLLM 0.6.3, March 2026)
 
@@ -101,13 +114,13 @@ Six runtime-selectable decode strategies, each with different performance trade-
 
 | Decode Path | N=1 tok/s | Selection | Notes |
 |---|---:|---|---|
-| Batched (default) | 133.1 | `T=1` unless `RVLLM_BATCHED_DECODE_1=0` | Reusable batched scratch path, current normal batch-1 decode path |
+| Batched (default) | 152.9 | `T=1` unless `RVLLM_BATCHED_DECODE_1=0` | Reusable batched scratch path, current normal batch-1 decode path |
 | CublasGemvDecode | legacy | `RVLLM_BATCHED_DECODE_1=0` | Older single-token cuBLAS GEMV path |
 | FusedDecode | legacy | `RVLLM_BATCHED_DECODE_1=0 RVLLM_CUBLAS_DECODE=0` | Older fused f16 GEMV path, now opt-in |
 | MegakernelDecode | ~50 | Internal | All 28 layers in 1 kernel launch (instruction tape interpreter) |
 | PersistentDecode | ~51 | Internal | SM-DAG cooperative kernel per layer |
 | Fp8Decode | auto | `RVLLM_FP8_WEIGHTS=1` | cublasLt FP8 GEMMs (when FP8 weights present) |
-| Batched (`Hybrid`) | auto | `T>=2` | QKV/O/down on cuBLAS or cublasLt, GateUp+SiLU on CUTLASS |
+| Batched (`Hybrid`) | auto | `T>=2` | QKV/O/down on cuBLAS or cublasLt, Gate activation on CUTLASS SM90 aux epilogue |
 
 For batched decode and prefill, the current default policy is:
 - `RVLLM_BATCHED_GEMM_STRATEGY=hybrid` when CUTLASS is available
@@ -274,15 +287,18 @@ See [crates/rvllm-fusion/README.md](crates/rvllm-fusion/README.md) for the full 
 | 12 | Batch-1 dispatch fix: default to `CublasGemvDecode` | 127.9 (N=1) | Apr 4 |
 | 13 | Batched GEMM `Hybrid` policy fix | 13,148 (N=128) | Apr 4 |
 | 14 | Batch-1 batched scratch default | 133.1 (N=1) | Apr 4 |
+| 15 | `cublasLt` autotune cache replay fix | 13,307 (N=128) | Apr 6 |
+| 16 | Direct benchmark shell cleanup | 13,556 (N=128) | Apr 6 |
+| 17 | Hopper CUTLASS FFN gate-aux epilogue | 15,480 (N=128) | Apr 7 |
 
 ### What Differs from vLLM
 
 Against vLLM 0.19.0 (April 2026), rvLLM now has two different stories:
 
-- **Batched direct engine is close**: `0.99x` at `N=32`, `1.01x` at `N=64`, `0.94x` at `N=128`
-- **Single-stream decode is not**: `0.80x` at `N=1`
+- **Batched direct engine can win**: `1.04x` at `N=64`
+- **Single-stream decode and large-batch decode still lag**: `0.91x` at `N=1`, `0.92x` at `N=128`
 
-The biggest architectural difference is that rvLLM's normal batched path is now an explicit per-op hybrid GEMM stack, while vLLM still has the stronger overall decode stack at `N=1` through FlashAttention 3, `torch.compile`, and fuller decode graph integration.
+The biggest architectural difference is that rvLLM's normal batched path is now an explicit per-op hybrid GEMM stack with a Hopper-specific CUTLASS FFN gate epilogue, while vLLM still has the stronger overall decode stack at `N=1` and `N=128` through FlashAttention 3, `torch.compile`, and fuller decode graph integration.
 
 Root causes of the gap (in order of impact):
 
