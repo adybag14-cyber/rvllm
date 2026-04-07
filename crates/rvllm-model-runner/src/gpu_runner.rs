@@ -2635,19 +2635,9 @@ mod cuda_impl {
                 }
             } else if let Some(path) = self.experimental_decode_path_override() {
                 path
-            } else if std::env::var("RVLLM_BATCHED_DECODE_1").map_or(true, |v| v != "0") {
-                ForwardPath::Batched
-            } else if std::env::var("RVLLM_CUBLAS_DECODE").map_or(true, |v| v != "0") {
-                ForwardPath::CublasGemvDecode
             } else {
-                #[cfg(feature = "cublaslt")]
-                if self.blas_lt.is_some()
-                    && !self.fp8_fused_qkv.is_empty()
-                    && self.fp8_input_scratch.is_some()
-                {
-                    return ForwardPath::Fp8Decode;
-                }
-                ForwardPath::FusedDecode
+                self.explicit_legacy_decode_path_override()
+                    .unwrap_or(ForwardPath::BatchedV2)
             }
         }
 
@@ -2698,6 +2688,30 @@ mod cuda_impl {
                 return Some(ForwardPath::PersistentDecode);
             }
             None
+        }
+
+        fn explicit_legacy_decode_path_override(&self) -> Option<ForwardPath> {
+            if std::env::var("RVLLM_BATCHED_PIPELINE_V2").map_or(false, |v| v == "0") {
+                return Some(ForwardPath::Batched);
+            }
+            match std::env::var("RVLLM_BATCHED_DECODE_1").ok().as_deref() {
+                Some("1") => Some(ForwardPath::Batched),
+                Some("0") => {
+                    if std::env::var("RVLLM_CUBLAS_DECODE").map_or(true, |v| v != "0") {
+                        Some(ForwardPath::CublasGemvDecode)
+                    } else {
+                        #[cfg(feature = "cublaslt")]
+                        if self.blas_lt.is_some()
+                            && !self.fp8_fused_qkv.is_empty()
+                            && self.fp8_input_scratch.is_some()
+                        {
+                            return Some(ForwardPath::Fp8Decode);
+                        }
+                        Some(ForwardPath::FusedDecode)
+                    }
+                }
+                _ => None,
+            }
         }
 
         /// Prepare the runner for CUDA graph capture.

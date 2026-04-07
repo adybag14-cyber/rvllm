@@ -3,7 +3,7 @@
 //! Split into 3 files:
 //! - `mod.rs`: types, dispatch, shared kernel helpers
 //! - `decode.rs`: T=1 single-token decode paths (fused GEMV, FP8 cublasLt)
-//! - `batched.rs`: T>=1 batched decode / prefill path (cuBLAS/CUTLASS GEMMs)
+//! - `batched.rs`: canonical `BatchedV2` batched decode / prefill path plus fenced legacy batched support
 
 #[cfg(feature = "cuda")]
 mod batched;
@@ -138,11 +138,12 @@ mod inner {
         MegakernelDecode,
         /// All 28 layers + LM head in ONE kernel launch via the v2 interpreter.
         MegakernelV2Decode,
-        /// T>=1 batched decode or prefill with cuBLAS/CUTLASS GEMMs.
-        /// Always requires scratch buffers.
-        Batched,
-        /// T>=1 batched decode or prefill with the new clean batched pipeline.
+        /// T>=1 batched decode or prefill with the canonical boring batched lane.
+        /// This is the default structural target for the vLLM 0.19 parity push.
         BatchedV2,
+        /// T>=1 batched decode or prefill with the legacy batched lane.
+        /// Keep fenced for compatibility and experiments; do not treat as the default path.
+        Batched,
     }
 
     /// GEMM implementation strategy for the batched path.
@@ -194,7 +195,9 @@ mod inner {
         /// Dispatch to the correct forward path based on `path` enum.
         ///
         /// Returns `Some((residual, mlp_out))` for decode paths,
-        /// `None` for batched path (results written to scratch buffers).
+        /// `None` for batched paths (results written to scratch buffers).
+        /// Callers should prefer `ForwardPath::BatchedV2`; `ForwardPath::Batched`
+        /// remains only as a fenced legacy lane.
         pub fn forward(
             &self,
             path: ForwardPath,
@@ -258,28 +261,28 @@ mod inner {
                 ForwardPath::MegakernelV2Decode => Err(LLMError::GpuError(
                     "MegakernelV2Decode is handled at the runner level, not per-layer".into(),
                 )),
-                ForwardPath::Batched => {
-                    let scratch = scratch.expect("Batched path requires scratch buffers");
-                    self.forward_batched(
+                ForwardPath::BatchedV2 => {
+                    self.forward_batched_entry(
+                        ForwardPath::BatchedV2,
                         input,
                         weights,
                         blas,
-                        lt,
                         prev_mlp_out,
+                        lt,
                         scratch,
                         gemm_strategy,
                         cutlass,
                     )?;
                     Ok(None)
                 }
-                ForwardPath::BatchedV2 => {
-                    let scratch = scratch.expect("BatchedV2 path requires scratch buffers");
-                    self.forward_batched_v2(
+                ForwardPath::Batched => {
+                    self.forward_batched_entry(
+                        ForwardPath::Batched,
                         input,
                         weights,
                         blas,
-                        lt,
                         prev_mlp_out,
+                        lt,
                         scratch,
                         gemm_strategy,
                         cutlass,
@@ -303,31 +306,31 @@ mod inner {
             cutlass: Option<&rvllm_gpu::cutlass_ffi::CutlassKernels>,
         ) -> Result<Option<(CudaSlice<f16>, CudaSlice<f16>)>> {
             match path {
-                ForwardPath::Batched => {
-                    let scratch = scratch.expect("Batched path requires scratch buffers");
-                    self.forward_batched_profiled(
+                ForwardPath::BatchedV2 => {
+                    self.forward_batched_profiled_entry(
+                        ForwardPath::BatchedV2,
                         input,
                         weights,
                         blas,
-                        lt,
                         prev_mlp_out,
+                        lt,
                         scratch,
-                        Some(phase_timings),
+                        phase_timings,
                         gemm_strategy,
                         cutlass,
                     )?;
                     Ok(None)
                 }
-                ForwardPath::BatchedV2 => {
-                    let scratch = scratch.expect("BatchedV2 path requires scratch buffers");
-                    self.forward_batched_v2_profiled(
+                ForwardPath::Batched => {
+                    self.forward_batched_profiled_entry(
+                        ForwardPath::Batched,
                         input,
                         weights,
                         blas,
-                        lt,
                         prev_mlp_out,
+                        lt,
                         scratch,
-                        Some(phase_timings),
+                        phase_timings,
                         gemm_strategy,
                         cutlass,
                     )?;
@@ -344,6 +347,93 @@ mod inner {
                     gemm_strategy,
                     cutlass,
                 ),
+            }
+        }
+
+        fn forward_batched_entry(
+            &self,
+            path: ForwardPath,
+            input: &GpuLayerInput<'_>,
+            weights: &GpuLayerWeights<'_>,
+            blas: &CublasHandle,
+            prev_mlp_out: Option<&CudaSlice<f16>>,
+            lt: Option<&crate::CublasLtRef>,
+            scratch: Option<&mut LayerScratchRef<'_>>,
+            gemm_strategy: GemmStrategy,
+            cutlass: Option<&rvllm_gpu::cutlass_ffi::CutlassKernels>,
+        ) -> Result<()> {
+            let scratch = scratch.expect(match path {
+                ForwardPath::BatchedV2 => "BatchedV2 path requires scratch buffers",
+                ForwardPath::Batched => "Legacy Batched path requires scratch buffers",
+                _ => unreachable!("non-batched path in batched entry"),
+            });
+            match path {
+                ForwardPath::BatchedV2 => self.forward_batched_v2(
+                    input,
+                    weights,
+                    blas,
+                    lt,
+                    prev_mlp_out,
+                    scratch,
+                    gemm_strategy,
+                    cutlass,
+                ),
+                ForwardPath::Batched => self.forward_batched(
+                    input,
+                    weights,
+                    blas,
+                    lt,
+                    prev_mlp_out,
+                    scratch,
+                    gemm_strategy,
+                    cutlass,
+                ),
+                _ => unreachable!("non-batched path in batched entry"),
+            }
+        }
+
+        fn forward_batched_profiled_entry(
+            &self,
+            path: ForwardPath,
+            input: &GpuLayerInput<'_>,
+            weights: &GpuLayerWeights<'_>,
+            blas: &CublasHandle,
+            prev_mlp_out: Option<&CudaSlice<f16>>,
+            lt: Option<&crate::CublasLtRef>,
+            scratch: Option<&mut LayerScratchRef<'_>>,
+            phase_timings: &mut BatchedLayerPhaseTimings,
+            gemm_strategy: GemmStrategy,
+            cutlass: Option<&rvllm_gpu::cutlass_ffi::CutlassKernels>,
+        ) -> Result<()> {
+            let scratch = scratch.expect(match path {
+                ForwardPath::BatchedV2 => "BatchedV2 path requires scratch buffers",
+                ForwardPath::Batched => "Legacy Batched path requires scratch buffers",
+                _ => unreachable!("non-batched path in profiled batched entry"),
+            });
+            match path {
+                ForwardPath::BatchedV2 => self.forward_batched_v2_profiled(
+                    input,
+                    weights,
+                    blas,
+                    lt,
+                    prev_mlp_out,
+                    scratch,
+                    Some(phase_timings),
+                    gemm_strategy,
+                    cutlass,
+                ),
+                ForwardPath::Batched => self.forward_batched_profiled(
+                    input,
+                    weights,
+                    blas,
+                    lt,
+                    prev_mlp_out,
+                    scratch,
+                    Some(phase_timings),
+                    gemm_strategy,
+                    cutlass,
+                ),
+                _ => unreachable!("non-batched path in profiled batched entry"),
             }
         }
 
