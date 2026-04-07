@@ -21,6 +21,7 @@ mod inner {
     use half::f16;
     use tracing::info;
 
+    use rvllm_attention::choose_num_splits;
     use rvllm_core::error::{LLMError, Result};
     use rvllm_gpu::cublas::CublasHandle;
     use rvllm_gpu::kernel_loader::KernelLoader;
@@ -1031,6 +1032,7 @@ mod inner {
             max_context_len: u32,
             block_size: usize,
         ) -> Result<CudaSlice<f16>> {
+            const DECODE_TILE_TOKENS: usize = 64;
             let out_len = num_tokens * num_heads * head_dim;
             let scale = 1.0f32 / (head_dim as f32).sqrt();
             let p_num_heads = num_heads as i32;
@@ -1043,16 +1045,10 @@ mod inner {
             } else {
                 1
             };
-
-            let num_splits: i32 = if max_context_len <= 512 {
-                1
-            } else if max_context_len <= 2048 {
-                2
-            } else if max_context_len <= 8192 {
-                4
-            } else {
-                8
-            };
+            let max_tiles = ((max_context_len as usize) + DECODE_TILE_TOKENS - 1) / DECODE_TILE_TOKENS;
+            let num_splits = choose_num_splits(max_context_len as usize)
+                .max(1)
+                .min(max_tiles.max(1)) as i32;
 
             // v3 GQA kernel
             if num_heads != num_kv_heads && heads_per_group <= 8 && head_dim % 8 == 0 {
