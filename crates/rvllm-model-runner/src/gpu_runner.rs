@@ -2152,10 +2152,10 @@ mod cuda_impl {
                 }
             }
             if actual > 0 {
-                let dummy_row = &host.block_tables[..max_blocks];
+                let dummy_row = host.block_tables[..max_blocks].to_vec();
                 for seq_idx in actual..padded {
                     let dst_off = seq_idx * max_blocks;
-                    host.block_tables[dst_off..dst_off + max_blocks].copy_from_slice(dummy_row);
+                    host.block_tables[dst_off..dst_off + max_blocks].copy_from_slice(&dummy_row);
                 }
             }
 
