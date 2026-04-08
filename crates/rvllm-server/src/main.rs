@@ -334,6 +334,7 @@ async fn main() -> anyhow::Result<()> {
                     "Describe the process of DNS resolution.",
                     "Write pseudocode for the A* pathfinding algorithm.",
                 ];
+                const FLAMEGRAPH_REPEAT_ROUNDS: usize = 12;
 
                 // Each batch size runs as a separate process to avoid CUDA context
                 // poisoning between different graph captures.
@@ -407,19 +408,32 @@ async fn main() -> anyhow::Result<()> {
                             .build()
                     }).transpose()?;
 
+                    let repeat_rounds = if flamegraph_out.is_some() {
+                        FLAMEGRAPH_REPEAT_ROUNDS
+                    } else {
+                        1
+                    };
+                    let mut total_toks = 0usize;
+                    let mut finished = 0usize;
                     let t0 = std::time::Instant::now();
-                    for i in 0..batch {
-                        let prompt = BENCH_PROMPTS[i % BENCH_PROMPTS.len()].to_string();
-                        engine.add_request_auto_id_with_emit_intermediate(
-                            prompt,
-                            params.clone(),
-                            false,
-                        )?;
-                    }
+                    for round in 0..repeat_rounds {
+                        for i in 0..batch {
+                            let prompt =
+                                BENCH_PROMPTS[(round * batch + i) % BENCH_PROMPTS.len()].to_string();
+                            engine.add_request_auto_id_with_emit_intermediate(
+                                prompt,
+                                params.clone(),
+                                false,
+                            )?;
+                        }
 
-                    let (total_toks, finished) = engine.run_count_tokens_only()?;
+                        let (round_toks, round_finished) = engine.run_count_tokens_only()?;
+                        total_toks += round_toks;
+                        finished += round_finished;
+                    }
                     let elapsed = t0.elapsed();
-                    let failed = batch.saturating_sub(finished);
+                    let expected_finished = batch * repeat_rounds;
+                    let failed = expected_finished.saturating_sub(finished);
                     let tps = total_toks as f64 / elapsed.as_secs_f64();
 
                     if json {
