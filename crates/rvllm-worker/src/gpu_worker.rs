@@ -1561,7 +1561,7 @@ impl GpuWorker {
                 return Ok(None);
             }
         }
-        let greedy_only = Self::all_greedy(metadata);
+        let greedy_only = decode_batch.map_or_else(|| Self::all_greedy(metadata), |b| b.all_greedy());
         let fwd_output = if let Some(batch) = decode_batch {
             self.gpu_forward_from_decode_batch_ex(batch, greedy_only)?
         } else {
@@ -1611,7 +1611,13 @@ impl GpuWorker {
                         self.sample_tokens_from_gpu_argmax(token_ids, metadata)?
                     }
                 }
-                ForwardOutput::Logits(ref logits) => self.sample_tokens(logits, metadata)?,
+                ForwardOutput::Logits(ref logits) => {
+                    if let Some(decode_batch) = decode_batch {
+                        self.sample_tokens_decode(logits, decode_batch)?
+                    } else {
+                        self.sample_tokens(logits, metadata)?
+                    }
+                }
                 ForwardOutput::TokenIdsPending { .. } => unreachable!(),
             };
             return Ok(GpuWorkerOutput { outputs });
@@ -1647,7 +1653,7 @@ impl GpuWorker {
             }
         }
 
-        let greedy_only = Self::all_greedy(metadata);
+        let greedy_only = decode_batch.map_or_else(|| Self::all_greedy(metadata), |b| b.all_greedy());
         let fwd_output = if let Some(batch) = decode_batch {
             self.gpu_forward_from_decode_batch_ex(batch, greedy_only)?
         } else {
@@ -1675,7 +1681,11 @@ impl GpuWorker {
             }
             ForwardOutput::Logits(ref logits) => {
                 during_gpu();
-                self.sample_tokens(logits, metadata)?
+                if let Some(decode_batch) = decode_batch {
+                    self.sample_tokens_decode(logits, decode_batch)?
+                } else {
+                    self.sample_tokens(logits, metadata)?
+                }
             }
         };
         Ok(GpuWorkerOutput { outputs })
@@ -1701,7 +1711,7 @@ impl GpuWorker {
 
         let t_start = std::time::Instant::now();
 
-        let greedy_only = Self::all_greedy(metadata);
+        let greedy_only = decode_batch.map_or_else(|| Self::all_greedy(metadata), |b| b.all_greedy());
         let fwd_output = if let Some(batch) = decode_batch {
             self.gpu_forward_from_decode_batch_ex(batch, greedy_only)?
         } else {
@@ -1726,7 +1736,13 @@ impl GpuWorker {
                     self.sample_pending_tokens_from_pinned(actual_batch, metadata)?
                 }
             }
-            ForwardOutput::Logits(ref logits) => self.sample_tokens(logits, metadata)?,
+            ForwardOutput::Logits(ref logits) => {
+                if let Some(decode_batch) = decode_batch {
+                    self.sample_tokens_decode(logits, decode_batch)?
+                } else {
+                    self.sample_tokens(logits, metadata)?
+                }
+            }
         };
         let t_sample = t_start.elapsed();
 
@@ -1775,7 +1791,7 @@ impl GpuWorker {
             }
         }
 
-        let greedy_only = Self::all_greedy(metadata);
+        let greedy_only = decode_batch.map_or_else(|| Self::all_greedy(metadata), |b| b.all_greedy());
         let fwd_output = if let Some(batch) = decode_batch {
             self.gpu_forward_from_decode_batch_ex(batch, greedy_only)?
         } else {
@@ -1796,7 +1812,11 @@ impl GpuWorker {
                 Ok(Some(GpuWorkerOutput { outputs }))
             }
             ForwardOutput::Logits(ref logits) => {
-                let outputs = self.sample_tokens(logits, metadata)?;
+                let outputs = if let Some(decode_batch) = decode_batch {
+                    self.sample_tokens_decode(logits, decode_batch)?
+                } else {
+                    self.sample_tokens(logits, metadata)?
+                };
                 Ok(Some(GpuWorkerOutput { outputs }))
             }
         }
@@ -2310,6 +2330,86 @@ impl GpuWorker {
 
                 offset += num_tokens * vocab_size;
             }
+        }
+
+        Ok(results)
+    }
+
+    fn sample_tokens_decode(
+        &mut self,
+        logits: &[f32],
+        decode_batch: &input::DecodeBatchDescriptor,
+    ) -> Result<Vec<GpuSamplerResult>> {
+        let vocab_size = self.vocab_size;
+        let mut results = Vec::with_capacity(decode_batch.seq_ids.len());
+
+        for (idx, (&seq_id, seq_data)) in decode_batch
+            .seq_ids
+            .iter()
+            .zip(decode_batch.seq_data.iter())
+            .enumerate()
+        {
+            let logit_start = idx * vocab_size;
+            let logit_end = logit_start + vocab_size;
+            let sampling_params = &decode_batch.sampling_params[idx];
+
+            let (token_id, logprob, top_logprobs) = if logit_end <= logits.len() {
+                let seq_logits = &logits[logit_start..logit_end];
+                let past: Vec<TokenId> = seq_data
+                    .prompt_token_ids
+                    .iter()
+                    .chain(seq_data.output_token_ids.iter())
+                    .copied()
+                    .collect();
+
+                let mut guided_logits_buf;
+                let final_logits =
+                    if !matches!(sampling_params.response_format, ResponseFormat::Text) {
+                        guided_logits_buf = seq_logits.to_vec();
+                        let state = self.guided_states.entry(seq_id).or_insert_with(|| {
+                            GuidedDecodingState::new(&sampling_params.response_format)
+                                .unwrap_or_else(|_| {
+                                    GuidedDecodingState::new(&ResponseFormat::Text).unwrap()
+                                })
+                        });
+                        if let Some(ref vocab) = self.vocab_table {
+                            state.apply_mask(&mut guided_logits_buf, vocab);
+                        }
+                        &guided_logits_buf[..]
+                    } else {
+                        seq_logits
+                    };
+
+                let mut rng = make_rng(sampling_params.seed);
+                let sampler_out = self.sampler.sample(
+                    final_logits,
+                    vocab_size,
+                    sampling_params,
+                    &past,
+                    &mut rng,
+                )?;
+
+                (
+                    sampler_out.token_id,
+                    sampler_out.logprob,
+                    sampler_out.top_logprobs,
+                )
+            } else {
+                warn!(
+                    seq_id,
+                    logits_len = logits.len(),
+                    expected_end = logit_end,
+                    "decode batch logits too short, producing dummy token"
+                );
+                (0, 0.0, Vec::new())
+            };
+
+            results.push(GpuSamplerResult {
+                seq_id,
+                token_id,
+                logprob,
+                top_logprobs,
+            });
         }
 
         Ok(results)

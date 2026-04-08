@@ -1,6 +1,6 @@
 //! Input preparation: converts sequence metadata into batched model tensors.
 
-use rvllm_core::prelude::{Result, TokenId};
+use rvllm_core::prelude::{Result, SamplingParams, TokenId};
 use rvllm_model_runner::bridge::AttentionMetadata;
 use rvllm_model_runner::input::ModelInput;
 
@@ -422,6 +422,8 @@ impl Default for DecodeInputScratch {
 #[derive(Debug, Clone)]
 pub struct DecodeBatchDescriptor {
     pub seq_ids: Vec<u64>,
+    pub seq_data: Vec<SequenceData>,
+    pub sampling_params: Vec<SamplingParams>,
     pub token_ids: Vec<u32>,
     pub position_ids: Vec<u32>,
     pub slot_mapping: Vec<u32>,
@@ -434,6 +436,8 @@ impl DecodeBatchDescriptor {
     pub fn new() -> Self {
         Self {
             seq_ids: Vec::with_capacity(64),
+            seq_data: Vec::with_capacity(64),
+            sampling_params: Vec::with_capacity(64),
             token_ids: Vec::with_capacity(64),
             position_ids: Vec::with_capacity(64),
             slot_mapping: Vec::with_capacity(64),
@@ -445,6 +449,8 @@ impl DecodeBatchDescriptor {
 
     pub fn clear(&mut self) {
         self.seq_ids.clear();
+        self.seq_data.clear();
+        self.sampling_params.clear();
         self.token_ids.clear();
         self.position_ids.clear();
         self.slot_mapping.clear();
@@ -457,6 +463,16 @@ impl DecodeBatchDescriptor {
 
     pub fn max_context_len(&self) -> u32 {
         self.context_lens.iter().copied().max().unwrap_or(0)
+    }
+
+    pub fn all_greedy(&self) -> bool {
+        self.sampling_params.iter().all(|p| {
+            p.temperature == 0.0
+                && matches!(p.response_format, rvllm_core::prelude::ResponseFormat::Text)
+                && p.repetition_penalty == 1.0
+                && p.frequency_penalty == 0.0
+                && p.presence_penalty == 0.0
+        })
     }
 }
 

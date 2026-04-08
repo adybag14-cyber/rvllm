@@ -333,22 +333,6 @@ use rvllm_core::prelude::{
             }
         }
 
-        fn all_greedy_scheduled(&self, groups: &[ScheduledSequenceGroup]) -> bool {
-            groups.iter().all(|scheduled| {
-                self.requests
-                    .get(&scheduled.seq_group.request_id)
-                    .map(|req| {
-                        let p = &req.sampling_params;
-                        p.temperature == 0.0
-                            && matches!(p.response_format, ResponseFormat::Text)
-                            && p.repetition_penalty == 1.0
-                            && p.frequency_penalty == 0.0
-                            && p.presence_penalty == 0.0
-                    })
-                    .unwrap_or(false)
-            })
-        }
-
         pub fn new(config: EngineConfig) -> Result<Self> {
             let model_name = &config.model.model_path;
             info!(model = %model_name, "GpuLLMEngine: initializing");
@@ -916,8 +900,7 @@ use rvllm_core::prelude::{
             }
 
             let scheduled_groups = scheduled.scheduled_seq_groups;
-            let use_decode_batch = scheduled_groups.iter().all(|g| !g.is_prefill)
-                && self.all_greedy_scheduled(&scheduled_groups);
+            let use_decode_batch = scheduled_groups.iter().all(|g| !g.is_prefill);
             let (metadata, aborted_seqs) = if use_decode_batch {
                 (Vec::new(), self.build_decode_batch_descriptor(&scheduled_groups))
             } else {
@@ -1234,6 +1217,11 @@ use rvllm_core::prelude::{
 
             for scheduled in groups {
                 let group = &scheduled.seq_group;
+                let sampling_params = self
+                    .requests
+                    .get(&group.request_id)
+                    .map(|req| req.sampling_params.clone())
+                    .unwrap_or_default();
                 for (seq_idx, seq) in group.sequences.iter().enumerate() {
                     if seq.is_finished() {
                         continue;
@@ -1302,6 +1290,10 @@ use rvllm_core::prelude::{
                     };
 
                     self.decode_batch.seq_ids.push(seq.seq_id.0);
+                    self.decode_batch.seq_data.push(seq_data.clone());
+                    self.decode_batch
+                        .sampling_params
+                        .push(sampling_params.clone());
                     self.decode_batch.token_ids.push(seq_data.last_token_id);
                     self.decode_batch.position_ids.push(seq_len.saturating_sub(1) as u32);
                     self.decode_batch.slot_mapping.push(slot);
