@@ -12,6 +12,14 @@ use crate::Result;
 /// Must match the workspace budget used by the cublasLt autotuner (32 MiB).
 const CUBLAS_GRAPH_WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
 
+/// Static scalars for cuBLAS GEMM alpha/beta.
+/// Using static addresses (not stack locals) guarantees safety during
+/// CUDA graph replay -- the graph captures these addresses, and statics
+/// have program-lifetime stability. CUDA 12.x cuBLAS handles host pointers
+/// correctly during capture, but statics eliminate the risk entirely.
+pub static ALPHA_ONE_F32: f32 = 1.0;
+pub static BETA_ZERO_F32: f32 = 0.0;
+
 /// Wrapper around cuBLAS for matrix operations.
 pub struct CublasHandle {
     blas: CudaBlas,
@@ -114,9 +122,6 @@ impl CublasHandle {
         let mut c_buf = self.stream.alloc_zeros::<half::f16>(max_c)
             .map_err(|e| crate::LLMError::GpuError(format!("warmup alloc C: {e}")))?;
 
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
-
         let (a_ptr, _ag) = DevicePtr::device_ptr(&a_buf, &self.stream);
         let (b_ptr, _bg) = DevicePtr::device_ptr(&b_buf, &self.stream);
         let (c_ptr, _cg) = DevicePtrMut::device_ptr_mut(&mut c_buf, &self.stream);
@@ -129,10 +134,10 @@ impl CublasHandle {
                         *self.blas.handle(),
                         CUBLAS_OP_T, CUBLAS_OP_N,
                         n as i32, m as i32, k as i32,
-                        &alpha as *const f32 as *const std::ffi::c_void,
+                        &ALPHA_ONE_F32 as *const f32 as *const std::ffi::c_void,
                         b_ptr as *const std::ffi::c_void, CUDA_R_16F, k as i32,
                         a_ptr as *const std::ffi::c_void, CUDA_R_16F, k as i32,
-                        &beta as *const f32 as *const std::ffi::c_void,
+                        &BETA_ZERO_F32 as *const f32 as *const std::ffi::c_void,
                         c_ptr as *mut std::ffi::c_void, CUDA_R_16F, n as i32,
                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP,
                     );
@@ -238,6 +243,11 @@ impl CublasHandle {
         let (a_ptr, _a_guard) = DevicePtr::device_ptr(a, &self.stream);
         let (c_ptr, _c_guard) = DevicePtrMut::device_ptr_mut(c, &self.stream);
 
+        // Use static scalars for graph-safe addresses (alpha/beta are always 1.0/0.0
+        // in practice; assert at debug to catch any unexpected values).
+        debug_assert!((alpha - 1.0).abs() < 1e-6 && beta.abs() < 1e-6,
+            "hgemm_f32_output only supports alpha=1.0, beta=0.0 for graph safety");
+
         unsafe {
             let status = cudarc::cublas::sys::cublasGemmEx(
                 *self.blas.handle(),
@@ -246,14 +256,14 @@ impl CublasHandle {
                 n as i32,
                 m as i32,
                 k as i32,
-                &alpha as *const f32 as *const std::ffi::c_void,
+                &ALPHA_ONE_F32 as *const f32 as *const std::ffi::c_void,
                 b_ptr as *const std::ffi::c_void,
                 CUDA_R_16F,
                 k as i32,
                 a_ptr as *const std::ffi::c_void,
                 CUDA_R_16F,
                 k as i32,
-                &beta as *const f32 as *const std::ffi::c_void,
+                &BETA_ZERO_F32 as *const f32 as *const std::ffi::c_void,
                 c_ptr as *mut std::ffi::c_void,
                 CUDA_R_32F,
                 n as i32,
@@ -352,15 +362,19 @@ impl CublasHandle {
         let (b_ptr, _bg) = DevicePtr::device_ptr(b, &self.stream);
         let (a_ptr, _ag) = DevicePtr::device_ptr(a, &self.stream);
         let (c_ptr, _cg) = DevicePtrMut::device_ptr_mut(c, &self.stream);
+
+        debug_assert!((alpha - 1.0).abs() < 1e-6 && beta.abs() < 1e-6,
+            "hgemm_into only supports alpha=1.0, beta=0.0 for graph safety");
+
         unsafe {
             let status = cudarc::cublas::sys::cublasGemmEx(
                 *self.blas.handle(),
                 CUBLAS_OP_T, CUBLAS_OP_N,
                 n as i32, m as i32, k as i32,
-                &alpha as *const f32 as *const std::ffi::c_void,
+                &ALPHA_ONE_F32 as *const f32 as *const std::ffi::c_void,
                 b_ptr as *const std::ffi::c_void, CUDA_R_16F, k as i32,
                 a_ptr as *const std::ffi::c_void, CUDA_R_16F, k as i32,
-                &beta as *const f32 as *const std::ffi::c_void,
+                &BETA_ZERO_F32 as *const f32 as *const std::ffi::c_void,
                 c_ptr as *mut std::ffi::c_void, CUDA_R_16F, n as i32,
                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP,
             );
@@ -409,15 +423,18 @@ impl CublasHandle {
         let (a_ptr, _ag) = DevicePtr::device_ptr(a, &self.stream);
         let (c_ptr, _cg) = DevicePtrMut::device_ptr_mut(c, &self.stream);
 
+        debug_assert!((alpha - 1.0).abs() < 1e-6 && beta.abs() < 1e-6,
+            "hgemm_strided_batched only supports alpha=1.0, beta=0.0 for graph safety");
+
         unsafe {
             let status = cudarc::cublas::sys::cublasGemmStridedBatchedEx(
                 *self.blas.handle(),
                 CUBLAS_OP_T, CUBLAS_OP_N,
                 n as i32, m as i32, k as i32,
-                &alpha as *const f32 as *const std::ffi::c_void,
+                &ALPHA_ONE_F32 as *const f32 as *const std::ffi::c_void,
                 b_ptr as *const std::ffi::c_void, CUDA_R_16F, k as i32, stride_b,
                 a_ptr as *const std::ffi::c_void, CUDA_R_16F, k as i32, stride_a,
-                &beta as *const f32 as *const std::ffi::c_void,
+                &BETA_ZERO_F32 as *const f32 as *const std::ffi::c_void,
                 c_ptr as *mut std::ffi::c_void, CUDA_R_16F, n as i32, stride_c,
                 batch_count as i32,
                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP,
@@ -583,15 +600,18 @@ impl CublasHandle {
         let (x_ptr, _xg) = DevicePtr::device_ptr(input, &self.stream);
         let (y_ptr, _yg) = DevicePtrMut::device_ptr_mut(output, &self.stream);
 
+        debug_assert!((alpha - 1.0).abs() < 1e-6 && beta.abs() < 1e-6,
+            "hgemv_f16 only supports alpha=1.0, beta=0.0 for graph safety");
+
         unsafe {
             let status = cudarc::cublas::sys::cublasGemmEx(
                 *self.blas.handle(),
                 CUBLAS_OP_T, CUBLAS_OP_N,
                 n as i32, 1i32, k as i32,
-                &alpha as *const f32 as *const std::ffi::c_void,
+                &ALPHA_ONE_F32 as *const f32 as *const std::ffi::c_void,
                 w_ptr as *const std::ffi::c_void, CUDA_R_16F, k as i32,
                 x_ptr as *const std::ffi::c_void, CUDA_R_16F, k as i32,
-                &beta as *const f32 as *const std::ffi::c_void,
+                &BETA_ZERO_F32 as *const f32 as *const std::ffi::c_void,
                 y_ptr as *mut std::ffi::c_void, CUDA_R_16F, n as i32,
                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP,
             );

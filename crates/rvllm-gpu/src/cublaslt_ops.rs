@@ -266,18 +266,18 @@ impl CublasLtOps {
         let mut retry_without_cache = false;
         let cache = self.f16_cache.borrow();
         if let Some(plan) = cache.get(&(m, n, k)) {
-            let alpha_f32 = alpha;
-            let beta_f32 = beta;
+            debug_assert!((alpha - 1.0).abs() < 1e-6 && beta.abs() < 1e-6,
+                "cublasLt cached path only supports alpha=1.0, beta=0.0 for graph safety");
             unsafe {
                 let s = lt_sys::cublasLtMatmul(
                     *self.handle.handle(),
                     plan.desc,
-                    &alpha_f32 as *const f32 as *const c_void,
+                    &crate::cublas::ALPHA_ONE_F32 as *const f32 as *const c_void,
                     b_ptr as *const c_void,
                     plan.layout_a,
                     a_ptr as *const c_void,
                     plan.layout_b,
-                    &beta_f32 as *const f32 as *const c_void,
+                    &crate::cublas::BETA_ZERO_F32 as *const f32 as *const c_void,
                     c_ptr as *mut c_void,
                     plan.layout_c,
                     c_ptr as *mut c_void,
@@ -376,17 +376,15 @@ impl CublasLtOps {
                 )));
             }
 
-            let alpha_f32 = alpha;
-            let beta_f32 = beta;
             let s = lt_sys::cublasLtMatmul(
                 handle,
                 desc,
-                &alpha_f32 as *const f32 as *const c_void,
+                &crate::cublas::ALPHA_ONE_F32 as *const f32 as *const c_void,
                 b_ptr as *const c_void,
                 la,
                 a_ptr as *const c_void,
                 lb,
-                &beta_f32 as *const f32 as *const c_void,
+                &crate::cublas::BETA_ZERO_F32 as *const f32 as *const c_void,
                 c_ptr as *mut c_void,
                 lc,
                 c_ptr as *mut c_void,
@@ -550,20 +548,18 @@ impl CublasLtOps {
 
         let cache = self.fp8_cache.borrow();
         let plan = cache.get(&key).unwrap();
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
         unsafe {
             let handle = *self.handle.handle();
             let (ws_ptr, _ws_guard) = DevicePtr::device_ptr(&self.workspace, &self.stream);
             let s = lt_sys::cublasLtMatmul(
                 handle,
                 plan.desc,
-                &alpha as *const f32 as *const c_void,
+                &crate::cublas::ALPHA_ONE_F32 as *const f32 as *const c_void,
                 weight_fp8_ptr as *const c_void,
                 plan.layout_a,
                 input_fp8_ptr as *const c_void,
                 plan.layout_b,
-                &beta as *const f32 as *const c_void,
+                &crate::cublas::BETA_ZERO_F32 as *const f32 as *const c_void,
                 output_f16_ptr as *mut c_void,
                 plan.layout_c,
                 output_f16_ptr as *mut c_void,
@@ -677,17 +673,15 @@ impl CublasLtOps {
                 return Err(LLMError::GpuError(format!("hgemm_bias no algo: {s:?}")));
             }
 
-            let alpha_f32 = alpha;
-            let beta_f32: f32 = 0.0;
             let s = lt_sys::cublasLtMatmul(
                 handle,
                 desc,
-                &alpha_f32 as *const f32 as *const c_void,
+                &crate::cublas::ALPHA_ONE_F32 as *const f32 as *const c_void,
                 b_ptr as *const c_void,
                 la,
                 a_ptr as *const c_void,
                 lb,
-                &beta_f32 as *const f32 as *const c_void,
+                &crate::cublas::BETA_ZERO_F32 as *const f32 as *const c_void,
                 c_ptr as *mut c_void,
                 lc,
                 c_ptr as *mut c_void,
@@ -812,18 +806,16 @@ impl CublasLtOps {
                 )));
             }
 
-            let alpha: f32 = 1.0;
-            let beta: f32 = 0.0;
             let (ws_ptr, _ws_guard) = DevicePtr::device_ptr(&self.workspace, &self.stream);
             let s = lt_sys::cublasLtMatmul(
                 handle,
                 desc,
-                &alpha as *const f32 as *const c_void,
+                &crate::cublas::ALPHA_ONE_F32 as *const f32 as *const c_void,
                 weight_fp8_ptr as *const c_void,
                 layout_a,
                 input_fp8_ptr as *const c_void,
                 layout_b,
-                &beta as *const f32 as *const c_void,
+                &crate::cublas::BETA_ZERO_F32 as *const f32 as *const c_void,
                 output_f16_ptr as *mut c_void,
                 layout_c,
                 output_f16_ptr as *mut c_void,
@@ -963,8 +955,6 @@ impl CublasLtOps {
                 }
 
                 // Autotune: benchmark each candidate algorithm
-                let alpha: f32 = 1.0;
-                let beta: f32 = 0.0;
                 let handle = *self.handle.handle();
                 let cu_stream = lt_sys::cu_stream_to_cuda_stream(self.stream.cu_stream());
                 let (ws_ptr, _ws_guard) = DevicePtr::device_ptr(&self.workspace, &self.stream);
@@ -985,10 +975,10 @@ impl CublasLtOps {
                     // Warmup
                     let s = lt_sys::cublasLtMatmul(
                         handle, desc,
-                        &alpha as *const f32 as *const c_void,
+                        &crate::cublas::ALPHA_ONE_F32 as *const f32 as *const c_void,
                         weight_fp8_ptr as *const c_void, layout_a,
                         act_fp8_ptr as *const c_void, layout_b,
-                        &beta as *const f32 as *const c_void,
+                        &crate::cublas::BETA_ZERO_F32 as *const f32 as *const c_void,
                         output_f16_ptr as *mut c_void, layout_c,
                         output_f16_ptr as *mut c_void, layout_c,
                         &heurs[i].algo,
@@ -1003,10 +993,10 @@ impl CublasLtOps {
                     for _ in 0..4 {
                         lt_sys::cublasLtMatmul(
                             handle, desc,
-                            &alpha as *const f32 as *const c_void,
+                            &crate::cublas::ALPHA_ONE_F32 as *const f32 as *const c_void,
                             weight_fp8_ptr as *const c_void, layout_a,
                             act_fp8_ptr as *const c_void, layout_b,
-                            &beta as *const f32 as *const c_void,
+                            &crate::cublas::BETA_ZERO_F32 as *const f32 as *const c_void,
                             output_f16_ptr as *mut c_void, layout_c,
                             output_f16_ptr as *mut c_void, layout_c,
                             &heurs[i].algo,
@@ -1059,19 +1049,17 @@ impl CublasLtOps {
             );
         }
 
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
         unsafe {
             let (ws_ptr, _ws_guard) = DevicePtr::device_ptr(&self.workspace, &self.stream);
             let s = lt_sys::cublasLtMatmul(
                 *self.handle.handle(),
                 plan.desc,
-                &alpha as *const f32 as *const std::ffi::c_void,
+                &crate::cublas::ALPHA_ONE_F32 as *const f32 as *const std::ffi::c_void,
                 weight_fp8_ptr as *const std::ffi::c_void,
                 plan.layout_a,
                 act_fp8_ptr as *const std::ffi::c_void,
                 plan.layout_b,
-                &beta as *const f32 as *const std::ffi::c_void,
+                &crate::cublas::BETA_ZERO_F32 as *const f32 as *const std::ffi::c_void,
                 output_f16_ptr as *mut std::ffi::c_void,
                 plan.layout_c,
                 output_f16_ptr as *mut std::ffi::c_void,

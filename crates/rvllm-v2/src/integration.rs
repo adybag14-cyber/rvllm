@@ -7,6 +7,8 @@ use tracing::{debug, info, warn};
 use rvllm_core::prelude::{RequestId, SamplingParams};
 use rvllm_tokenizer::Tokenizer;
 
+use rvllm_gpu::cutlass_autotune::CutlassAutotuneCache;
+
 use crate::block_manager::{BlockManager, BlockManagerConfig};
 use crate::engine::{Engine, EngineError, StepPending};
 use crate::input::InputBuilder;
@@ -81,7 +83,7 @@ impl Default for V2EngineConfig {
             preemption_mode: PreemptionMode::Recompute,
             device_id: 0,
             watermark: 0.04,
-            graph_enabled: true,
+            graph_enabled: std::env::var("RVLLM_NO_GRAPH").map_or(true, |v| v != "1"),
             fp8_weights: false,
         }
     }
@@ -623,6 +625,24 @@ fn load_model_and_build_runner(
         loaded
     };
 
+    // 6b. Load CUTLASS autotune cache
+    let autotune = {
+        let cache_path = CutlassAutotuneCache::cache_path();
+        let cache = CutlassAutotuneCache::load(&cache_path);
+        if cache.is_empty() {
+            info!("no CUTLASS autotune cache found, using cuBLAS fallback");
+            None
+        } else {
+            info!(
+                hgemm = cache.hgemm.len(),
+                oproj = cache.oproj_residual.len(),
+                gateup = cache.gateup_silu.len(),
+                "loaded CUTLASS autotune cache"
+            );
+            Some(cache)
+        }
+    };
+
     // 7. Create transformer layers
     let loader = Arc::new(loader);
     let mut layers = Vec::with_capacity(num_layers);
@@ -650,6 +670,7 @@ fn load_model_and_build_runner(
         config.clone(),
         layers,
         cutlass,
+        autotune,
         cublas,
         lt_ops,
         stream,

@@ -6,6 +6,7 @@ use half::f16;
 use rvllm_core::prelude::{LLMError, Result};
 use rvllm_gpu::cublas::CublasHandle;
 use rvllm_gpu::cublaslt_ops::CublasLtOps;
+use rvllm_gpu::cutlass_autotune::{CutlassAutotuneCache, max_workspace_size};
 use rvllm_gpu::cutlass_ffi::CutlassKernels;
 use rvllm_gpu::kernel_loader::KernelLoader;
 use rvllm_gpu::pinned_memory::PinnedBuffer;
@@ -77,6 +78,7 @@ pub struct GpuModelRunner {
     layers: Vec<GpuTransformerLayer>,
     gemm_strategy: GemmStrategy,
     cutlass: Option<Arc<CutlassKernels>>,
+    autotune: Option<CutlassAutotuneCache>,
     cublas: CublasHandle,
     lt_ops: Option<CublasLtOps>,
     stream: Arc<CudaStream>,
@@ -117,6 +119,7 @@ impl GpuModelRunner {
         config: RunnerConfig,
         layers: Vec<GpuTransformerLayer>,
         cutlass: Option<Arc<CutlassKernels>>,
+        autotune: Option<CutlassAutotuneCache>,
         cublas: CublasHandle,
         lt_ops: Option<CublasLtOps>,
         stream: Arc<CudaStream>,
@@ -152,7 +155,20 @@ impl GpuModelRunner {
         let hidden_size = config.hidden_size;
         let vocab_size = config.vocab_size;
         let layer_config = layers[0].config_ref();
-        let scratch = F16LayerScratch::alloc(&stream, layer_config, max_t)?;
+        let cutlass_ws_bytes = if let Some(ref ck) = cutlass {
+            let h = config.hidden_size;
+            let qkv = (config.num_heads + 2 * config.num_kv_heads) * config.head_dim;
+            let gate_up = config.intermediate_size * 2;
+            let inter = config.intermediate_size;
+            let hgemm_shapes = [(max_t, qkv, h), (max_t, h, qkv), (max_t, gate_up, h), (max_t, h, inter), (max_t, config.vocab_size, h)];
+            let oproj_shapes = [(max_t, h, h)];
+            let gateup_shapes = [(max_t, gate_up, h)];
+            let fp8_shapes = [(max_t, qkv, h), (max_t, h, qkv), (max_t, gate_up, h), (max_t, h, inter)];
+            max_workspace_size(ck, &hgemm_shapes, &oproj_shapes, &gateup_shapes, &fp8_shapes)
+        } else {
+            4 * 1024 * 1024
+        };
+        let scratch = F16LayerScratch::alloc(&stream, layer_config, max_t, cutlass_ws_bytes)?;
         let max_n = max_t * hidden_size;
         let alloc_f16 = |label: &str, count: usize| -> Result<CudaSlice<f16>> {
             stream.alloc_zeros::<f16>(count)
@@ -178,6 +194,7 @@ impl GpuModelRunner {
             layers,
             gemm_strategy,
             cutlass,
+            autotune,
             cublas,
             lt_ops,
             stream,
@@ -322,6 +339,7 @@ impl GpuModelRunner {
         let Self {
             ref layers,
             ref cutlass,
+            ref autotune,
             ref cublas,
             ref lt_ops,
             ref stream,
@@ -344,6 +362,7 @@ impl GpuModelRunner {
         } = *self;
 
         let cutlass_ref: Option<&CutlassKernels> = cutlass.as_deref();
+        let autotune_ref: Option<&CutlassAutotuneCache> = autotune.as_ref();
 
         // 4. Layer loop -- layers write directly to double-buffer targets (zero copies)
         for layer_idx in 0..num_layers {
@@ -399,19 +418,19 @@ impl GpuModelRunner {
                 layers[layer_idx].forward_batched_v2(
                     embed_output, &attn, &layer_weights, scratch, None,
                     residual_a, down_a,
-                    gemm_strategy, cutlass_ref, cublas, lt_ops.as_ref(),
+                    gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
                 )?;
             } else if layer_idx % 2 == 1 {
                 layers[layer_idx].forward_batched_v2(
                     &*residual_a, &attn, &layer_weights, scratch, Some(&*down_a),
                     residual_b, down_b,
-                    gemm_strategy, cutlass_ref, cublas, lt_ops.as_ref(),
+                    gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
                 )?;
             } else {
                 layers[layer_idx].forward_batched_v2(
                     &*residual_b, &attn, &layer_weights, scratch, Some(&*down_b),
                     residual_a, down_a,
-                    gemm_strategy, cutlass_ref, cublas, lt_ops.as_ref(),
+                    gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
                 )?;
             }
         }
@@ -465,6 +484,7 @@ impl GpuModelRunner {
         let Self {
             ref layers,
             ref cutlass,
+            ref autotune,
             ref cublas,
             ref lt_ops,
             ref stream,
@@ -490,6 +510,7 @@ impl GpuModelRunner {
         } = *self;
 
         let cutlass_ref: Option<&CutlassKernels> = cutlass.as_deref();
+        let autotune_ref: Option<&CutlassAutotuneCache> = autotune.as_ref();
 
         for layer_idx in 0..num_layers {
             let (key_cache, value_cache) = &kv_cache.gpu_cache[layer_idx];
@@ -540,19 +561,19 @@ impl GpuModelRunner {
                 layers[layer_idx].forward_batched_v2(
                     embed_output, &attn, &layer_weights, scratch, None,
                     residual_a, down_a,
-                    gemm_strategy, cutlass_ref, cublas, lt_ops.as_ref(),
+                    gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
                 )?;
             } else if layer_idx % 2 == 1 {
                 layers[layer_idx].forward_batched_v2(
                     &*residual_a, &attn, &layer_weights, scratch, Some(&*down_a),
                     residual_b, down_b,
-                    gemm_strategy, cutlass_ref, cublas, lt_ops.as_ref(),
+                    gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
                 )?;
             } else {
                 layers[layer_idx].forward_batched_v2(
                     &*residual_b, &attn, &layer_weights, scratch, Some(&*down_b),
                     residual_a, down_a,
-                    gemm_strategy, cutlass_ref, cublas, lt_ops.as_ref(),
+                    gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
                 )?;
             }
         }
@@ -957,6 +978,7 @@ impl GpuModelRunner {
         let Self {
             ref layers,
             ref cutlass,
+            ref autotune,
             ref cublas,
             ref lt_ops,
             ref stream,
@@ -981,6 +1003,7 @@ impl GpuModelRunner {
         } = *self;
 
         let cutlass_ref: Option<&CutlassKernels> = cutlass.as_deref();
+        let autotune_ref: Option<&CutlassAutotuneCache> = autotune.as_ref();
 
         for layer_idx in 0..num_layers {
             let (key_cache, value_cache) = &kv_cache.gpu_cache[layer_idx];
@@ -1031,19 +1054,19 @@ impl GpuModelRunner {
                 layers[layer_idx].forward_batched_v2(
                     embed_output, &attn, &layer_weights, scratch, None,
                     residual_a, down_a,
-                    gemm_strategy, cutlass_ref, cublas, lt_ops.as_ref(),
+                    gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
                 )?;
             } else if layer_idx % 2 == 1 {
                 layers[layer_idx].forward_batched_v2(
                     &*residual_a, &attn, &layer_weights, scratch, Some(&*down_a),
                     residual_b, down_b,
-                    gemm_strategy, cutlass_ref, cublas, lt_ops.as_ref(),
+                    gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
                 )?;
             } else {
                 layers[layer_idx].forward_batched_v2(
                     &*residual_b, &attn, &layer_weights, scratch, Some(&*down_b),
                     residual_a, down_a,
-                    gemm_strategy, cutlass_ref, cublas, lt_ops.as_ref(),
+                    gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
                 )?;
             }
         }

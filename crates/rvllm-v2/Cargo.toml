@@ -43,4 +43,4 @@ tracing-subscriber.workspace = true
 [[bin]]
 name = "rvllm-v2-bench"
 path = "src/bin/bench.rs"
-required-features = ["cuda"]
+required-features = ["cuda-graphs"]

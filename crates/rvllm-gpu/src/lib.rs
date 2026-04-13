@@ -11,6 +11,8 @@ pub mod cpu_buffer;
 #[cfg(feature = "cuda")]
 pub mod cublas;
 #[cfg(feature = "cuda")]
+pub mod cutlass_autotune;
+#[cfg(feature = "cuda")]
 pub mod cutlass_ffi;
 #[cfg(feature = "cuda")]
 pub mod cublas_ops;
@@ -45,6 +47,8 @@ pub use rvllm_core::prelude::{LLMError, Result};
 pub use cuda_allocator::CudaGpuAllocator;
 
 pub use autotune_cache::{AutotuneCache, AutotuneCacheEntry, AutotuneCacheKey};
+#[cfg(feature = "cuda")]
+pub use cutlass_autotune::CutlassAutotuneCache;
 #[cfg(feature = "cublaslt")]
 pub use cublas_autotune::{CublasAutotuner, GemmDtype};
 #[cfg(feature = "cublaslt")]

@@ -30,5 +30,10 @@ serde_json = { workspace = true }
 cudarc = { version = "0.19", features = ["driver", "cublas", "cublaslt", "f16", "cuda-version-from-build-system"], optional = true }
 libloading = { version = "0.8", optional = true }
 
+[[bin]]
+name = "autotune-cutlass"
+path = "src/bin/autotune_cutlass.rs"
+required-features = ["cuda"]
+
 [dev-dependencies]
 tempfile = "3"
