@@ -8,7 +8,7 @@
 use std::ffi::c_void;
 use std::path::Path;
 
-pub const HGEMM_VARIANTS: usize = 55;
+pub const HGEMM_VARIANTS: usize = 67;
 pub const OPROJ_RESIDUAL_VARIANTS: usize = 31;
 pub const GATEUP_SILU_VARIANTS: usize = 32;
 pub const FP8_GEMM_VARIANTS: usize = 15;

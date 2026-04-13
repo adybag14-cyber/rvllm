@@ -27,8 +27,10 @@ const SHAPES: &[(usize, usize, &str)] = &[
 
 // Fused family shapes: oproj+residual and gateup+silu
 // oproj: C = A @ W + residual, shape (M, hidden, q_dim) = (M, 3584, 3584)
+// down_proj+residual reuses same kernel: (M, hidden, intermediate) = (M, 3584, 18944)
 const OPROJ_SHAPES: &[(usize, usize, &str)] = &[
     (3584, 3584, "O-proj+residual"),
+    (3584, 18944, "down_proj+residual"),
 ];
 
 // gateup+silu: C = SiLU(A @ W), shape (M, gate_up_dim, hidden) = (M, 37888, 3584)
@@ -90,7 +92,7 @@ const VARIANT_NAMES: [&str; HGEMM_VARIANTS] = [
     "128x256x 64 1x1x1 WS z4",
     " 64x256x 64 1x2x1 WS z2",
     " 64x256x 64 1x2x1 WS z4",
-    // v42-v50: split-K (Coop + StreamKScheduler)
+    // v42-v50: split-K M>=128 (Coop + StreamKScheduler)
     "128x256x 64 1x1x1 SK2",
     "128x256x 64 1x1x1 SK4",
     "128x256x 64 1x1x1 SK8",
@@ -100,11 +102,25 @@ const VARIANT_NAMES: [&str; HGEMM_VARIANTS] = [
     "128x128x 64 1x1x1 SK2",
     "128x128x 64 1x1x1 SK4",
     "128x128x 64 1x1x1 SK8",
-    // v51-v54: stream-K (Coop + heuristic decomposition)
+    // v51-v54: stream-K M>=128
     "256x128x 64 1x1x1 StK",
     "128x128x 64 1x1x1 StK",
     "128x256x 64 1x1x1 StK",
     "256x256x 64 1x1x1 StK",
+    // v55-v62: M=64 WS/PP additional (Coop/split-K need M>=128)
+    " 64x256x 64 1x1x1 WS s2",
+    " 64x256x 64 1x1x1 WS s4",
+    " 64x128x 64 1x1x1 WS s2",
+    " 64x128x 64 1x1x1 WS s4",
+    " 64x256x 64 1x2x1 PP",
+    " 64x128x 64 1x2x1 PP",
+    " 64x256x 64 1x1x1 WS z2",
+    " 64x256x 64 1x1x1 WS z4",
+    // v63-v66: 128xN split-K/stream-K for M=32 (M-waste but fills SMs)
+    "128x128x 64 1x1x1 SK16",
+    "128x256x 64 1x1x1 SK16",
+    "128x256x 64 1x2x1 StK",
+    "128x128x 64 1x2x1 StK",
 ];
 
 // -- CUDA event timing (RAII) --
@@ -526,18 +542,19 @@ fn main() {
                     let spd = cublas_us / us;
                     cache.insert_hgemm(m, n, k, v);
                     cutlass_wins += 1;
-                    println!("  WINNER: CUTLASS v{v} ({us:.1} us, {spd:.2}x vs cuBLAS)");
+                    let pct = (1.0 - us / cublas_us) * 100.0;
+                    println!("  BEST: CUTLASS v{v} ({us:.1} us, {pct:.1}% faster than cuBLAS)");
                     (format!("v{v}"), us, spd)
                 }
                 Some((_, us)) => {
                     cublas_wins += 1;
-                    println!("  WINNER: cuBLAS ({cublas_us:.1} us, best CUTLASS was {us:.1} us)");
-                    ("cuBLAS".to_string(), cublas_us, 1.0)
+                    println!("  BEST: cuBLAS wins ({cublas_us:.1} us vs CUTLASS {us:.1} us) -- not stored");
+                    ("cublas".to_string(), cublas_us, 1.0)
                 }
                 None => {
                     cublas_wins += 1;
-                    println!("  WINNER: cuBLAS ({cublas_us:.1} us, no CUTLASS variant worked)");
-                    ("cuBLAS".to_string(), cublas_us, 1.0)
+                    println!("  NO CUTLASS VARIANT WORKED for M={m} N={n} K={k}");
+                    ("none".to_string(), cublas_us, 1.0)
                 }
             };
 
@@ -587,16 +604,21 @@ fn main() {
                     }
                 }
 
-                // cuBLAS baseline (plain GEMM, no residual fuse -- unfair comparison but logged for reference)
+                // cuBLAS baseline (plain GEMM, no residual add)
                 let cublas_us = bench_cublas(&cublas, cu_stream, m, n, k, a_ptr, b_ptr, c_ptr);
                 println!("  cuBLAS (GEMM only, no residual): {cublas_us:8.1} us");
 
                 total += 1;
                 match best {
-                    Some((v, us)) => {
+                    Some((v, us)) if us < cublas_us => {
                         cache.insert_oproj_residual(m, n, k, v);
                         cutlass_wins += 1;
-                        println!("  BEST: v{v} ({us:.1} us) -- fused GEMM+residual, always stored");
+                        let speedup = (1.0 - us / cublas_us) * 100.0;
+                        println!("  BEST: CUTLASS v{v} ({us:.1} us, {speedup:.1}% faster than cuBLAS)");
+                    }
+                    Some((_, us)) => {
+                        cublas_wins += 1;
+                        println!("  BEST: cuBLAS wins ({cublas_us:.1} us vs CUTLASS {us:.1} us) -- not stored");
                     }
                     None => {
                         cublas_wins += 1;

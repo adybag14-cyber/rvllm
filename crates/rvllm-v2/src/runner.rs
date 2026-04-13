@@ -161,7 +161,7 @@ impl GpuModelRunner {
             let gate_up = config.intermediate_size * 2;
             let inter = config.intermediate_size;
             let hgemm_shapes = [(max_t, qkv, h), (max_t, h, qkv), (max_t, gate_up, h), (max_t, h, inter), (max_t, config.vocab_size, h)];
-            let oproj_shapes = [(max_t, h, h)];
+            let oproj_shapes = [(max_t, h, h), (max_t, h, inter)];
             let gateup_shapes = [(max_t, gate_up, h)];
             let fp8_shapes = [(max_t, qkv, h), (max_t, h, qkv), (max_t, gate_up, h), (max_t, h, inter)];
             max_workspace_size(ck, &hgemm_shapes, &oproj_shapes, &gateup_shapes, &fp8_shapes)
@@ -365,6 +365,7 @@ impl GpuModelRunner {
         let autotune_ref: Option<&CutlassAutotuneCache> = autotune.as_ref();
 
         // 4. Layer loop -- layers write directly to double-buffer targets (zero copies)
+        let mut prev_fused = false;
         for layer_idx in 0..num_layers {
             let (key_cache, value_cache) = &kv_cache.gpu_cache[layer_idx];
 
@@ -414,25 +415,42 @@ impl GpuModelRunner {
                 fp8: fp8_refs,
             };
 
-            if layer_idx == 0 {
+            let fused = if layer_idx == 0 {
                 layers[layer_idx].forward_batched_v2(
                     embed_output, &attn, &layer_weights, scratch, None,
                     residual_a, down_a,
                     gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
-                )?;
+                )?
             } else if layer_idx % 2 == 1 {
-                layers[layer_idx].forward_batched_v2(
-                    &*residual_a, &attn, &layer_weights, scratch, Some(&*down_a),
-                    residual_b, down_b,
-                    gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
-                )?;
+                if prev_fused {
+                    layers[layer_idx].forward_batched_v2(
+                        &*down_a, &attn, &layer_weights, scratch, None,
+                        residual_b, down_b,
+                        gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                    )?
+                } else {
+                    layers[layer_idx].forward_batched_v2(
+                        &*residual_a, &attn, &layer_weights, scratch, Some(&*down_a),
+                        residual_b, down_b,
+                        gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                    )?
+                }
             } else {
-                layers[layer_idx].forward_batched_v2(
-                    &*residual_b, &attn, &layer_weights, scratch, Some(&*down_b),
-                    residual_a, down_a,
-                    gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
-                )?;
-            }
+                if prev_fused {
+                    layers[layer_idx].forward_batched_v2(
+                        &*down_b, &attn, &layer_weights, scratch, None,
+                        residual_a, down_a,
+                        gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                    )?
+                } else {
+                    layers[layer_idx].forward_batched_v2(
+                        &*residual_b, &attn, &layer_weights, scratch, Some(&*down_b),
+                        residual_a, down_a,
+                        gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                    )?
+                }
+            };
+            prev_fused = fused;
         }
 
         // Final output: last odd layer wrote to b, last even (>0) layer wrote to a
@@ -445,10 +463,17 @@ impl GpuModelRunner {
             };
 
         // 5. Final RMSNorm
-        layers[0].fused_residual_rmsnorm_pub(
-            final_residual, final_down, final_norm_weight,
-            num_tokens, hidden_size, final_normed, residual_tmp,
-        )?;
+        if prev_fused {
+            layers[0].rms_norm_pub(
+                final_down, final_norm_weight,
+                num_tokens, hidden_size, final_normed,
+            )?;
+        } else {
+            layers[0].fused_residual_rmsnorm_pub(
+                final_residual, final_down, final_norm_weight,
+                num_tokens, hidden_size, final_normed, residual_tmp,
+            )?;
+        }
 
         // 6. LM head: f16 hidden x f16 lm_head -> f32 logits
         cublas.hgemm_f32_output(
@@ -512,6 +537,7 @@ impl GpuModelRunner {
         let cutlass_ref: Option<&CutlassKernels> = cutlass.as_deref();
         let autotune_ref: Option<&CutlassAutotuneCache> = autotune.as_ref();
 
+        let mut prev_fused = false;
         for layer_idx in 0..num_layers {
             let (key_cache, value_cache) = &kv_cache.gpu_cache[layer_idx];
             let attn = AttentionMeta {
@@ -557,25 +583,42 @@ impl GpuModelRunner {
                 post_attention_layernorm_weight: &weights.post_attn_layernorm[layer_idx],
                 fp8: fp8_refs,
             };
-            if layer_idx == 0 {
+            let fused = if layer_idx == 0 {
                 layers[layer_idx].forward_batched_v2(
                     embed_output, &attn, &layer_weights, scratch, None,
                     residual_a, down_a,
                     gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
-                )?;
+                )?
             } else if layer_idx % 2 == 1 {
-                layers[layer_idx].forward_batched_v2(
-                    &*residual_a, &attn, &layer_weights, scratch, Some(&*down_a),
-                    residual_b, down_b,
-                    gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
-                )?;
+                if prev_fused {
+                    layers[layer_idx].forward_batched_v2(
+                        &*down_a, &attn, &layer_weights, scratch, None,
+                        residual_b, down_b,
+                        gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                    )?
+                } else {
+                    layers[layer_idx].forward_batched_v2(
+                        &*residual_a, &attn, &layer_weights, scratch, Some(&*down_a),
+                        residual_b, down_b,
+                        gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                    )?
+                }
             } else {
-                layers[layer_idx].forward_batched_v2(
-                    &*residual_b, &attn, &layer_weights, scratch, Some(&*down_b),
-                    residual_a, down_a,
-                    gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
-                )?;
-            }
+                if prev_fused {
+                    layers[layer_idx].forward_batched_v2(
+                        &*down_b, &attn, &layer_weights, scratch, None,
+                        residual_a, down_a,
+                        gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                    )?
+                } else {
+                    layers[layer_idx].forward_batched_v2(
+                        &*residual_b, &attn, &layer_weights, scratch, Some(&*down_b),
+                        residual_a, down_a,
+                        gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                    )?
+                }
+            };
+            prev_fused = fused;
         }
 
         let last_wrote_to_b = num_layers > 1 && (num_layers - 1) % 2 == 1;
@@ -586,10 +629,17 @@ impl GpuModelRunner {
                 (residual_a, down_a)
             };
 
-        layers[0].fused_residual_rmsnorm_pub(
-            final_residual, final_down, final_norm_weight,
-            num_tokens, hidden_size, final_normed, residual_tmp,
-        )?;
+        if prev_fused {
+            layers[0].rms_norm_pub(
+                final_down, final_norm_weight,
+                num_tokens, hidden_size, final_normed,
+            )?;
+        } else {
+            layers[0].fused_residual_rmsnorm_pub(
+                final_residual, final_down, final_norm_weight,
+                num_tokens, hidden_size, final_normed, residual_tmp,
+            )?;
+        }
 
         // LM head GEMM
         cublas.hgemm_f32_output(
@@ -995,6 +1045,7 @@ impl GpuModelRunner {
         let cutlass_ref: Option<&CutlassKernels> = cutlass.as_deref();
         let autotune_ref: Option<&CutlassAutotuneCache> = autotune.as_ref();
 
+        let mut prev_fused = false;
         for layer_idx in 0..num_layers {
             let (key_cache, value_cache) = &kv_cache.gpu_cache[layer_idx];
             let attn = AttentionMeta {
@@ -1040,25 +1091,42 @@ impl GpuModelRunner {
                 post_attention_layernorm_weight: &weights.post_attn_layernorm[layer_idx],
                 fp8: fp8_refs,
             };
-            if layer_idx == 0 {
+            let fused = if layer_idx == 0 {
                 layers[layer_idx].forward_batched_v2(
                     embed_output, &attn, &layer_weights, scratch, None,
                     residual_a, down_a,
                     gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
-                )?;
+                )?
             } else if layer_idx % 2 == 1 {
-                layers[layer_idx].forward_batched_v2(
-                    &*residual_a, &attn, &layer_weights, scratch, Some(&*down_a),
-                    residual_b, down_b,
-                    gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
-                )?;
+                if prev_fused {
+                    layers[layer_idx].forward_batched_v2(
+                        &*down_a, &attn, &layer_weights, scratch, None,
+                        residual_b, down_b,
+                        gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                    )?
+                } else {
+                    layers[layer_idx].forward_batched_v2(
+                        &*residual_a, &attn, &layer_weights, scratch, Some(&*down_a),
+                        residual_b, down_b,
+                        gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                    )?
+                }
             } else {
-                layers[layer_idx].forward_batched_v2(
-                    &*residual_b, &attn, &layer_weights, scratch, Some(&*down_b),
-                    residual_a, down_a,
-                    gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
-                )?;
-            }
+                if prev_fused {
+                    layers[layer_idx].forward_batched_v2(
+                        &*down_b, &attn, &layer_weights, scratch, None,
+                        residual_a, down_a,
+                        gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                    )?
+                } else {
+                    layers[layer_idx].forward_batched_v2(
+                        &*residual_b, &attn, &layer_weights, scratch, Some(&*down_b),
+                        residual_a, down_a,
+                        gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                    )?
+                }
+            };
+            prev_fused = fused;
         }
 
         let last_wrote_to_b = num_layers > 1 && (num_layers - 1) % 2 == 1;
@@ -1069,10 +1137,17 @@ impl GpuModelRunner {
                 (residual_a, down_a)
             };
 
-        layers[0].fused_residual_rmsnorm_pub(
-            final_residual, final_down, final_norm_weight,
-            num_tokens, hidden_size, final_normed, residual_tmp,
-        )?;
+        if prev_fused {
+            layers[0].rms_norm_pub(
+                final_down, final_norm_weight,
+                num_tokens, hidden_size, final_normed,
+            )?;
+        } else {
+            layers[0].fused_residual_rmsnorm_pub(
+                final_residual, final_down, final_norm_weight,
+                num_tokens, hidden_size, final_normed, residual_tmp,
+            )?;
+        }
 
         // LM head GEMM
         cublas.hgemm_f32_output(

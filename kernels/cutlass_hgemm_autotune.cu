@@ -637,7 +637,7 @@ HGEMM_SWIZZLE_VARIANT(40,  64, 256, 64, 1,2,1, WS, 2)
 HGEMM_SWIZZLE_VARIANT(41,  64, 256, 64, 1,2,1, WS, 4)
 
 // ---------------------------------------------------------------------------
-// Split-K variants for M=1 decode (v42-v50) -- Cooperative only
+// Split-K variants for M>=128 decode (v42-v50) -- Cooperative only
 // ---------------------------------------------------------------------------
 HGEMM_SPLITK_VARIANT(42, 128, 256, 64, 1,1,1, 2)
 HGEMM_SPLITK_VARIANT(43, 128, 256, 64, 1,1,1, 4)
@@ -656,3 +656,33 @@ HGEMM_STREAMK_VARIANT(51, 256, 128, 64, 1,1,1)
 HGEMM_STREAMK_VARIANT(52, 128, 128, 64, 1,1,1)
 HGEMM_STREAMK_VARIANT(53, 128, 256, 64, 1,1,1)
 HGEMM_STREAMK_VARIANT(54, 256, 256, 64, 1,1,1)
+
+// ---------------------------------------------------------------------------
+// M=64 WGMMA additional WS/PP variants (v55-v62)
+// Cooperative/split-K/stream-K require M>=128, so M=64 is WS/PP only.
+// Strategy: maximize N-tile variety + stage/swizzle combos for the autotune
+// to find optimal configs per shape.
+// ---------------------------------------------------------------------------
+
+// Wide-K variants for down_proj (K=18944) -- more K per tile = fewer K-iterations
+HGEMM_STAGED_VARIANT(55,  64, 256, 64, 1,1,1, WS, 2)   // M=64, wide N, 2 stages
+HGEMM_STAGED_VARIANT(56,  64, 256, 64, 1,1,1, WS, 4)   // M=64, wide N, 4 stages
+HGEMM_STAGED_VARIANT(57,  64, 128, 64, 1,1,1, WS, 2)   // M=64, medium N, 2 stages
+HGEMM_STAGED_VARIANT(58,  64, 128, 64, 1,1,1, WS, 4)   // M=64, medium N, 4 stages
+// PingPong with clusters -- overlap producer/consumer + N-parallelism
+HGEMM_VARIANT(59,  64, 256, 64, 1,2,1, PP)              // PP + N-clustered
+HGEMM_VARIANT(60,  64, 128, 64, 1,2,1, PP)              // PP + N-clustered, medium N
+// Swizzle for M=64 without cluster
+HGEMM_SWIZZLE_VARIANT(61,  64, 256, 64, 1,1,1, WS, 2)  // swizzle 2, no cluster
+HGEMM_SWIZZLE_VARIANT(62,  64, 256, 64, 1,1,1, WS, 4)  // swizzle 4, no cluster
+
+// ---------------------------------------------------------------------------
+// 128xN split-K for M=32 decode (v63-v68)
+// M=32 rounds to M=128 tile (75% M-waste) but split-K fills all 132 SMs.
+// WGMMA 4x throughput + TMA pipeline may compensate for the M-waste.
+// The autotune benchmarks them head-to-head with cuBLAS SM80 tiles.
+// ---------------------------------------------------------------------------
+HGEMM_SPLITK_VARIANT(63, 128, 128, 64, 1,1,1, 16)
+HGEMM_SPLITK_VARIANT(64, 128, 256, 64, 1,1,1, 16)
+HGEMM_STREAMK_VARIANT(65, 128, 256, 64, 1,2,1)   // stream-K + 2-SM N-cluster
+HGEMM_STREAMK_VARIANT(66, 128, 128, 64, 1,2,1)   // stream-K + 2-SM N-cluster

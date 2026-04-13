@@ -170,9 +170,9 @@ fn cutlass_fp8_gemm_dispatch(
 }
 
 // ===================================================================
-// Autotuned CUTLASS SM90 WGMMA -> cuBLASLt -> cuBLAS dispatch for F16
-// Autotune picks the winner per shape. If CUTLASS has no entry for this
-// (M,N,K), cuBLAS won the benchmark -- use it.
+// Autotuned CUTLASS SM90 WGMMA dispatch for F16
+// On SM90: always use CUTLASS WGMMA (cuBLAS may pick SM80 mma.sync).
+// No CUTLASS loaded: cuBLASLt/cuBLAS path (non-SM90 builds).
 // ===================================================================
 
 fn f16_gemm_autotuned(
@@ -188,22 +188,27 @@ fn f16_gemm_autotuned(
     workspace: &mut CudaSlice<u8>,
 ) -> Result<()> {
     if let (Some(ck), Some(at)) = (cutlass, autotune) {
-        if let Some(variant) = at.best_hgemm(m, n, k) {
-            let stream_ptr = stream.cu_stream() as u64;
-            let ws_len = workspace.len();
-            let (in_ptr, _g1) = input.device_ptr(stream);
-            let (w_ptr, _g2) = weight.device_ptr(stream);
-            let (out_ptr, _g3) = output.device_ptr_mut(stream);
-            let (wk_ptr, _g4) = workspace.device_ptr_mut(stream);
-            return ck.hgemm_variant(
-                variant,
-                out_ptr as u64, in_ptr as u64, w_ptr as u64,
-                m as i32, n as i32, k as i32,
-                wk_ptr as u64, ws_len, stream_ptr,
-            ).map_err(|e| LLMError::GpuError(e));
-        }
+        let variant = match at.best_hgemm(m, n, k) {
+            Some(v) => v,
+            None => {
+                // No CUTLASS entry -- cuBLAS wins for this shape (bandwidth-bound)
+                return hgemm_dispatch(lt_ops, cublas, m, n, k, 1.0, input, weight, 0.0, output);
+            }
+        };
+        let stream_ptr = stream.cu_stream() as u64;
+        let ws_len = workspace.len();
+        let (in_ptr, _g1) = input.device_ptr(stream);
+        let (w_ptr, _g2) = weight.device_ptr(stream);
+        let (out_ptr, _g3) = output.device_ptr_mut(stream);
+        let (wk_ptr, _g4) = workspace.device_ptr_mut(stream);
+        return ck.hgemm_variant(
+            variant,
+            out_ptr as u64, in_ptr as u64, w_ptr as u64,
+            m as i32, n as i32, k as i32,
+            wk_ptr as u64, ws_len, stream_ptr,
+        ).map_err(|e| LLMError::GpuError(e));
     }
-    // cuBLAS won the autotune for this shape, or no CUTLASS loaded
+    // No CUTLASS loaded -- cuBLAS path (non-SM90 build)
     hgemm_dispatch(lt_ops, cublas, m, n, k, 1.0, input, weight, 0.0, output)
 }
 
@@ -277,6 +282,118 @@ pub enum GemmStrategy {
     Cutlass,
     /// cuBLAS for everything.
     Cublas,
+}
+
+// ===================================================================
+// LayerPlan -- pre-computed dispatch FSM, built once at init
+// ===================================================================
+
+#[derive(Debug, Clone, Copy)]
+pub enum GemmOp {
+    CuBLAS,
+    CutlassHgemm(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum OprojOp {
+    CuBLAS,
+    Fused(usize),  // oproj_residual variant -- output = GEMM + residual
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum GateUpOp {
+    CuBLAS,
+    FusedSilu(usize),  // gateup_silu variant -- output = SiLU(GEMM)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum DownOp {
+    CuBLAS,
+    FusedResidual(usize),  // oproj_residual variant -- output = GEMM + residual
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Fp8Path {
+    CutlassFp8,
+    CuBLASLtFp8,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum LayerPlan {
+    Fp8 { path: Fp8Path },
+    F16 {
+        qkv: GemmOp,
+        oproj: OprojOp,
+        gateup: GateUpOp,
+        down: DownOp,
+    },
+}
+
+impl LayerPlan {
+    /// Is down_proj fused with residual? (next layer skips residual add in input norm)
+    pub fn down_fused(&self) -> bool {
+        matches!(self, LayerPlan::F16 { down: DownOp::FusedResidual(_), .. })
+    }
+
+    /// Build optimal dispatch plan from autotune cache and model config.
+    /// Called once at model load. No runtime fallbacks -- every step is locked in.
+    pub fn build(
+        cfg: &LayerConfig,
+        max_tokens: usize,
+        has_fp8: bool,
+        has_cutlass: bool,
+        autotune: Option<&CutlassAutotuneCache>,
+    ) -> Self {
+        // FP8 weights -> FP8 path (CUTLASS FP8 if available, else cuBLASLt)
+        if has_fp8 {
+            return LayerPlan::Fp8 {
+                path: if has_cutlass { Fp8Path::CutlassFp8 } else { Fp8Path::CuBLASLtFp8 },
+            };
+        }
+
+        let h = cfg.hidden_size;
+        let qkv = cfg.qkv_dim();
+        let q = cfg.q_dim();
+        let inter = cfg.intermediate_size;
+        let gate_up = cfg.gate_up_dim();
+
+        // Use representative M for dispatch decision (decode = small M)
+        // Autotune nearest-M lookup handles prefill automatically
+        let m = max_tokens.min(32);
+
+        let at = autotune;
+
+        // QKV: check if CUTLASS hgemm has an entry (hybrid policy: only stored when CUTLASS wins)
+        let qkv_op = match at.and_then(|a| a.best_hgemm(m, qkv, h)) {
+            Some(v) if has_cutlass => GemmOp::CutlassHgemm(v),
+            _ => GemmOp::CuBLAS,
+        };
+
+        // O-proj: check oproj_residual entry (only stored when CUTLASS beats cuBLAS)
+        let oproj_op = match at.and_then(|a| a.best_oproj_residual(m, h, q)) {
+            Some(v) if has_cutlass => OprojOp::Fused(v),
+            _ => OprojOp::CuBLAS,
+        };
+
+        // GateUp+SiLU: check gateup_silu entry
+        let gateup_op = match at.and_then(|a| a.best_gateup_silu(m, gate_up, h)) {
+            Some(v) if has_cutlass => GateUpOp::FusedSilu(v),
+            _ => GateUpOp::CuBLAS,
+        };
+
+        // Down proj: check oproj_residual entry for down shape (only if CUTLASS wins)
+        let down_op = match at.and_then(|a| a.best_oproj_residual(m, h, inter)) {
+            Some(v) if has_cutlass => DownOp::FusedResidual(v),
+            _ => DownOp::CuBLAS,
+        };
+
+        LayerPlan::F16 {
+            qkv: qkv_op,
+            oproj: oproj_op,
+            gateup: gateup_op,
+            down: down_op,
+        }
+    }
 }
 
 // ===================================================================
@@ -642,7 +759,7 @@ impl GpuTransformerLayer {
         autotune: Option<&CutlassAutotuneCache>,
         cublas: &CublasHandle,
         lt_ops: Option<&CublasLtOps>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let cfg = &self.config;
         let num_tokens = attn.num_tokens;
         let hidden_size = cfg.hidden_size;
@@ -868,6 +985,7 @@ impl GpuTransformerLayer {
         }
 
         // SiLU activation + Down projection GEMM
+        let mut used_fused_downproj = false;
         if let (Some(ck), Some(fp8w)) = (cutlass, &weights.fp8) {
             // CUTLASS FP8: fused silu+quant -> CUTLASS GEMM (skips separate silu kernel)
             self.fused_silu_mul_fp8_quant(
@@ -914,13 +1032,31 @@ impl GpuTransformerLayer {
                     &mut scratch.fp8_absmax,
                 )?;
             } else {
-                f16_gemm_autotuned(cutlass, autotune, lt_ops, cublas, &self.stream,
-                    num_tokens, hidden_size, intermediate, &scratch.silu_out, weights.down_proj_weight,
-                    &mut *down_write, &mut scratch.cutlass_workspace)?;
+                // F16: try fused down_proj + residual (GEMM + residual in epilogue)
+                // Uses same oproj_residual CUTLASS kernel: D = GEMM(A,B) + C
+                // down_write = GEMM(silu_out, down_weight) + residual_write
+                // Saves one HBM round-trip: next layer reads only down_write (full residual)
+                if let (Some(ck), Some(at)) = (cutlass, autotune) {
+                    if let Some(variant) = at.best_oproj_residual(num_tokens, hidden_size, intermediate) {
+                        f16_oproj_residual_autotuned(
+                            ck, &self.stream, variant,
+                            num_tokens, hidden_size, intermediate,
+                            &scratch.silu_out, weights.down_proj_weight,
+                            &*residual_write, down_write,
+                            &mut scratch.cutlass_workspace,
+                        )?;
+                        used_fused_downproj = true;
+                    }
+                }
+                if !used_fused_downproj {
+                    f16_gemm_autotuned(cutlass, autotune, lt_ops, cublas, &self.stream,
+                        num_tokens, hidden_size, intermediate, &scratch.silu_out, weights.down_proj_weight,
+                        &mut *down_write, &mut scratch.cutlass_workspace)?;
+                }
             }
         }
 
-        Ok(())
+        Ok(used_fused_downproj)
     }
 
     // =================================================================

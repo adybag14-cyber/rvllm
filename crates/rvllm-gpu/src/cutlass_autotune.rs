@@ -42,17 +42,40 @@ fn shape_key(m: usize, n: usize, k: usize) -> String {
     format!("{m}_{n}_{k}")
 }
 
+/// Find the best variant for a given (M, N, K) from the cache.
+/// Exact M match first; if no exact match, uses the nearest M with the same N,K
+/// (handles arbitrary prefill lengths not in the autotune set).
+fn lookup_nearest(map: &HashMap<String, usize>, m: usize, n: usize, k: usize) -> Option<usize> {
+    if let Some(&v) = map.get(&shape_key(m, n, k)) {
+        return Some(v);
+    }
+    let suffix = format!("_{n}_{k}");
+    let mut best: Option<(usize, usize)> = None;
+    for (key, &variant) in map {
+        if !key.ends_with(&suffix) { continue; }
+        if let Ok(cached_m) = key[..key.len() - suffix.len()].parse::<usize>() {
+            let dist = cached_m.abs_diff(m);
+            match best {
+                None => best = Some((dist, variant)),
+                Some((bd, _)) if dist < bd => best = Some((dist, variant)),
+                _ => {}
+            }
+        }
+    }
+    best.map(|(_, v)| v)
+}
+
 impl CutlassAutotuneCache {
     pub fn best_hgemm(&self, m: usize, n: usize, k: usize) -> Option<usize> {
-        self.hgemm.get(&shape_key(m, n, k)).copied()
+        lookup_nearest(&self.hgemm, m, n, k)
     }
 
     pub fn best_oproj_residual(&self, m: usize, n: usize, k: usize) -> Option<usize> {
-        self.oproj_residual.get(&shape_key(m, n, k)).copied()
+        lookup_nearest(&self.oproj_residual, m, n, k)
     }
 
     pub fn best_gateup_silu(&self, m: usize, n: usize, k: usize) -> Option<usize> {
-        self.gateup_silu.get(&shape_key(m, n, k)).copied()
+        lookup_nearest(&self.gateup_silu, m, n, k)
     }
 
     pub fn insert_hgemm(&mut self, m: usize, n: usize, k: usize, variant: usize) {
@@ -68,7 +91,7 @@ impl CutlassAutotuneCache {
     }
 
     pub fn best_fp8_gemm(&self, m: usize, n: usize, k: usize) -> Option<usize> {
-        self.fp8_gemm.get(&shape_key(m, n, k)).copied()
+        lookup_nearest(&self.fp8_gemm, m, n, k)
     }
 
     pub fn insert_fp8_gemm(&mut self, m: usize, n: usize, k: usize, variant: usize) {
@@ -534,9 +557,10 @@ pub fn bench_cublas_hgemm(
     time.ok()
 }
 
-/// Autotune HGEMM: benchmark all CUTLASS variants vs cuBLAS.
+/// Autotune HGEMM: benchmark all CUTLASS SM90 WGMMA variants vs cuBLAS.
 /// Returns the best CUTLASS variant only if it beats cuBLAS.
-/// Returns None if cuBLAS wins -- runtime uses cuBLAS for that shape.
+/// Small-M bandwidth-bound GEMMs (N=3584) are genuinely faster on cuBLAS
+/// SM80 tiles due to less overhead and zero M-padding waste.
 #[cfg(feature = "cuda")]
 pub fn autotune_hgemm_vs_cublas(
     cutlass: &CutlassKernels,
@@ -568,7 +592,7 @@ pub fn autotune_hgemm_vs_cublas(
             m, n, k,
             cublas_us = format!("{:.1}", cublas_time),
             best_cutlass_us = format!("{:.1}", cutlass_best.1),
-            "cuBLAS wins for hgemm"
+            "cuBLAS wins for hgemm M={m} N={n} K={k}",
         );
         None
     }
