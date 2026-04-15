@@ -10,12 +10,12 @@ set -euo pipefail
 #   MODEL          model name (default: Qwen/Qwen2.5-7B)
 #   NUM_PROMPTS    total prompts (default: 500)
 #   CONCURRENT     concurrency level (default: 32)
-#   MAX_TOKENS     max output tokens (default: 256)
+#   MAX_TOKENS     max output tokens (default: 512)
 
 MODEL=${MODEL:-"Qwen/Qwen2.5-7B"}
 NUM_PROMPTS=${NUM_PROMPTS:-500}
 CONCURRENT=${CONCURRENT:-32}
-MAX_TOKENS=${MAX_TOKENS:-256}
+MAX_TOKENS=${MAX_TOKENS:-512}
 WARMUP_PROMPTS=${WARMUP_PROMPTS:-100}
 
 RVLLM_INSTANCE=${RVLLM_INSTANCE:-$(cat deploy/.instance_id_rvllm 2>/dev/null || echo "")}

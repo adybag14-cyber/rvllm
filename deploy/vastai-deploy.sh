@@ -135,12 +135,12 @@ bench_path() {
     fi
     sleep 1
 
-    # Bench: 3 runs, 256 tokens each
+    # Bench: 3 runs, 512 tokens each
     for run in 1 2 3; do
         local START=\$(date +%s%N)
         local RESP=\$(curl -s -X POST http://localhost:8000/v1/completions \
             -H "Content-Type: application/json" \
-            -d '{"model":"$MODEL","prompt":"The theory of general relativity states that","max_tokens":256,"temperature":0.0}' \
+            -d '{"model":"$MODEL","prompt":"The theory of general relativity states that","max_tokens":512,"temperature":0.0}' \
             --max-time 120)
         local END=\$(date +%s%N)
         local TOKS=\$(echo "\$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('usage',{}).get('completion_tokens',0))" 2>/dev/null || echo 0)
