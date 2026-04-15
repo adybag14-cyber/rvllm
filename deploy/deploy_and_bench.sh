@@ -211,13 +211,13 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
     step "Step 2: Build rvllm-v2"
     BUILD_START=$(date +%s)
 
-    cargo build --release -p rvllm-v2 --bin bench \
+    cargo build --release -p rvllm-v2 --bin rvllm-v2-bench \
         --manifest-path "$REPO_DIR/Cargo.toml" 2>&1 | tail -5
 
     BUILD_END=$(date +%s)
     BUILD_SECS=$((BUILD_END - BUILD_START))
 
-    BINARY="$REPO_DIR/target/release/bench"
+    BINARY="$REPO_DIR/target/release/rvllm-v2-bench"
     if [[ -x "$BINARY" ]]; then
         pass "Build complete in ${BUILD_SECS}s -> ${BINARY}"
     else
@@ -230,9 +230,9 @@ else
     echo ""
 fi
 
-BINARY="$REPO_DIR/target/release/bench"
+BINARY="$REPO_DIR/target/release/rvllm-v2-bench"
 if [[ ! -x "$BINARY" ]]; then
-    fail "bench binary not found. Run without --skip-build."
+    fail "rvllm-v2-bench binary not found. Run without --skip-build."
     exit 1
 fi
 
