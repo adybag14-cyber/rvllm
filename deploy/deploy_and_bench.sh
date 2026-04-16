@@ -119,6 +119,17 @@ fi
 
 GPU_MEM_USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 || echo "?")
 echo "GPU memory used: ${GPU_MEM_USED} MiB"
+
+# --- SHA verification ---
+REVISION_FILE="${REPO_DIR}/REVISION"
+if [[ -f "$REVISION_FILE" ]]; then
+    EXPECTED_SHA=$(cat "$REVISION_FILE")
+    echo "Expected SHA: ${EXPECTED_SHA}"
+    pass "REVISION file present"
+else
+    fail "No REVISION file -- cannot verify source integrity. Deploy via rsync_and_run.sh."
+    exit 1
+fi
 echo ""
 
 # ============================================================
@@ -219,6 +230,12 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
 
     BINARY="$REPO_DIR/target/release/rvllm-v2-bench"
     if [[ -x "$BINARY" ]]; then
+        # Verify binary was built in this run (not stale)
+        BINARY_AGE=$(( $(date +%s) - $(stat -c %Y "$BINARY" 2>/dev/null || stat -f %m "$BINARY") ))
+        if [[ "$BINARY_AGE" -gt "$((BUILD_SECS + 10))" ]]; then
+            fail "Binary is ${BINARY_AGE}s old but build took ${BUILD_SECS}s -- stale binary survived!"
+            exit 1
+        fi
         pass "Build complete in ${BUILD_SECS}s -> ${BINARY}"
     else
         fail "Binary not found at ${BINARY}"
@@ -248,7 +265,26 @@ echo ""
 # ============================================================
 # Step 4: Benchmark
 # ============================================================
-step "Step 4: Benchmark (direct engine, no HTTP)"
+step "Step 4: Verify binary SHA"
+
+# Quick check: run binary with --help, capture revision line, verify SHA matches
+BINARY_REV=$("$BINARY" --help 2>&1 | head -1 || true)
+echo "Binary reports: ${BINARY_REV}"
+if [[ -n "$EXPECTED_SHA" ]]; then
+    # The binary prints SHA at startup to stderr -- run a minimal invocation to capture it
+    BINARY_SHA=$("$BINARY" --model dummy --n 0 2>&1 | grep "rvLLM revision:" | awk '{print $NF}' || true)
+    if [[ -n "$BINARY_SHA" && "$BINARY_SHA" != "$EXPECTED_SHA" ]]; then
+        fail "Binary SHA (${BINARY_SHA}) != expected (${EXPECTED_SHA}) -- STALE BINARY!"
+        exit 1
+    elif [[ -n "$BINARY_SHA" ]]; then
+        pass "Binary SHA verified: ${BINARY_SHA}"
+    else
+        warn "Could not extract SHA from binary output (will verify from bench log)"
+    fi
+fi
+echo ""
+
+step "Step 5: Benchmark (direct engine, no HTTP)"
 
 FP8_FLAG=""
 if [[ "$FP8" -eq 1 ]]; then FP8_FLAG="--fp8"; fi

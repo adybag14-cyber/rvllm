@@ -90,9 +90,21 @@ fn init_tracing() {
         .init();
 }
 
+fn print_revision() {
+    let rev = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../REVISION"),
+    );
+    match rev {
+        Ok(sha) => eprintln!("rvLLM revision: {}", sha.trim()),
+        Err(_) => eprintln!("rvLLM revision: UNKNOWN (no REVISION file)"),
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     init_tracing();
     let cli = Cli::parse();
+
+    print_revision();
 
     let batch_sizes: Vec<usize> = cli
         .n

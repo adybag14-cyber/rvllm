@@ -21,8 +21,17 @@ REMOTE_DIR="/root/rvllm"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+LOCAL_SHA=$(git -C "${REPO_DIR}" rev-parse HEAD)
 echo "Target: root@${HOST}:${PORT} -> ${REMOTE_DIR}"
+echo "Local SHA: ${LOCAL_SHA}"
 echo ""
+
+# Write REVISION file so the remote can verify
+echo "${LOCAL_SHA}" > "${REPO_DIR}/REVISION"
+
+# --- Nuke stale binary so old code can never run ---
+echo "Removing stale binary on remote..."
+ssh ${SSH_OPTS} "root@${HOST}" "rm -f ${REMOTE_DIR}/target/release/rvllm-v2-bench" 2>/dev/null || true
 
 # --- Rsync source code ---
 echo "Syncing code..."
@@ -45,3 +54,6 @@ ssh ${SSH_OPTS} "root@${HOST}" "
     cd ${REMOTE_DIR}
     bash deploy/deploy_and_bench.sh ${EXTRA_ARGS}
 "
+
+# Clean up REVISION file locally
+rm -f "${REPO_DIR}/REVISION"

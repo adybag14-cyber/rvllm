@@ -11,6 +11,7 @@ target/
 .env
 .instance_id
 results_*.json
+REVISION
 __pycache__/
 *.pyc
 .mypy_cache/
