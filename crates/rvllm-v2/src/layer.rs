@@ -147,32 +147,15 @@ pub(crate) fn cutlass_fp8_gemm_dispatch(
     let (out_ptr, _) = output_f16.device_ptr_mut(stream);
     let (wk_ptr, _) = workspace.device_ptr_mut(stream);
 
-    if let Some(at) = autotune {
-        if let Some(variant) = at.best_fp8_gemm(m, n, k) {
-            return cutlass.fp8_gemm_variant(
-                variant,
-                out_ptr as u64, act_ptr as u64, w_ptr as u64,
-                as_ptr as u64, ws_ptr as u64,
-                m as i32, n as i32, k as i32,
-                wk_ptr as u64, workspace.len(),
-                stream_ptr,
-            ).map_err(|e| LLMError::GpuError(e));
-        }
-    }
+    let variant = autotune
+        .and_then(|at| at.best_fp8_gemm(m, n, k))
+        .unwrap_or_else(|| panic!(
+            "FP8 GEMM: no autotune entry for shape M={m}, N={n}, K={k}. \
+             Run autotune-cutlass to populate the cache."
+        ));
 
-    // Small tile (64x128x128) for decode: better tile utilization when M <= 64
-    if m <= 64 && cutlass.has_fp8_gemm_small() {
-        return cutlass.fp8_gemm_small(
-            out_ptr as u64, act_ptr as u64, w_ptr as u64,
-            as_ptr as u64, ws_ptr as u64,
-            m as i32, n as i32, k as i32,
-            wk_ptr as u64, workspace.len(),
-            stream_ptr,
-        ).map_err(|e| LLMError::GpuError(e));
-    }
-
-    // Default CUTLASS FP8 kernel
-    cutlass.fp8_gemm(
+    cutlass.fp8_gemm_variant(
+        variant,
         out_ptr as u64, act_ptr as u64, w_ptr as u64,
         as_ptr as u64, ws_ptr as u64,
         m as i32, n as i32, k as i32,
