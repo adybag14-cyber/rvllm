@@ -1,0 +1,14 @@
+[package]
+name = "rvllm-kernels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# rvllm-kernels: PTX/CUBIN/.so wrappers, kernel signatures, artifact manifest.
+# See v3/specs/01-architecture.md, 16-deploy.md.
+
+[dependencies]
+rvllm-core = { workspace = true }
+rvllm-mem = { workspace = true }

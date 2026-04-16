@@ -1,0 +1,18 @@
+[package]
+name = "rvllm-fused"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# rvllm-fused: 8 fused kernels (norm+quant, rope+kv, silu+quant, argmax,
+# residual_add, embedding_gather). NO megakernels. See v3/specs/12-fused.md.
+# Every kernel ships: .cu source + Rust binding + pure-Rust f32 reference
+# + cosine-vs-reference unit test (>=0.999 for f16).
+
+[dependencies]
+rvllm-core = { workspace = true }
+rvllm-mem = { workspace = true }
+rvllm-kernels = { workspace = true }
+half = { workspace = true }

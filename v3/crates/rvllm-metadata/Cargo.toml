@@ -1,0 +1,14 @@
+[package]
+name = "rvllm-metadata"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# rvllm-metadata: ONE canonical layout per (bucket, max_blocks_per_seq).
+# Frozen at engine init. Single upload path. See v3/specs/08-metadata.md.
+
+[dependencies]
+rvllm-core = { workspace = true }
+rvllm-mem = { workspace = true }

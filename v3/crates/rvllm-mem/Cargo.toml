@@ -1,0 +1,14 @@
+[package]
+name = "rvllm-mem"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# rvllm-mem: HBM arena, Region, Tensor, Stream, Event, CaptureScope, GraphSafe,
+#            PinnedPool, KvLayout. See v3/specs/{04,05}.md.
+
+[dependencies]
+rvllm-core = { workspace = true }
+half = { workspace = true }

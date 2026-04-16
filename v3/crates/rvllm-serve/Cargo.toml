@@ -1,0 +1,20 @@
+[package]
+name = "rvllm-serve"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# rvllm-serve: HTTP serving loop. Reuses step_launch/step_collect.
+# OpenAI-compatible API. See v3/specs/05-concurrency.md for the tokio -> worker channel design.
+
+[[bin]]
+name = "rvllm-server"
+path = "src/main.rs"
+
+[dependencies]
+rvllm-core = { workspace = true }
+rvllm-runtime = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

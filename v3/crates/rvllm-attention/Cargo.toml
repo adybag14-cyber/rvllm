@@ -1,0 +1,15 @@
+[package]
+name = "rvllm-attention"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# rvllm-attention: FA3 SM90 paged decode + prefill. No PTX fallback.
+# Engine refuses to start without libfa3_kernels.so. See v3/specs/10-attention.md.
+
+[dependencies]
+rvllm-core = { workspace = true }
+rvllm-mem = { workspace = true }
+rvllm-kernels = { workspace = true }

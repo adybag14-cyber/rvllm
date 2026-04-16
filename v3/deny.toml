@@ -1,0 +1,51 @@
+# cargo-deny config — enforces the crate DAG declared in IMPL_PLAN.md
+# Install: cargo install cargo-deny
+# Run:     cargo deny check
+
+[graph]
+all-features = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+# DAG enforcement: each crate may only depend on crates strictly below it.
+# Ordered bottom-up; violations become a `deny = [...]` entry.
+# rvllm-core:     (no rvllm-* deps)
+# rvllm-mem:      rvllm-core
+# rvllm-kernels:  rvllm-core, rvllm-mem
+# rvllm-cutlass:  rvllm-core, rvllm-mem, rvllm-kernels
+# rvllm-attention:rvllm-core, rvllm-mem, rvllm-kernels
+# rvllm-fused:    rvllm-core, rvllm-mem, rvllm-kernels
+# rvllm-metadata: rvllm-core, rvllm-mem
+# rvllm-graph:    rvllm-core, rvllm-mem, rvllm-metadata
+# rvllm-loader:   rvllm-core, rvllm-mem
+# rvllm-sampling: rvllm-core, rvllm-mem, rvllm-fused
+# rvllm-runtime:  all of the above except serve/bench/deploy
+# rvllm-serve:    rvllm-runtime (+ core)
+# rvllm-bench:    rvllm-runtime (+ core)
+# rvllm-deploy:   rvllm-core (types only)
+#
+# The tests/dag.rs test parses every Cargo.toml and asserts these rules.
+# cargo-deny alone can't express "crate X may not depend on Y"; see tests/dag.rs.
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+]
+confidence-threshold = 0.9
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[advisories]
+yanked = "deny"

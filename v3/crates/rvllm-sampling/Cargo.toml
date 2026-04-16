@@ -1,0 +1,15 @@
+[package]
+name = "rvllm-sampling"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# rvllm-sampling: greedy argmax + optional top-k/top-p. GPU-side.
+# Double-buffered pinned DtoH with type-state ticket. See v3/specs/13-sampling.md.
+
+[dependencies]
+rvllm-core = { workspace = true }
+rvllm-mem = { workspace = true }
+rvllm-fused = { workspace = true }

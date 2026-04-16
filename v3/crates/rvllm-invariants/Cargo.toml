@@ -1,0 +1,19 @@
+[package]
+name = "rvllm-invariants"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# rvllm-invariants: CI-only. Parses every Cargo.toml + source file to enforce:
+#   - the DAG declared in v3/IMPL_PLAN.md section 1.1
+#   - per-crate and per-file LoC budgets
+# Zero runtime deps. `cargo test -p rvllm-invariants` is the gate.
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]

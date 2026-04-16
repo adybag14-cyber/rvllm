@@ -1,0 +1,20 @@
+[package]
+name = "rvllm-deploy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# rvllm-deploy: SHA-pinned tarball, manifest.json verification.
+# NO dependency on runtime — this is build/ship tooling only.
+# See v3/specs/16-deploy.md.
+
+[[bin]]
+name = "rvllm-deploy"
+path = "src/main.rs"
+
+[dependencies]
+rvllm-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

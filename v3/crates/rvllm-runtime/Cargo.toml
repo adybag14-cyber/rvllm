@@ -1,0 +1,22 @@
+[package]
+name = "rvllm-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# rvllm-runtime: Engine, scheduler, layer_exec. ONE step_launch/step_collect pair.
+# See v3/specs/{07,09}.md.
+
+[dependencies]
+rvllm-core = { workspace = true }
+rvllm-mem = { workspace = true }
+rvllm-cutlass = { workspace = true }
+rvllm-attention = { workspace = true }
+rvllm-fused = { workspace = true }
+rvllm-metadata = { workspace = true }
+rvllm-graph = { workspace = true }
+rvllm-loader = { workspace = true }
+rvllm-sampling = { workspace = true }
+tracing = { workspace = true }
