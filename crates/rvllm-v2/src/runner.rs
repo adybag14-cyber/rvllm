@@ -120,12 +120,13 @@ pub struct GpuModelRunner {
     embed_output: CudaSlice<f16>,
     argmax_output: CudaSlice<i32>,
     // Pinned host buffers for truly async DtoH/HtoD (pageable memory degrades to sync)
-    pinned_argmax: PinnedBuffer<i32>,
+    // Double-buffered: launch_dtoh writes to [write_buf], read_completed_output reads from [read_buf]
+    pinned_argmax: [PinnedBuffer<i32>; 2],
+    dtoh_events: [CUevent; 2],
+    dtoh_buf_idx: usize, // which buffer the NEXT launch_dtoh writes to
     pinned_meta: PinnedBuffer<i32>,
     // Stored metadata offsets from the last upload (for forward_gpu_only)
     last_meta_offsets: Option<PackedMetaOffsets>,
-    // Event for non-blocking DtoH completion polling (CU_EVENT_DISABLE_TIMING for zero overhead)
-    dtoh_event: CUevent,
     // Number of tokens in the pending DtoH transfer (set by launch_dtoh)
     pending_dtoh_tokens: usize,
 }
@@ -206,11 +207,13 @@ impl GpuModelRunner {
         let argmax_output = stream.alloc_zeros::<i32>(max_t)
             .map_err(|e| LLMError::GpuError(format!("argmax_output alloc: {e}")))?;
 
-        let pinned_argmax = PinnedBuffer::<i32>::new(max_t)?;
+        let pinned_argmax_0 = PinnedBuffer::<i32>::new(max_t)?;
+        let pinned_argmax_1 = PinnedBuffer::<i32>::new(max_t)?;
         let pinned_meta = PinnedBuffer::<i32>::new(max_meta_elems.max(4096))?;
 
-        // CU_EVENT_DISABLE_TIMING: zero overhead event for DtoH completion polling
-        let dtoh_event = cu_event::create(CUevent_flags::CU_EVENT_DISABLE_TIMING)
+        let dtoh_event_0 = cu_event::create(CUevent_flags::CU_EVENT_DISABLE_TIMING)
+            .map_err(|e| LLMError::GpuError(format!("dtoh event create: {e}")))?;
+        let dtoh_event_1 = cu_event::create(CUevent_flags::CU_EVENT_DISABLE_TIMING)
             .map_err(|e| LLMError::GpuError(format!("dtoh event create: {e}")))?;
 
         Ok(Self {
@@ -266,10 +269,11 @@ impl GpuModelRunner {
             lm_head_out_f16,
             embed_output,
             argmax_output,
-            pinned_argmax,
+            pinned_argmax: [pinned_argmax_0, pinned_argmax_1],
+            dtoh_events: [dtoh_event_0, dtoh_event_1],
+            dtoh_buf_idx: 0,
             pinned_meta,
             last_meta_offsets: None,
-            dtoh_event,
             pending_dtoh_tokens: 0,
         })
     }
@@ -384,15 +388,11 @@ impl GpuModelRunner {
 
         // Free dead f16 weights -- never used again after FP8 quantization.
         // Replace with 1-element stubs (LayerWeights construction still indexes these vecs).
+        // NOTE: lm_head_weight is NOT shrunk -- all forward paths use it via hgemm_f32_output.
         let freed = Self::shrink_weight_vecs(&mut self.weights.fused_qkv, &self.stream)
             + Self::shrink_weight_vecs(&mut self.weights.fused_gate_up, &self.stream)
             + Self::shrink_weight_vecs(&mut self.weights.o_proj, &self.stream)
             + Self::shrink_weight_vecs(&mut self.weights.down_proj, &self.stream);
-        // Also free lm_head f16 (FP8 lm_head is used instead)
-        let lm_head_elems = self.lm_head_weight.len();
-        self.lm_head_weight = self.stream.alloc_zeros::<f16>(1)
-            .map_err(|e| LLMError::GpuError(format!("lm_head shrink: {e}")))?;
-        let freed = freed + lm_head_elems * 2;
 
         tracing::info!(num_layers, freed_bytes = freed, freed_gb = freed as f64 / (1024.0 * 1024.0 * 1024.0), "FP8 weight quantization complete, freed dead f16 weights");
         Ok(())
@@ -1333,8 +1333,7 @@ impl GpuModelRunner {
     }
 
     /// Read the argmax token IDs from the GPU after forward_gpu_only or graph replay.
-    /// Uses pinned host memory for truly async DtoH (pageable Vec is synchronous).
-    /// Returns a slice into the pinned buffer -- valid until next read_graph_output call.
+    /// Synchronous path -- uses buf 0, blocks until complete.
     pub fn read_graph_output(&mut self, num_tokens: usize) -> Result<&[i32]> {
         let bytes = num_tokens * std::mem::size_of::<i32>();
         let src_dev_ptr = {
@@ -1343,7 +1342,7 @@ impl GpuModelRunner {
         };
         unsafe {
             cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
-                self.pinned_argmax.as_mut_ptr() as *mut std::ffi::c_void,
+                self.pinned_argmax[0].as_mut_ptr() as *mut std::ffi::c_void,
                 src_dev_ptr,
                 bytes,
                 self.stream.cu_stream(),
@@ -1353,13 +1352,15 @@ impl GpuModelRunner {
         }
         self.stream.synchronize()
             .map_err(|e| LLMError::GpuError(format!("stream sync: {e}")))?;
-        Ok(&self.pinned_argmax.as_slice()[..num_tokens])
+        Ok(&self.pinned_argmax[0].as_slice()[..num_tokens])
     }
 
-    /// Launch async DtoH copy for argmax token IDs and record completion event.
-    /// Returns immediately -- call is_dtoh_ready() or wait_dtoh() to check/wait.
+    /// Launch async DtoH copy into the current write buffer and record event.
+    /// Flips the buffer index so the next launch_dtoh writes to the other buffer.
+    /// Returns immediately -- call wait_dtoh() then read_completed_output().
     pub fn launch_dtoh(&mut self, num_tokens: usize) -> Result<()> {
         self.pending_dtoh_tokens = num_tokens;
+        let buf = self.dtoh_buf_idx;
         let bytes = num_tokens * std::mem::size_of::<i32>();
         let src_dev_ptr = {
             let (ptr, _) = self.argmax_output.device_ptr(&self.stream);
@@ -1367,37 +1368,43 @@ impl GpuModelRunner {
         };
         unsafe {
             cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
-                self.pinned_argmax.as_mut_ptr() as *mut std::ffi::c_void,
+                self.pinned_argmax[buf].as_mut_ptr() as *mut std::ffi::c_void,
                 src_dev_ptr,
                 bytes,
                 self.stream.cu_stream(),
             )
             .result()
             .map_err(|e| LLMError::GpuError(format!("launch_dtoh: {e}")))?;
-            cu_event::record(self.dtoh_event, self.stream.cu_stream())
+            cu_event::record(self.dtoh_events[buf], self.stream.cu_stream())
                 .map_err(|e| LLMError::GpuError(format!("dtoh event record: {e}")))?;
         }
+        // Flip: next launch writes to the other buffer
+        self.dtoh_buf_idx = 1 - buf;
         Ok(())
     }
 
-    /// Non-blocking check: is the DtoH copy from launch_dtoh() complete?
+    /// Non-blocking check: is the previous DtoH copy complete?
     pub fn is_dtoh_ready(&self) -> bool {
+        let read_buf = 1 - self.dtoh_buf_idx; // previous launch wrote to the other buffer
         unsafe {
-            cudarc::driver::sys::cuEventQuery(self.dtoh_event)
+            cudarc::driver::sys::cuEventQuery(self.dtoh_events[read_buf])
                 == cudarc::driver::sys::CUresult::CUDA_SUCCESS
         }
     }
 
-    /// Block until the DtoH copy from launch_dtoh() is complete.
+    /// Block until the previous DtoH copy is complete.
     pub fn wait_dtoh(&self) -> Result<()> {
-        unsafe { cu_event::synchronize(self.dtoh_event) }
+        let read_buf = 1 - self.dtoh_buf_idx;
+        unsafe { cu_event::synchronize(self.dtoh_events[read_buf]) }
             .map_err(|e| LLMError::GpuError(format!("dtoh event sync: {e}")))?;
         Ok(())
     }
 
-    /// Read the completed DtoH output. Only valid after wait_dtoh() or is_dtoh_ready() == true.
+    /// Read the completed DtoH output from the previous buffer.
+    /// Only valid after wait_dtoh() or is_dtoh_ready() == true.
     pub fn read_completed_output(&self) -> &[i32] {
-        &self.pinned_argmax.as_slice()[..self.pending_dtoh_tokens]
+        let read_buf = 1 - self.dtoh_buf_idx;
+        &self.pinned_argmax[read_buf].as_slice()[..self.pending_dtoh_tokens]
     }
 
     /// Returns the max_seq_len from config (for graph capture max_context_len).
@@ -1413,7 +1420,9 @@ impl GpuModelRunner {
 
 impl Drop for GpuModelRunner {
     fn drop(&mut self) {
-        unsafe { cu_event::destroy(self.dtoh_event) }.ok();
+        self.stream.synchronize().ok();
+        unsafe { cu_event::destroy(self.dtoh_events[0]) }.ok();
+        unsafe { cu_event::destroy(self.dtoh_events[1]) }.ok();
     }
 }
 

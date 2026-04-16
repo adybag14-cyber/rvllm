@@ -474,17 +474,12 @@ impl<B: BlockManagerOps> Scheduler<B> {
                 continue;
             }
 
-            let new_token = match req.last_new_token {
-                Some(t) => t,
-                None => 0,
-            };
-
             let block_table_update = self.block_manager.get_block_table_update(req.seq_id);
 
             diff.continued.push(ContinuedRequest {
                 request_id: req.request_id,
                 seq_id: req.seq_id,
-                new_token_id: new_token,
+                new_token_id: req.last_new_token,
                 block_table_update,
             });
 
@@ -558,13 +553,12 @@ impl<B: BlockManagerOps> Scheduler<B> {
                 continue;
             }
 
-            let new_token = req.last_new_token.unwrap_or(0);
             let block_table_update = self.block_manager.get_block_table_update(req.seq_id);
 
             diff.continued.push(ContinuedRequest {
                 request_id: req.request_id,
                 seq_id: req.seq_id,
-                new_token_id: new_token,
+                new_token_id: req.last_new_token,
                 block_table_update,
             });
 

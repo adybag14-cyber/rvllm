@@ -454,8 +454,8 @@ impl Worker {
         // Update continuing decode requests
         for cont in &diff.continued {
             if let Some(req) = self.requests.get_mut(&cont.request_id) {
-                if cont.new_token_id != 0 {
-                    req.output_token_ids.push(cont.new_token_id);
+                if let Some(token_id) = cont.new_token_id {
+                    req.output_token_ids.push(token_id);
                 }
                 if let Some(new_table) = &cont.block_table_update {
                     req.block_table.clone_from(new_table);
@@ -465,7 +465,7 @@ impl Worker {
                 req.token_chunk = 0..0;
                 trace!(
                     request_id = %cont.request_id,
-                    new_token = cont.new_token_id,
+                    new_token = ?cont.new_token_id,
                     seq_len = req.seq_len(),
                     "continued request in worker state"
                 );

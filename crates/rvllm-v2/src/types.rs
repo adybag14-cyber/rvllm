@@ -66,7 +66,7 @@ pub struct AddedRequest {
 pub struct ContinuedRequest {
     pub request_id: RequestId,
     pub seq_id: SequenceId,
-    pub new_token_id: TokenId,
+    pub new_token_id: Option<TokenId>,
     pub block_table_update: Option<Vec<BlockId>>,
 }
 

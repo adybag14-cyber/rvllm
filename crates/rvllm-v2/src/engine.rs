@@ -274,36 +274,18 @@ impl<B: BlockManagerOps> Engine<B> {
         Ok(result)
     }
 
-    /// Pipelined step: overlaps output processing of step N-1 with GPU work for step N.
-    /// Returns outputs from the PREVIOUS step (one step latency).
+    /// Pipelined step: overlaps GPU execution of step N with CPU processing of N's
+    /// output + scheduling N+1.
     ///
-    /// Timeline:
-    ///   GPU: [forward N][forward N+1][forward N+2]
-    ///   CPU: [prep N]  [out N-1 + prep N+1]  [out N + prep N+2]
+    /// Order: process_output(N-1) -> schedule(N) -> launch(N)
+    ///
+    /// process_output sets last_new_token which schedule reads to build the diff.
+    /// The overlap comes from GPU running N while CPU does output(N) + schedule(N+1).
     ///
     /// Call step_pipelined_flush() at end to drain the last pending step.
     pub fn step_pipelined(&mut self) -> Result<Vec<V2RequestOutput>, EngineError> {
-        // 1. Schedule + launch step N on GPU
-        let sched_out = if self.should_use_decode_lane() {
-            self.decode_steps_since_admission += 1;
-            self.scheduler.schedule_decode_only()
-        } else {
-            self.decode_steps_since_admission = 0;
-            self.scheduler.schedule()
-        };
-
-        let launched = if !sched_out.diff.is_empty() {
-            self.worker
-                .step_launch(&sched_out.diff)
-                .map_err(|e| EngineError::Worker(e.to_string()))?;
-            true
-        } else {
-            false
-        };
-
-        // 2. While GPU runs step N, process output from step N-1
+        // 1. Process output from step N-1 (sets last_new_token for scheduling)
         let prev_outputs = if let Some(prev) = self.prev_pending.take() {
-            // Wait for step N-1's DtoH (should already be done -- GPU ran during our prep)
             self.worker
                 .wait_for_output()
                 .map_err(|e| EngineError::Worker(e.to_string()))?;
@@ -318,7 +300,26 @@ impl<B: BlockManagerOps> Engine<B> {
             Vec::new()
         };
 
-        // 3. Store step N as prev_pending for next iteration
+        // 2. Schedule step N (reads last_new_token set by process_output above)
+        let sched_out = if self.should_use_decode_lane() {
+            self.decode_steps_since_admission += 1;
+            self.scheduler.schedule_decode_only()
+        } else {
+            self.decode_steps_since_admission = 0;
+            self.scheduler.schedule()
+        };
+
+        // 3. Launch step N on GPU
+        let launched = if !sched_out.diff.is_empty() {
+            self.worker
+                .step_launch(&sched_out.diff)
+                .map_err(|e| EngineError::Worker(e.to_string()))?;
+            true
+        } else {
+            false
+        };
+
+        // 4. Store step N as prev_pending for next iteration
         if launched {
             self.prev_pending = Some(PipelinedPending { sched_out });
         } else {

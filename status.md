@@ -1,7 +1,352 @@
-# rvLLM GPU Memory & Data Path Audit
+# rvLLM Status: Pipeline Review & Bug Report
 
-Model: Qwen2.5-32B-Instruct, FP8 CUTLASS path, H100 80GB
-Date: 2025-04-15
+Model: Qwen2.5-32B-Instruct, FP8 CUTLASS path, H100 80GB SXM
+Date: 2026-04-15
+Commit: 35b253d07 (pipeline changes), c0ae8ab3e (kernels on HF)
+
+---
+
+## CRITICAL: Showstopper Bugs in step_pipelined()
+
+16-agent review found 4 showstopper bugs that make the pipelined decode path
+produce garbage output. The non-pipelined `step()` path is unaffected.
+
+### BUG 1: Pipeline ordering produces wrong tokens (CRITICAL)
+
+**File:** `engine.rs:285` (`step_pipelined`)
+
+The pipeline does: schedule(N) -> launch(N) -> process_output(N-1)
+
+But `schedule(N)` reads `req.last_new_token` to build the step diff, and
+`last_new_token` is set by `process_step_result()` inside `process_output(N-1)`.
+Since N-1 output hasn't been processed yet when N is scheduled, `last_new_token`
+is always `None`, so `new_token_id` in every `ContinuedRequest` is 0.
+
+Downstream cascade:
+- `apply_diff()` in worker.rs skips the push when `new_token_id == 0`
+- Worker's `output_token_ids` is permanently empty
+- `last_token_id()` returns the last prompt token instead of the generated token
+- Every decode step feeds the model the same last-prompt-token
+- `seq_len()` never advances, so position_ids are wrong
+- `slot_mapping` writes every step's KV to the same slot (overwrites previous)
+- `context_lens` stuck at prompt_len, attention never sees generated tokens
+- **Output is nonsense after the first token**
+
+**Fix:** Reorder to: process_output(N-1) -> schedule(N) -> launch(N). The
+overlap then comes from GPU running step N while CPU processes N's output
+scheduling N+1.
+
+### BUG 2: Pinned buffer data race in pipelined path (CRITICAL)
+
+**File:** `runner.rs:1361` (`launch_dtoh`), `worker.rs:289`
+
+`step_pipelined` launches step N+1's DtoH into the same `pinned_argmax` buffer
+before reading step N's output. Both are on the same CUDA stream, so the
+execution order is:
+
+```
+GPU stream: [graph_N] [DtoH_N -> pinned_argmax] [HtoD_N+1] [graph_N+1] [DtoH_N+1 -> pinned_argmax]
+CPU:        [launch N+1] .......................... [read pinned_argmax thinking it's N's data]
+```
+
+Step N+1's DtoH overwrites step N's data. The `dtoh_event` is also overwritten
+by step N+1's `cuEventRecord`, so `wait_dtoh()` waits on N+1's event, not N's.
+
+**Fix:** Double-buffer: 2 pinned buffers + 2 CUevents, alternating per step.
+Or restructure so step N's output is read before step N+1's DtoH is launched.
+
+### BUG 3: LM head f16 weight shrunk but still used (CRITICAL)
+
+**File:** `runner.rs:391-395` (`enable_fp8_weights`)
+
+`shrink_weight_vecs` replaces `lm_head_weight` with a 1-element CudaSlice stub.
+But all 3 forward paths (`forward`, `forward_greedy_launch`, `forward_gpu_only`)
+call `cublas.hgemm_f32_output(..., lm_head_weight, ...)` with dimensions
+m=num_tokens, n=152064, k=3584.
+
+cuBLAS reads 545M f16 elements from a 1-element buffer. This is an out-of-bounds
+GPU memory read. cuBLAS has no bounds checking -- it reads whatever is in adjacent
+GPU memory. Result: silent garbage logits, wrong tokens. No crash unless the read
+hits an unmapped page.
+
+The `fp8_lm_head` and `fp8_lm_head_scale` fields ARE populated but NEVER
+dispatched to in any forward path. The LM head FP8 path is dead code.
+
+**Fix:** Don't shrink `lm_head_weight`. Remove lines 391-395. The LM head is
+~1.04 GB -- keep it. Separately, wire up the FP8 LM head path if it's faster.
+
+### BUG 4: build() never updates cached decode keys (MODERATE)
+
+**File:** `input.rs:105-148` (`build`), `input.rs:60` (`build_decode_only`)
+
+When `is_decode_only=false` (additions exist), `build()` is called instead of
+`build_decode_only()`. But `build()` never updates `cached_decode_keys` or
+`cached_decode_valid`. Scenario:
+
+1. Step N: 3 decode sequences [A,B,C]. Cache = [A,B,C].
+2. Step N+1: B removed, D added. `build()` called. Cache NOT updated.
+3. Step N+2: No changes. `build_decode_only()` called. Cache = [A,B,C] but
+   B no longer exists. `requests[&B]` panics.
+
+**Fix:** At end of `build()`, update the cache:
+```rust
+self.cached_decode_keys.clear();
+self.cached_decode_keys.extend_from_slice(&self.decode_keys);
+self.cached_decode_valid = true;
+```
+
+---
+
+## Wrong Estimates: My CPU Cost Numbers Were 10-25x Too High
+
+16 agents independently traced every operation. The original estimates were
+wildly pessimistic:
+
+| Operation | My Estimate | Actual (agents) | Factor Off |
+|-----------|-------------|-----------------|------------|
+| GPU forward pass | 5.0 ms | 6.2-7.2 ms | 1.3x too optimistic |
+| Total CPU overhead | 1.3-1.5 ms | 50-150 us | 10-20x too pessimistic |
+| scheduler.schedule_decode_only() | 500 us | 20-30 us | 15-25x too high |
+| process_forward_output() | 1000 us | 25-45 us | 20-40x too high |
+| HashMap cost (1800 ops) | dominant | ~36 us total | not a bottleneck |
+| build_request_outputs() | 100 us | 9-15 us | 7-10x too high |
+| cleanup_finished() | 50 us | 1-3 us | 15-50x too high |
+
+**Key insight: CPU was never the bottleneck.** At N=128 with GPU taking 6-7ms
+and CPU taking 50-150us, the CPU has 40-100x headroom. The pipeline was solving
+a problem that barely exists at this batch size.
+
+The 1.3ms figure was likely measured from the synchronous `step()` path which
+includes `stream.synchronize()` -- that blocks the CPU for the full GPU forward
+pass, making "CPU overhead" appear to include GPU time.
+
+### GPU Forward Pass Breakdown (from first principles)
+
+All GEMMs are memory-bandwidth-bound at M=128 (arithmetic intensity ~240,
+crossover at ~1182 FLOPs/byte):
+
+```
+Per-layer weight reads:
+  QKV:     16.5 MB FP8
+  O-proj:  12.85 MB FP8
+  Gate+Up: 135.8 MB FP8
+  Down:    67.9 MB FP8
+  Total:   233 MB/layer
+
+64 layers: 14.9 GB
+LM head:   1.09 GB (FP16, NOT FP8 -- see Bug 3)
+Total:     16.0 GB weight reads per forward step
+
+At 3.35 TB/s theoretical: 4.8 ms floor (impossible to beat)
+At 80% BW utilization:    6.0 ms
+At 75% BW utilization:    6.4 ms
+With non-GEMM overhead:   6.2-7.2 ms realistic
+```
+
+Flash attention at N=128, context 512: ~5-10 us/layer (trivial).
+RMSNorm, RoPE, SiLU, residuals: ~5 us/layer.
+CUDA graph replay overhead: ~8-12 us (depends on node count).
+
+---
+
+## PCIe & Transfer Analysis
+
+All transfers are correctly async with pinned memory. No hidden costs.
+
+### HtoD Metadata Upload (per decode step at N=128)
+
+| Field | Elements | Bytes |
+|-------|----------|-------|
+| token_ids | 128 | 512 |
+| position_ids | 128 | 512 |
+| context_lens | 128 | 512 |
+| block_tables | 128 * max_blocks | 16-66 KB (depends on max_seq_len) |
+| slot_mapping | 128 | 512 |
+| seq_start_pos | 129 | 516 |
+| **Total (2K ctx)** | | **~19 KB** |
+
+Note: `patch_metadata_decode` patches 4 fields in the pinned buffer but
+re-uploads the FULL buffer. Optimization: could do sub-region upload for the
+~2 KB that actually changed, saving ~17 KB of PCIe traffic. But at PCIe Gen5
+this saves ~0.5 us. Not worth the complexity.
+
+### DtoH Argmax Output
+
+128 * 4 bytes = 512 bytes. PCIe latency floor: ~2-3 us. Negligible.
+
+### Pinned Memory
+
+Genuine `cuMemAllocHost_v2` (pinned_memory.rs:58). Not a regular Vec.
+Argmax writes directly to `argmax_output` device buffer (no D2D copy).
+Mapped memory would be worse (128 non-coalesced 4-byte PCIe writes from
+separate blocks vs one 512-byte DMA).
+
+### CUDA Driver Calls (5 per step)
+
+1. `cuMemcpyHtoDAsync_v2` (metadata upload): ~1.5-3 us
+2. `cuGraphLaunch` (graph replay): ~8-12 us
+3. `cuMemcpyDtoHAsync_v2` (argmax DtoH): ~1.5-2 us
+4. `cuEventRecord` (DtoH completion): ~0.3-0.5 us
+5. `cuEventSynchronize` (wait for previous step): ~0.3-1 us (if already done)
+
+Total driver overhead: ~12-19 us. No hidden mutex contention (single thread,
+single stream, single GPU). cudarc wrapper adds negligible overhead.
+
+---
+
+## Heap Allocation Audit (per decode step, N=128)
+
+147 heap allocations per step in steady-state decode. Total ~25 KB of churn.
+
+| Source | Allocs | Bytes | Avoidable? |
+|--------|--------|-------|------------|
+| GpuBatchInput.clone() | ~10 | ~7,680 | YES -- build in-place, pass by ref |
+| vec![logprob] x128 | 128 | 512 | YES -- use f32 field, not Vec<f32> |
+| Vec<V2RequestOutput> + reallocs | ~7 | ~15,360 | YES -- reusable field |
+| Vec<TokenId> collect in read_output | 1 | 512 | YES -- transmute &[i32] to &[u32] |
+| cached_decode_keys.clone() | 1 | 1,024 | YES -- use index iteration |
+| **Total** | **~147** | **~25,088** | **all avoidable** |
+
+At ~35ns per malloc/free, allocator time is ~5 us. Real cost is L1 cache
+pollution: ~196 cache lines dirtied and evicted per step. Jitter risk from
+occasional mmap/munmap.
+
+Priority fixes:
+1. GpuBatchInput: build in-place, pass by reference (eliminates 10 allocs)
+2. logprobs: store as `f32` not `Vec<f32>` (eliminates 128 allocs)
+3. request_outputs: reusable Vec field (eliminates 7 reallocs)
+4. read_output: transmute instead of collect (eliminates 1 alloc)
+5. cached keys: index iteration instead of clone (eliminates 1 alloc)
+
+---
+
+## cuEvent Lifecycle Issues
+
+### Drop Use-After-Free (MODERATE)
+
+`runner.rs:1414-1418`: Drop impl calls `cu_event::destroy` but does NOT
+synchronize the stream. Rust struct drop order drops fields in declaration order.
+`pinned_argmax` (line 123) is declared before `dtoh_event` (line 128), so
+pinned memory is freed first. If a DtoH is in-flight writing to pinned memory,
+this is a use-after-free.
+
+**Fix:** Add `self.stream.synchronize()` in Drop impl before field drops.
+
+### is_dtoh_ready() Swallows Errors
+
+`runner.rs:1383-1387`: `cuEventQuery` returns `CUDA_SUCCESS` or
+`CUDA_ERROR_NOT_READY`. But it can also return `CUDA_ERROR_LAUNCH_FAILED` if a
+kernel failed. Current code treats all non-SUCCESS as "not ready", causing
+infinite polling on GPU errors.
+
+**Fix:** Return `Result<bool>`, propagate errors that aren't NOT_READY.
+
+### invalidate_cache() is Dead Code
+
+`input.rs:164-166`: Defined but never called anywhere. Cache invalidation
+relies entirely on the `set_changed` parameter. Not a bug but misleading.
+
+---
+
+## Pipeline Architecture Assessment
+
+### The Good
+
+- Single-stream ordering is correct for this workload (sequential layer deps)
+- HtoD/DtoH transfers are tiny and properly async
+- Pinned memory is genuine
+- CUDA graph replay eliminates kernel launch overhead
+- GPU argmax means only token IDs cross PCIe (not logits)
+
+### The Bad
+
+- Pipeline ordering bug makes ALL pipelined output garbage (Bug 1)
+- Pinned buffer race means wrong tokens even if ordering is fixed (Bug 2)
+- CPU was never the bottleneck -- pipeline adds complexity for ~50-150us savings
+  against a 6-7ms GPU step
+- 147 heap allocations per step is sloppy but not performance-critical
+
+### The Ugly
+
+- LM head weight shrunk while still actively used (Bug 3) -- silent OOB reads
+- FP8 LM head path is dead code (quantized but never dispatched)
+- 5ms GPU estimate was wrong (real: 6.2-7.2ms)
+- CPU cost estimates were 10-25x too high
+
+---
+
+## f16 Weight Shrink Analysis
+
+Per-layer shrink is SAFE: FP8 guard (`weights.fp8.is_some()`) prevents any
+code path from reaching the f16 GEMM branch when FP8 is enabled.
+
+LM head shrink is BROKEN: All 3 forward paths use `lm_head_weight` via
+`cublas.hgemm_f32_output`. The `fp8_lm_head` is populated but never used.
+cuBLAS reads past the 1-element stub into adjacent GPU memory = garbage logits.
+
+Layernorm weights correctly NOT shrunk (used by all paths).
+
+Savings after fix (don't shrink lm_head):
+- Dead f16 layer weights freed: 27.8 GB (correct, safe)
+- lm_head_weight kept: 1.04 GB (must keep)
+- Net savings: ~27.8 GB instead of 28.8 GB
+
+---
+
+## vLLM Competitive Comparison
+
+### What vLLM Does
+
+- CUDA graphs for decode (same as rvLLM)
+- Separate scheduler process (Python, communicates via shared memory + IPC)
+- Pinned buffers pre-allocated at max batch, reused (same as rvLLM)
+- Mostly single-stream for forward, separate streams for H2D/D2H
+- Caching memory allocator via torch (rvLLM needs equivalent)
+- Chunked prefill interleaved with decode
+- Prefix caching for shared system prompts
+- Preemption + KV swap to CPU under memory pressure
+
+### rvLLM Advantages
+
+- No Python interpreter overhead (~5-10 us per op dispatch eliminated)
+- No torch framework tax (3-6 ms of dispatch overhead eliminated for 64 layers)
+- CUTLASS autotuning (potentially better than cuBLAS for specific shapes)
+- Direct CUDA control (fused kernels, precise memory management)
+- Lower CPU overhead in Rust vs Python scheduler
+
+### rvLLM Disadvantages
+
+- Missing chunked prefill (long prompts stall all decode sequences)
+- Missing prefix caching
+- Missing preemption/KV swap
+- No caching memory allocator (risk of cuMemAlloc during inference)
+- FP8 LM head path incomplete
+
+### Throughput Numbers
+
+- rvLLM baseline: 18,922 tok/s at N=128 (needs validation at longer contexts)
+- vLLM v0.6.x FP8 on H100: ~4,000-5,500 tok/s (Qwen2.5-32B, batch=128)
+- TensorRT-LLM: ~5,500-7,000 tok/s
+- rvLLM's 18,922 is 3-4x higher than vLLM -- needs context length validation.
+  If measured at very short sequence lengths (few decode steps), attention cost
+  is minimal and the number is plausible. At seq_len=2048, it would need
+  re-verification.
+
+---
+
+## Benchmark Baselines (pre-pipeline, commit 3eacacd0f)
+
+```
+N=1:    139.6 tok/s
+N=32:  4,257.1 tok/s
+N=64: 10,702.8 tok/s
+N=128: 18,922.8 tok/s
+```
+
+These were measured with the synchronous `step()` path (correct output).
+The pipelined path has never produced correct output.
+
+---
 
 ## Model Dimensions (Qwen2.5-32B)
 
@@ -23,394 +368,15 @@ block_size       = 16    (KV cache)
 
 ---
 
-## 1. GPU Weight Memory
-
-### F16 Weights (loaded at model init, NEVER FREED after FP8 quant)
-
-Per-layer f16 weights stored in `ModelWeightsStore` (runner.rs:35-65):
-
-| Weight | Shape (out x in) | Elements | F16 Bytes | Status |
-|--------|-----------------|----------|-----------|--------|
-| fused_qkv | 4608 x 3584 | 16,515,072 | 31.5 MB | DEAD after FP8 |
-| o_proj | 3584 x 3584 | 12,845,056 | 24.5 MB | DEAD after FP8 |
-| fused_gate_up | 37888 x 3584 | 135,794,432 | 259.1 MB | DEAD after FP8 |
-| down_proj | 3584 x 18944 | 67,897,216 | 129.5 MB | DEAD after FP8 |
-| input_layernorm | 3584 | 3,584 | 7 KB | still used |
-| post_attn_layernorm | 3584 | 3,584 | 7 KB | still used |
-| **Per-layer f16 total** | | | **444.6 MB** | |
-| **64 layers f16** | | | **27.8 GB** | |
-
-Non-layer f16 weights:
-
-| Weight | Shape | F16 Bytes | Status |
-|--------|-------|-----------|--------|
-| embed_tokens | 152064 x 3584 | 1.04 GB | still used (embedding lookup) |
-| lm_head_weight | 152064 x 3584 | 1.04 GB | DEAD after FP8 quant |
-| final_norm_weight | 3584 | 7 KB | still used |
-
-### FP8 Weights (created by enable_fp8_weights(), runner.rs:269-375)
-
-Per-layer FP8 weights:
-
-| Weight | Shape | FP8 Bytes | Scale Bytes |
-|--------|-------|-----------|-------------|
-| fp8_qkv | 4608 x 3584 | 15.7 MB | 4 B (per-tensor f32) |
-| fp8_o_proj | 3584 x 3584 | 12.3 MB | 4 B |
-| fp8_gate_up | 37888 x 3584 | 129.5 MB | 4 B |
-| fp8_down | 3584 x 18944 | 64.8 MB | 4 B |
-| gemv_qkv_scale | 4608 | 9 KB | (per-row f16 for GEMV) |
-| gemv_o_proj_scale | 3584 | 7 KB | |
-| gemv_gate_up_scale | 37888 | 74 KB | |
-| gemv_down_scale | 3584 | 7 KB | |
-| **Per-layer FP8 total** | | **222.3 MB** | |
-| **64 layers FP8** | | **13.9 GB** | |
-
-Non-layer FP8:
-
-| Weight | FP8 Bytes |
-|--------|-----------|
-| fp8_lm_head | 0.52 GB |
-| fp8_lm_head_scale | 4 B |
-
-### Weight Memory Summary
-
-```
-F16 layer weights (DEAD, never freed):   27.8 GB
-F16 lm_head (DEAD, never freed):          1.0 GB
-F16 embed_tokens (active):                1.0 GB
-F16 norms + final_norm (active):          0.9 MB
-FP8 layer weights (active):              13.9 GB
-FP8 lm_head (active):                     0.5 GB
-FP8 scales + GEMV scales (active):        0.6 MB
-----------------------------------------------------
-TOTAL WEIGHT MEMORY:                      44.2 GB
-WASTED (dead f16 after FP8 quant):        28.8 GB
-SHOULD BE:                                15.4 GB
-```
-
-**BUG: 28.8 GB of f16 weights are never freed after FP8 quantization.**
-The `#[allow(dead_code)]` annotations on `fused_qkv`, `fused_gate_up`,
-`o_proj`, `down_proj` in `ModelWeightsStore` (runner.rs:36-43) confirm
-the compiler knows they're unused. They remain allocated on GPU.
-
-Fix: After `enable_fp8_weights()` completes, clear the f16 weight vecs
-and drop lm_head_weight. This reclaims 28.8 GB for KV cache blocks.
-
----
-
-## 2. KV Cache Memory
-
-Allocated in kv_cache.rs:60-66, per-layer:
-
-```
-elements_per_block = block_size * num_kv_heads * head_dim
-                   = 16 * 4 * 128 = 8192 elements
-bytes_per_block    = 8192 * 2 = 16,384 bytes (16 KB, f16)
-per_layer          = 2 * num_gpu_blocks * 16 KB  (key + value)
-64 layers          = 128 * num_gpu_blocks * 16 KB = 2 MB per block
-```
-
-**CORRECT**: CacheConfig.num_heads is set from `num_kv_heads` (4), not
-`num_heads` (28). Verified at integration.rs:155. No 7x overallocation.
-
-With current 44.2 GB weights + 13.1 GB buffers = 57.3 GB used:
-- Remaining for KV: ~22.7 GB on H100 80GB
-- Blocks available: 22.7 GB / 2 MB = ~11,350 blocks
-- Tokens cacheable: 11,350 * 16 = ~181,600 tokens
-
-After freeing dead f16 weights (28.8 GB reclaimed):
-- Remaining for KV: ~51.5 GB
-- Blocks available: 51.5 GB / 2 MB = ~25,750 blocks
-- Tokens cacheable: 25,750 * 16 = ~412,000 tokens
-- **2.3x more concurrent sequences**
-
----
-
-## 3. Scratch Buffers (F16LayerScratch, layer.rs:500-571)
-
-Allocated once, reused across all 64 layers per step.
-Sized for max_batch_tokens (t = 8192 default):
-
-| Buffer | Formula | Bytes | Purpose |
-|--------|---------|-------|---------|
-| normed | t * hidden * 2 | 56 MB | RMSNorm output |
-| qkv_buf | t * qkv_dim * 2 | 72 MB | Fused QKV GEMM output |
-| attn_out | t * q_dim * 2 | 56 MB | Attention output (q_dim = hidden for Qwen) |
-| o_proj_out | t * hidden * 2 | 56 MB | O-proj GEMM output |
-| gate_up_out | t * gate_up_dim * 2 | 593 MB | GateUp GEMM output |
-| silu_out | t * intermediate * 2 | 296 MB | SiLU activation output |
-| gateup_workspace | t * gate_up_dim * 2 * 4 | **2,374 MB** | Fused gateup+silu CUTLASS workspace |
-| attn_split_out | 16 * t * num_heads * head_dim * 4 | **1,792 MB** | Split-K attention partial results |
-| attn_split_max | 16 * t * num_heads * 4 | 14 MB | Split-K row max |
-| attn_split_sum | 16 * t * num_heads * 4 | 14 MB | Split-K row sum |
-| residual_tmp | t * hidden * 2 | 56 MB | Layer-internal residual |
-| fp8_act_scratch | t * intermediate * 2 | 296 MB | FP8 quantized activations |
-| fp8_act_scale | t * 4 | 32 KB | Per-token FP8 scales |
-| fp8_absmax | 1 * 4 | 4 B | FP8 absmax reduction |
-| cutlass_workspace | max_workspace_size() | ~20 MB | CUTLASS GEMM workspace |
-| **Scratch total** | | **~5,665 MB** | |
-
-### Issues
-
-**gateup_workspace (2.37 GB)**: Only used in the F16 fused gateup+silu
-path (layer.rs:1059-1066). The FP8 path never touches this buffer --
-it uses separate gate_up_out + fused_silu_mul_fp8_quant. When FP8 is
-enabled, this 2.37 GB is completely wasted.
-
-**attn_split_out (1.79 GB)**: 16-way split-K attention workspace. Only
-used when context length exceeds split threshold. Allocated at full
-max_batch_tokens * 16 splits unconditionally. At N=128 decode, actual
-usage is 128 * 28 * 128 * 4 * (actual_splits) which is a fraction of
-the allocation.
-
-**silu_out (296 MB)**: Only used in F16 path (separate SiLU kernel).
-FP8 path uses fused_silu_mul_fp8_quant which writes to fp8_act_scratch.
-Dead allocation when FP8 is enabled.
-
----
-
-## 4. Runner-Level Buffers (runner.rs:160-204)
-
-| Buffer | Formula | Bytes | Notes |
-|--------|---------|-------|-------|
-| meta_packed | 256 * (max_seq_len + max_blocks + 10) * 4 | ~275 KB | Packed attention metadata |
-| residual_a | t * hidden * 2 | 56 MB | Double-buffer residual (even layers) |
-| residual_b | t * hidden * 2 | 56 MB | Double-buffer residual (odd layers) |
-| down_a | t * hidden * 2 | 56 MB | Double-buffer down-proj output (even) |
-| down_b | t * hidden * 2 | 56 MB | Double-buffer down-proj output (odd) |
-| final_normed | t * hidden * 2 | 56 MB | Final RMSNorm before LM head |
-| residual_tmp | t * hidden * 2 | 56 MB | Runner-level residual temp |
-| logits_gpu | t * vocab * 4 | **4,736 MB** | Full-vocab f32 logits |
-| lm_head_out_f16 | t * vocab * 2 | **2,368 MB** | DEAD -- `#[allow(dead_code)]` |
-| embed_output | t * hidden * 2 | 56 MB | Embedding lookup output |
-| argmax_output | t * 4 | 32 KB | GPU argmax results |
-| pinned_argmax | t * 4 | 32 KB | Pinned host for async DtoH |
-| pinned_meta | same as meta_packed | ~275 KB | Pinned host for async HtoD |
-| **Runner total** | | **~7,496 MB** | |
-
-### Issues
-
-**lm_head_out_f16 (2.37 GB)**: Marked `#[allow(dead_code)]`, allocated
-but never used in the current FP8 LM head path. The FP8 path writes
-directly to logits_gpu (f32). Pure waste.
-
-**logits_gpu (4.74 GB)**: f32 at full vocab (152064) for max_batch_tokens
-(8192). At decode with N=128, actual usage is 128 * 152064 * 4 = 74 MB.
-The buffer is 64x oversized for typical decode workloads.
-
-**Duplicate residual_tmp**: One in F16LayerScratch (56 MB, layer.rs:565)
-and one in GpuModelRunner (56 MB, runner.rs:195). Both are
-t * hidden * 2. Need to verify they serve different purposes or if one
-can be eliminated.
-
----
-
-## 5. Data Flow Per Decode Step (FP8 CUTLASS, N=128)
-
-All reads/writes are to HBM unless noted. "Reuse" means the buffer
-is read by the next kernel without an intervening write by another
-kernel to a different buffer.
-
-```
-Layer i (of 64):
-
-  Input: residual_X[t * hidden, f16]  (X = a or b, alternating)
-  Prev MLP: down_Y[t * hidden, f16]   (Y = a or b, previous layer's down-proj)
-
-  1. FUSED_ADD_RMSNORM_FP8_QUANT
-     Read:  residual_X (56 MB), down_Y (56 MB), input_layernorm_weight (7 KB)
-     Write: fp8_act_scratch (4.5 MB fp8), fp8_act_scale (512 B), residual_tmp (56 MB)
-     Note:  residual_tmp = residual_X + down_Y (saved for later residual add)
-
-  2. QKV GEMM (CUTLASS FP8, autotuned variant)
-     Read:  fp8_act_scratch (4.5 MB), fp8_act_scale (512 B),
-            fp8_qkv_weight (15.7 MB), fp8_qkv_scale (4 B)
-     Write: qkv_buf (72 MB at t=8192, but 1.125 MB at N=128)
-
-  3. ROPE + KV CACHE WRITE (fused kernel)
-     Read:  qkv_buf (Q+K portions), rope_cos, rope_sin
-     Write: kv_cache key/val slots (via slot_mapping)
-     Note:  Q stays in qkv_buf, K/V written directly to cache blocks
-
-  4. FLASH ATTENTION 3 (FA3 or split-K fallback)
-     Read:  Q from qkv_buf, K/V from kv_cache (random access by block table)
-     Write: attn_out (56 MB at max, 0.875 MB at N=128)
-
-  5. FP8 QUANT (per-token quantization of attn_out)
-     Read:  attn_out (0.875 MB)
-     Write: fp8_act_scratch (0.4375 MB), fp8_act_scale (512 B)
-
-  6a. O-PROJ GEMM + RESIDUAL (if autotuned fp8_gemm_residual exists)
-     Read:  fp8_act_scratch, fp8_act_scale,
-            fp8_o_proj_weight (12.3 MB), fp8_o_proj_scale (4 B),
-            residual_tmp (from step 1)
-     Write: residual_Y (output = GEMM + residual, directly to next layer's residual)
-     Saves: one fused_add_rmsnorm read of o_proj_out
-  6b. O-PROJ GEMM (plain, if no residual autotune entry)
-     Read:  same minus residual_tmp
-     Write: o_proj_out (56 MB max)
-
-  7. FUSED_ADD_RMSNORM_FP8_QUANT (or just RMSNORM_FP8_QUANT if 6a used)
-     If 6a: Read residual_Y + post_attn_layernorm_weight
-            Write fp8_act_scratch + fp8_act_scale  (no residual add needed)
-     If 6b: Read residual_tmp + o_proj_out + post_attn_layernorm_weight
-            Write fp8_act_scratch + fp8_act_scale + residual_Y
-
-  8. GATEUP GEMM (CUTLASS FP8, autotuned)
-     Read:  fp8_act_scratch, fp8_act_scale,
-            fp8_gate_up_weight (129.5 MB), fp8_gate_up_scale (4 B)
-     Write: gate_up_out (593 MB max, 9.25 MB at N=128)
-
-  9. FUSED_SILU_MUL_FP8_QUANT
-     Read:  gate_up_out (9.25 MB)
-     Write: fp8_act_scratch (4.625 MB), fp8_act_scale (512 B)
-     Note:  SiLU(gate) * up, then quantize to FP8, single kernel
-
-  10a. DOWN GEMM + RESIDUAL (if autotuned fp8_gemm_residual exists -- currently NO for K=18944)
-     Would read: fp8_act_scratch + residual_Y -> write down_X
-  10b. DOWN GEMM (plain FP8, current path)
-     Read:  fp8_act_scratch (4.625 MB), fp8_act_scale (512 B),
-            fp8_down_weight (64.8 MB), fp8_down_scale (4 B)
-     Write: down_X (56 MB max, 0.875 MB at N=128)
-
-  Output: residual_Y, down_X carry forward to layer i+1
-```
-
-### HBM Traffic Per Layer at N=128 (decode)
-
-Activations (read + write, both directions):
-
-| Step | Read | Write | Total |
-|------|------|-------|-------|
-| 1. add+norm+fp8quant | 1.75 MB | 1.33 MB | 3.08 MB |
-| 2. QKV GEMM | 20.2 MB (mostly weight) | 1.13 MB | 21.3 MB |
-| 3. RoPE+KV write | ~0.5 MB | ~0.1 MB | 0.6 MB |
-| 4. FA3 attention | varies by ctx_len | 0.88 MB | varies |
-| 5. FP8 quant | 0.88 MB | 0.44 MB | 1.32 MB |
-| 6. O-proj GEMM | 12.7 MB | 0.88 MB | 13.6 MB |
-| 7. norm+fp8quant | 0.88 MB | 0.44 MB | 1.32 MB |
-| 8. GateUp GEMM | 134.3 MB | 9.25 MB | 143.5 MB |
-| 9. SiLU+fp8quant | 9.25 MB | 4.63 MB | 13.9 MB |
-| 10. Down GEMM | 69.4 MB | 0.88 MB | 70.3 MB |
-| **Total (excl attn)** | | | **~269 MB/layer** |
-| **64 layers** | | | **~16.8 GB/step** |
-
-Weight reads dominate (222 MB/layer). Activation traffic is ~47 MB/layer.
-At 3.35 TB/s HBM bandwidth, pure bandwidth limit = 16.8 GB / 3.35 TB/s = 5.0 ms/step.
-
-### Redundant HBM Round-Trips
-
-1. **Steps 4->5->6 (attn_out -> fp8_quant -> O-proj)**:
-   attn_out written by FA3, read by fp8_quant, fp8 version read by O-proj.
-   3 touches of the same data. If FP8 quant were fused into FA3 epilogue
-   or O-proj prologue, saves one 0.88 MB round-trip per layer.
-
-2. **Steps 8->9->10 (gate_up_out -> silu+fp8quant -> Down)**:
-   gate_up_out written by GateUp GEMM, read by fused_silu_fp8_quant,
-   fp8 version read by Down GEMM. Same 3-touch pattern. The fused_silu
-   kernel already combines SiLU + quant, but gate_up_out still
-   materializes to HBM between steps 8 and 9.
-
-3. At N=128 these round-trips cost ~0.27 us each (0.88 MB / 3.35 TB/s).
-   64 layers * 2 extra round-trips * 0.27 us = ~35 us/step.
-   Out of a ~5-7 ms step, that's <1%. Not the bottleneck.
-
----
-
-## 6. Fallback Audit Results
-
-### FP8 Hot Path (CUTLASS loaded, FP8 enabled)
-
-| Location | Code | Status |
-|----------|------|--------|
-| cutlass_fp8_gemm_dispatch L150 | Was: hardcoded tile fallback when no autotune | **FIXED: now panics** |
-| cuBLASLt FP8 L868, 967, 1024 | `else if let (Some(lt), Some(fp8w))` | Unreachable (CUTLASS branch taken first) |
-| fp8_gemm_residual -> plain L959, 1094 | Falls back to plain FP8 GEMM | By design (down-proj residual 40% slower) |
-| GEMV FP8 L822 | Gated behind `RVLLM_GEMV_FP8` env var | Correct, pending A/B profiling |
-
-### F16 Path (only active when FP8 disabled)
-
-| Location | Code | Status |
-|----------|------|--------|
-| f16_gemm_autotuned L243 | Falls to cuBLAS when no CUTLASS entry | By design (cuBLAS wins some shapes) |
-| fused gateup+silu L1069 | Falls to separate GEMM+SiLU | By design (autotune only stores winners) |
-| fused oproj+residual L990 | Falls to separate GEMM | By design |
-
-No silent fallbacks in the FP8 hot path. The only hardcoded tile
-fallback has been replaced with a panic.
-
----
-
-## 7. Waste Summary & Priority Fixes
-
-| Issue | Wasted GPU Memory | Difficulty | Impact |
-|-------|-------------------|------------|--------|
-| Dead f16 weights after FP8 quant | **28.8 GB** | Easy (clear vecs) | 2.3x more KV cache blocks |
-| lm_head_out_f16 (dead_code) | **2.37 GB** | Easy (don't alloc when FP8) | Free memory |
-| gateup_workspace (F16-only) | **2.37 GB** | Easy (skip alloc when FP8) | Free memory |
-| silu_out (F16-only) | **296 MB** | Easy (skip alloc when FP8) | Free memory |
-| logits_gpu oversized | ~4.66 GB unused at N=128 | Medium (lazy alloc) | Depends on max batch |
-| attn_split_out oversized | ~1.79 GB at max | Medium | Depends on split-K usage |
-| Duplicate residual_tmp | 56 MB | Easy (verify, remove one) | Minor |
-| **Total recoverable** | **~33.8 GB** | | |
-
-### After fixes, H100 80GB memory map:
-
-```
-FP8 weights + scales:           15.4 GB
-Embedding (f16):                 1.0 GB
-Scratch (FP8-only needed):      ~2.9 GB
-Runner buffers (logits etc):    ~5.1 GB
-Available for KV cache:         ~55.6 GB
-KV blocks (at 2 MB/block):     ~27,800
-Tokens cacheable:               ~445,000
-```
-
-vs current:
-
-```
-All weights (f16 + FP8):        44.2 GB
-Scratch (all paths):            ~5.7 GB
-Runner buffers:                 ~7.5 GB
-Available for KV cache:         ~22.6 GB
-KV blocks:                      ~11,300
-Tokens cacheable:               ~181,000
-```
-
----
-
-## 8. Benchmark Baselines (H100 SXM5, Qwen2.5-32B FP8)
-
-Instance: vast.ai 34803302, ssh8.vast.ai:13302
-Binary: commit 3eacacd0f, fresh kernel compile (56/57 kernels)
-Autotune: full cache with fp8_gemm + fp8_gemm_residual entries
-
-```
-N=1:    139.6 tok/s  (target: 160+, gap: GEMV path pending profiling)
-N=32:  4,257.1 tok/s
-N=64: 10,702.8 tok/s
-N=128: 18,922.8 tok/s  (baseline: 19,259)
-```
-
-O-proj residual fusion active (2-6% GEMM overhead, saves one norm kernel).
-Down-proj residual fusion disabled (38-46% overhead at K=18944).
-
----
-
-## 9. Competitive Position vs vLLM
-
-The dead f16 weight fix (28.8 GB) brings us to parity with vLLM, not
-ahead of it. vLLM loads FP8 weights directly from the checkpoint --
-it never has f16 copies on GPU. We load f16, quantize at runtime,
-and forget to free. Fixing this is a correctness bug, not a
-competitive advantage.
-
-What actually differentiates rvLLM from vLLM:
-- Kernel-level speed: CUTLASS FP8 GEMMs are 2-6x faster individually
-- Fused kernels: add+rmsnorm+fp8quant, silu+mul+fp8quant, oproj+residual
-- Lower kernel count per layer (10 vs 12-15)
-- FA3 integration
-
-The throughput gap we're chasing is CPU overhead and scheduling, not
-memory layout or kernel speed. The GPU is fast; the CPU is the
-bottleneck between steps.
+## Next Steps (Priority Order)
+
+1. Fix Bug 1: pipeline ordering (process N-1 before scheduling N)
+2. Fix Bug 3: don't shrink lm_head_weight
+3. Fix Bug 2: double-buffer pinned argmax
+4. Fix Bug 4: update cache in build()
+5. Fix Drop use-after-free (stream sync in Drop)
+6. Fix disk space on H100 instance (model download failed: ENOSPC)
+7. Compile and deploy
+8. Bench with `--profile` to verify actual CPU timing matches agent estimates
+9. Bench at longer sequence lengths to validate 18,922 tok/s claim
+10. Eliminate 147 heap allocations (GpuBatchInput clone, logprobs Vec, etc.)

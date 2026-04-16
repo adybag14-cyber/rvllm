@@ -145,6 +145,11 @@ impl InputBuilder {
         self.input.max_context_len = self.input.context_lens.iter().copied().max().unwrap_or(0);
         self.input.is_all_greedy = self.is_all_greedy;
 
+        // Update cached decode keys so build_decode_only() doesn't use stale data
+        self.cached_decode_keys.clear();
+        self.cached_decode_keys.extend_from_slice(&self.decode_keys);
+        self.cached_decode_valid = true;
+
         &self.input
     }
 
