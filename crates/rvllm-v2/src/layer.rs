@@ -949,11 +949,13 @@ impl GpuTransformerLayer {
                 &mut scratch.fp8_act_scratch, &mut scratch.fp8_act_scale,
             )?;
             // Fused FP8 GEMM + residual add (eliminates o_proj_out buffer).
-            // Hardcode non-FP8FastAccum variants: v0 (64x128x128 WS) for M<=64,
-            // v1 (128x128x128 Coop) for M>64. FP8FastAccum variants (v4+) crash
-            // with the residual EVT epilogue on certain shapes.
+            // v1 (128x128x128 Coop) is the only non-FP8FastAccum variant whose
+            // mainloop schedule (Cooperative) matches the epilogue schedule
+            // (TmaWarpSpecializedCooperative, kernels/cutlass_fp8_gemm_residual.cu:100).
+            // v0 uses non-cooperative mainloop -> CUDA_ERROR_ILLEGAL_ADDRESS on replay.
+            // FP8FastAccum variants (v4+) crash with the residual EVT epilogue.
             if ck.fp8_gemm_residual_variant_count() > 0 {
-                let variant = if num_tokens <= 64 { 0 } else { 1 };
+                let variant = 1;
                 cutlass_fp8_gemm_residual_autotuned(
                     ck, variant, &self.stream, num_tokens, hidden_size, q_dim,
                     &scratch.fp8_act_scratch, &scratch.fp8_act_scale,
