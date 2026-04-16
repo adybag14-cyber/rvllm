@@ -1,5 +1,5 @@
 #!/bin/bash
-# rsync_and_run.sh -- Push code to H100 instance and run deploy_and_bench.sh
+# rsync_and_run.sh -- Push to GitHub, pull on GPU box, build + bench.
 #
 # Usage:
 #   bash deploy/rsync_and_run.sh                          # defaults
@@ -17,43 +17,57 @@ EXTRA_ARGS="$*"
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -p ${PORT}"
 REMOTE_DIR="/root/rvllm"
+REPO_URL="git@github.com:m0at/rvllm.git"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 LOCAL_SHA=$(git -C "${REPO_DIR}" rev-parse HEAD)
-echo "Target: root@${HOST}:${PORT} -> ${REMOTE_DIR}"
+
+# Abort if tree is dirty
+if ! git -C "${REPO_DIR}" diff --quiet HEAD; then
+    echo "ERROR: Working tree is dirty. Commit first."
+    exit 1
+fi
+
 echo "Local SHA: ${LOCAL_SHA}"
+echo "Target: root@${HOST}:${PORT}"
 echo ""
 
-# Write REVISION file so the remote can verify
-echo "${LOCAL_SHA}" > "${REPO_DIR}/REVISION"
+# --- Push to GitHub ---
+echo "Pushing to GitHub..."
+git -C "${REPO_DIR}" push origin main
 
-# --- Nuke stale binary so old code can never run ---
-echo "Removing stale binary on remote..."
-ssh ${SSH_OPTS} "root@${HOST}" "rm -f ${REMOTE_DIR}/target/release/rvllm-v2-bench" 2>/dev/null || true
-
-# --- Rsync source code ---
-echo "Syncing code..."
-rsync -avz --delete \
-    --exclude target \
-    --exclude .git \
-    --exclude '.claude' \
-    --exclude '*.ptx' \
-    --exclude 'kernels/sm_*' \
-    -e "ssh ${SSH_OPTS}" \
-    "${REPO_DIR}/" "root@${HOST}:${REMOTE_DIR}/"
-
-echo ""
-echo "Running deploy_and_bench.sh on remote..."
-echo "========================================"
-
-# --- Run on remote ---
+# --- Pull on remote (clone if needed) ---
+echo "Pulling on remote..."
 ssh ${SSH_OPTS} "root@${HOST}" "
     export PATH=/root/.cargo/bin:\$PATH
-    cd ${REMOTE_DIR}
+    if [ -d ${REMOTE_DIR}/.git ]; then
+        cd ${REMOTE_DIR}
+        git fetch origin
+        git reset --hard origin/main
+    else
+        git clone ${REPO_URL} ${REMOTE_DIR}
+        cd ${REMOTE_DIR}
+    fi
+
+    # Verify SHA
+    REMOTE_SHA=\$(git rev-parse HEAD)
+    echo \"Remote SHA: \${REMOTE_SHA}\"
+    if [ \"\${REMOTE_SHA}\" != \"${LOCAL_SHA}\" ]; then
+        echo \"FATAL: SHA mismatch! Local=${LOCAL_SHA} Remote=\${REMOTE_SHA}\"
+        exit 1
+    fi
+
+    # Write REVISION for binary to read
+    echo \"${LOCAL_SHA}\" > REVISION
+
+    # Nuke stale binary
+    rm -f target/release/rvllm-v2-bench
+
+    echo ''
+    echo '========================================'
+    echo 'Running deploy_and_bench.sh...'
+    echo '========================================'
     bash deploy/deploy_and_bench.sh ${EXTRA_ARGS}
 "
-
-# Clean up REVISION file locally
-rm -f "${REPO_DIR}/REVISION"
