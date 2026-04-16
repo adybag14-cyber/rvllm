@@ -125,6 +125,11 @@ pub struct GpuModelRunner {
     pinned_meta: PinnedBuffer<i32>,
     // Stored metadata offsets from the last upload (for forward_gpu_only)
     last_meta_offsets: Option<PackedMetaOffsets>,
+    // padded_batch of the last upload_metadata_padded (None if last upload was non-padded).
+    // patch_metadata_decode is only safe when this matches the requested padded_batch:
+    // the captured graph reads at padded offsets, and a non-padded upload (e.g. from
+    // forward_greedy_launch during prefill) leaves the buffer with mismatched offsets.
+    last_padded_batch: Option<usize>,
     // Number of tokens in the pending DtoH transfer (set by launch_dtoh)
     pending_dtoh_tokens: usize,
 }
@@ -271,6 +276,7 @@ impl GpuModelRunner {
             dtoh_buf_idx: 0,
             pinned_meta,
             last_meta_offsets: None,
+            last_padded_batch: None,
             pending_dtoh_tokens: 0,
         })
     }
@@ -911,6 +917,7 @@ impl GpuModelRunner {
             num_seq_start_pos,
         };
         self.last_meta_offsets = Some(offsets);
+        self.last_padded_batch = None;
         Ok(offsets)
     }
 
@@ -1065,6 +1072,7 @@ impl GpuModelRunner {
             seq_start_pos: seq_start_pos_off,
             num_seq_start_pos: padded_batch + 1,
         });
+        self.last_padded_batch = Some(padded_batch);
 
         Ok(())
     }
@@ -1412,6 +1420,13 @@ impl GpuModelRunner {
     /// Whether prior metadata offsets exist (for incremental patching).
     pub fn has_metadata_offsets(&self) -> bool {
         self.last_meta_offsets.is_some()
+    }
+
+    /// padded_batch of the last upload_metadata_padded, or None if the last upload
+    /// was non-padded (forward_greedy path). patch_metadata_decode is only safe
+    /// when this matches the bucket the captured graph expects.
+    pub fn last_padded_batch(&self) -> Option<usize> {
+        self.last_padded_batch
     }
 }
 
