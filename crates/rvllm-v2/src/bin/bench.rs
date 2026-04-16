@@ -11,6 +11,7 @@ use std::time::Instant;
 use clap::Parser;
 use rvllm_core::prelude::SamplingParams;
 
+use rvllm_v2::engine::StepTimings;
 use rvllm_v2::integration::{init_engine, V2EngineConfig};
 
 const BENCH_PROMPTS: &[&str] = &[
@@ -75,6 +76,9 @@ struct Cli {
 
     #[arg(long)]
     fp8: bool,
+
+    #[arg(long, help = "Enable CUPTI GPU kernel profiling and CPU timing breakdown")]
+    profile: bool,
 }
 
 fn init_tracing() {
@@ -97,6 +101,12 @@ fn main() -> anyhow::Result<()> {
         .collect();
 
     let iters = cli.iters.max(1);
+
+    // Profile mode: disable CUDA graphs so CUPTI can see individual kernel launches
+    if cli.profile {
+        std::env::set_var("RVLLM_NO_GRAPH", "1");
+        eprintln!("Profile mode: CUDA graphs disabled for CUPTI visibility");
+    }
 
     if batch_sizes.len() > 1 || iters > 1 {
         eprintln!("rvLLM v2 benchmark -- direct engine, no HTTP");
@@ -141,6 +151,11 @@ fn main() -> anyhow::Result<()> {
         }
         engine.sync().map_err(|e| anyhow::anyhow!("{e}"))?;
 
+        // Profile run: CUPTI GPU profiling + CPU timing (separate from throughput measurement)
+        if cli.profile {
+            run_profiled_iteration(&mut engine, batch, &cli)?;
+        }
+
         // Bench runs
         let params = SamplingParams {
             temperature: 0.0,
@@ -163,7 +178,8 @@ fn main() -> anyhow::Result<()> {
             let mut total_tokens = 0usize;
 
             while engine.has_pending_work() {
-                let outputs = engine.step().map_err(|e| anyhow::anyhow!("{e}"))?;
+                let pending = engine.step_launch().map_err(|e| anyhow::anyhow!("{e}"))?;
+                let outputs = engine.step_collect(pending).map_err(|e| anyhow::anyhow!("{e}"))?;
                 total_tokens += outputs.len();
             }
 
@@ -219,5 +235,100 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    Ok(())
+}
+
+fn run_profiled_iteration(
+    engine: &mut rvllm_v2::integration::ConcreteEngine,
+    batch: usize,
+    cli: &Cli,
+) -> anyhow::Result<()> {
+    eprintln!("\n--- Profile run: N={batch} ---");
+
+    let params = SamplingParams {
+        temperature: 0.0,
+        max_tokens: cli.output_len,
+        ignore_eos: true,
+        ..Default::default()
+    };
+
+    for i in 0..batch {
+        let prompt = BENCH_PROMPTS[i % BENCH_PROMPTS.len()].to_string();
+        engine
+            .add_request(prompt, params.clone())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    // Try CUPTI profiling
+    let mut profiler = match rvllm_autotune::profiler::CuptiProfiler::new() {
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!("CUPTI profiler init failed (will skip GPU profiling): {e}");
+            None
+        }
+    };
+
+    if let Some(ref mut p) = profiler {
+        if let Err(e) = p.start() {
+            eprintln!("CUPTI start failed: {e}");
+            profiler = None;
+        }
+    }
+
+    // Run one full iteration with CPU timing
+    let mut total_tokens = 0usize;
+    let mut step_count = 0u64;
+    let mut acc_timings = StepTimings::default();
+
+    while engine.has_pending_work() {
+        let (outputs, timings) = engine
+            .step_profiled()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        total_tokens += outputs.len();
+        step_count += 1;
+        acc_timings.scheduler_us += timings.scheduler_us;
+        acc_timings.forward_us += timings.forward_us;
+        acc_timings.output_us += timings.output_us;
+        acc_timings.total_us += timings.total_us;
+    }
+
+    engine.sync().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Stop CUPTI and print GPU kernel breakdown
+    if let Some(ref mut p) = profiler {
+        if let Err(e) = p.stop() {
+            eprintln!("CUPTI stop failed: {e}");
+        } else {
+            eprintln!("\nGPU Kernel Breakdown (N={batch}, {total_tokens} tokens, {step_count} steps):");
+            p.print_summary(25);
+        }
+    }
+
+    // Print CPU timing breakdown
+    if step_count > 0 {
+        eprintln!("\nCPU Timing (N={batch}, {step_count} steps):");
+        eprintln!(
+            "  Scheduler:     {:.2} ms/step",
+            acc_timings.scheduler_us as f64 / step_count as f64 / 1000.0
+        );
+        eprintln!(
+            "  Forward (GPU): {:.2} ms/step",
+            acc_timings.forward_us as f64 / step_count as f64 / 1000.0
+        );
+        eprintln!(
+            "  Output proc:   {:.2} ms/step",
+            acc_timings.output_us as f64 / step_count as f64 / 1000.0
+        );
+        eprintln!(
+            "  Total:         {:.2} ms/step",
+            acc_timings.total_us as f64 / step_count as f64 / 1000.0
+        );
+        eprintln!(
+            "  Step rate:     {:.1} steps/sec",
+            step_count as f64 / (acc_timings.total_us as f64 / 1_000_000.0)
+        );
+    }
+
+    eprintln!("--- End profile run ---\n");
     Ok(())
 }

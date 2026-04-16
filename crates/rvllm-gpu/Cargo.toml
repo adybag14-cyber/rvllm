@@ -17,6 +17,7 @@ mock-gpu = []
 cuda = ["dep:cudarc", "dep:libloading"]
 cublaslt = ["cuda"]
 cuda-graphs = ["cuda"]
+hf-download = ["dep:hf-hub", "dep:sha2"]
 
 [dependencies]
 rvllm-core.workspace = true
@@ -29,6 +30,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 cudarc = { version = "0.19", features = ["driver", "cublas", "cublaslt", "f16", "cuda-version-from-build-system"], optional = true }
 libloading = { version = "0.8", optional = true }
+hf-hub = { version = "0.4", optional = true }
+sha2 = { version = "0.10", optional = true }
 
 [[bin]]
 name = "autotune-cutlass"

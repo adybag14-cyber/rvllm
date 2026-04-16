@@ -562,13 +562,25 @@ fn load_model_and_build_runner(
     let rope_sin = stream.clone_htod(&sin_table).expect("rope sin htod");
     info!(max_pos, half_dim, "RoPE tables uploaded");
 
-    // 5. Create kernel loader + cuBLAS
-    let kernel_dir_str = std::env::var("RVLLM_PTX_DIR").unwrap_or_else(|_| "kernels".into());
-    let kernel_dir = std::path::Path::new(&kernel_dir_str);
+    // 5. Resolve kernel artifacts (local override or HF download) and create loader
+    let kernel_dir = {
+        #[cfg(feature = "cuda")]
+        {
+            let gpu_arch = rvllm_gpu::kernel_artifacts::detect_gpu_arch()
+                .unwrap_or_else(|_| "sm_90".to_string());
+            rvllm_gpu::kernel_artifacts::resolve_kernel_artifacts(&gpu_arch)
+                .unwrap_or_else(|e| {
+                    warn!("kernel artifact resolution failed ({e}), falling back to 'kernels'");
+                    std::path::PathBuf::from("kernels")
+                })
+        }
+        #[cfg(not(feature = "cuda"))]
+        std::path::PathBuf::from("kernels")
+    };
     let loader = KernelLoader::new(
         stream.context().clone(),
         Arc::clone(&stream),
-        kernel_dir,
+        &kernel_dir,
     )
     .expect("failed to create kernel loader");
     loader.validate_required_kernels();
@@ -604,16 +616,16 @@ fn load_model_and_build_runner(
         Some(lt)
     };
 
-    // 6. Try loading CUTLASS
+    // 6. Try loading CUTLASS (from resolved kernel dir, then legacy paths)
     let cutlass = {
         use rvllm_gpu::cutlass_ffi::CutlassKernels;
-        let candidates = [
-            "kernels/sm_90/libcutlass_kernels.so",
-            "kernels/sm_80/libcutlass_kernels.so",
-        ];
         let mut loaded = None;
-        for p in &candidates {
-            let path = std::path::Path::new(p);
+        // Try resolved kernel dir first (cutlass/ subdir or direct)
+        let cutlass_candidates = [
+            kernel_dir.join("cutlass/libcutlass_kernels.so"),
+            kernel_dir.join("libcutlass_kernels.so"),
+        ];
+        for path in &cutlass_candidates {
             if path.exists() {
                 if let Ok(k) = CutlassKernels::load(path) {
                     info!(?path, "CUTLASS loaded");
@@ -622,38 +634,67 @@ fn load_model_and_build_runner(
                 }
             }
         }
+        // Legacy fallback
+        if loaded.is_none() {
+            for p in &["kernels/sm_90/libcutlass_kernels.so", "kernels/sm_80/libcutlass_kernels.so"] {
+                let path = std::path::Path::new(p);
+                if path.exists() {
+                    if let Ok(k) = CutlassKernels::load(path) {
+                        info!(?path, "CUTLASS loaded (legacy path)");
+                        loaded = Some(Arc::new(k));
+                        break;
+                    }
+                }
+            }
+        }
         loaded
     };
 
-    // 6a. Try loading FA3 SM90 attention kernels
+    // 6a. Try loading FA3 SM90 attention kernels (from resolved dir, then legacy)
     let fa3 = {
         use rvllm_gpu::fa3_ffi::Fa3Kernels;
-        let path = std::path::Path::new("kernels/sm_90/libfa3_kernels.so");
-        if path.exists() {
-            match Fa3Kernels::load(path) {
-                Ok(k) => {
-                    info!(?path, "FA3 SM90 loaded");
-                    Some(Arc::new(k))
-                }
-                Err(e) => {
-                    info!(?path, error = %e, "FA3 SM90 load failed, using PTX FA3");
-                    None
+        let fa3_candidates = [
+            kernel_dir.join("cutlass/libfa3_kernels.so"),
+            kernel_dir.join("libfa3_kernels.so"),
+            std::path::PathBuf::from("kernels/sm_90/libfa3_kernels.so"),
+        ];
+        let mut loaded = None;
+        for path in &fa3_candidates {
+            if path.exists() {
+                match Fa3Kernels::load(path) {
+                    Ok(k) => {
+                        info!(?path, "FA3 SM90 loaded");
+                        loaded = Some(Arc::new(k));
+                        break;
+                    }
+                    Err(e) => {
+                        info!(?path, error = %e, "FA3 load failed, trying next");
+                    }
                 }
             }
-        } else {
-            None
         }
+        if loaded.is_none() {
+            info!("FA3 .so not found, using PTX FA3");
+        }
+        loaded
     };
 
-    // 6b. Load CUTLASS autotune cache (required when CUTLASS is loaded)
+    // 6b. Load CUTLASS autotune cache (check resolved dir, then default path)
     let autotune = if cutlass.is_some() {
-        let cache_path = CutlassAutotuneCache::cache_path();
-        let cache = CutlassAutotuneCache::load(&cache_path);
+        let cache = {
+            let resolved_path = kernel_dir.join("autotune/cutlass_autotune.json");
+            if resolved_path.exists() {
+                info!(path = %resolved_path.display(), "loading autotune cache from kernel dir");
+                CutlassAutotuneCache::load(&resolved_path)
+            } else {
+                let default_path = CutlassAutotuneCache::cache_path();
+                CutlassAutotuneCache::load(&default_path)
+            }
+        };
         if cache.is_empty() {
             panic!(
-                "CUTLASS kernels loaded but autotune cache is empty at {}. \
-                 Run autotune-cutlass first: target/release/autotune-cutlass --so kernels/sm_90/libcutlass_kernels.so",
-                cache_path.display()
+                "CUTLASS kernels loaded but autotune cache is empty. \
+                 Run autotune-cutlass first, or upload cached autotune to HF kernel repo."
             );
         }
         info!(

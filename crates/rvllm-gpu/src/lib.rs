@@ -33,6 +33,8 @@ mod ffi;
 pub mod fp8_quantize;
 #[cfg(feature = "cuda")]
 pub mod cooperative;
+#[cfg(feature = "hf-download")]
+pub mod kernel_artifacts;
 #[cfg(feature = "cuda")]
 pub mod kernel_loader;
 #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]

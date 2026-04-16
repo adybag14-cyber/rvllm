@@ -506,6 +506,11 @@ pub struct Fp8LayerWeightRefs<'a> {
     pub gate_up_scale: &'a CudaSlice<f32>,
     pub down_proj_fp8: &'a CudaSlice<u8>,
     pub down_proj_scale: &'a CudaSlice<f32>,
+    // Per-row f16 scale buffers for GEMV dispatch (broadcast from per-tensor scale)
+    pub gemv_qkv_scale: Option<&'a CudaSlice<f16>>,
+    pub gemv_o_proj_scale: Option<&'a CudaSlice<f16>>,
+    pub gemv_gate_up_scale: Option<&'a CudaSlice<f16>>,
+    pub gemv_down_scale: Option<&'a CudaSlice<f16>>,
 }
 
 // ===================================================================
@@ -814,6 +819,17 @@ impl GpuTransformerLayer {
     ) -> Result<bool> {
         let cfg = &self.config;
         let num_tokens = attn.num_tokens;
+
+        // N=1 GEMV fast path: 7 kernels/layer instead of 10-11
+        if num_tokens == 1 && !attn.is_prefill {
+            if let Some(fp8w) = &weights.fp8 {
+                if fp8w.gemv_qkv_scale.is_some() {
+                    return self.forward_gemv_fp8(hidden, attn, weights, scratch,
+                        prev_mlp_out, residual_write, down_write, fa3);
+                }
+            }
+        }
+
         let hidden_size = cfg.hidden_size;
         let q_dim = cfg.q_dim();
         let kv_dim = cfg.kv_dim();
@@ -1067,14 +1083,25 @@ impl GpuTransformerLayer {
                 &scratch.gate_up_out, num_tokens, intermediate,
                 &mut scratch.fp8_act_scratch, &mut scratch.fp8_act_scale,
             )?;
-            // Down-proj uses autotuned non-residual FP8 GEMM (residual kernel lacks
-            // autotune for K=intermediate shapes and regresses ~24% vs autotuned path)
-            cutlass_fp8_gemm_dispatch(
-                ck, autotune, &self.stream, num_tokens, hidden_size, intermediate,
-                &scratch.fp8_act_scratch, &scratch.fp8_act_scale,
-                fp8w.down_proj_fp8, fp8w.down_proj_scale,
-                down_write, &mut scratch.cutlass_workspace,
-            )?;
+            // FP8 down-proj + residual fusion: GEMM output += residual_write
+            // Saves one HBM round-trip per layer (next layer reads fused result directly)
+            if ck.fp8_gemm_residual_variant_count() > 0 {
+                cutlass_fp8_gemm_residual_dispatch(
+                    ck, &self.stream, num_tokens, hidden_size, intermediate,
+                    &scratch.fp8_act_scratch, &scratch.fp8_act_scale,
+                    fp8w.down_proj_fp8, fp8w.down_proj_scale,
+                    &*residual_write, down_write,
+                    &mut scratch.cutlass_workspace,
+                )?;
+                used_fused_downproj = true;
+            } else {
+                cutlass_fp8_gemm_dispatch(
+                    ck, autotune, &self.stream, num_tokens, hidden_size, intermediate,
+                    &scratch.fp8_act_scratch, &scratch.fp8_act_scale,
+                    fp8w.down_proj_fp8, fp8w.down_proj_scale,
+                    down_write, &mut scratch.cutlass_workspace,
+                )?;
+            }
         } else {
             // SiLU activation (skip if fused gateup+silu already wrote to silu_out)
             if !used_fused_gateup {
@@ -1134,6 +1161,179 @@ impl GpuTransformerLayer {
         }
 
         Ok(used_fused_downproj)
+    }
+
+    // =================================================================
+    // GEMV N=1 decode path: fused FP8 GEMV kernels (7 launches/layer)
+    // =================================================================
+
+    fn forward_gemv_fp8(
+        &self,
+        hidden: &CudaSlice<f16>,
+        attn: &AttentionMeta<'_>,
+        weights: &LayerWeights<'_>,
+        scratch: &mut F16LayerScratch,
+        prev_mlp_out: Option<&CudaSlice<f16>>,
+        residual_write: &mut CudaSlice<f16>,
+        down_write: &mut CudaSlice<f16>,
+        fa3: Option<&Fa3Kernels>,
+    ) -> Result<bool> {
+        let cfg = &self.config;
+        let hidden_size = cfg.hidden_size;
+        let q_dim = cfg.q_dim();
+        let kv_dim = cfg.kv_dim();
+        let qkv_dim = cfg.qkv_dim();
+        let intermediate = cfg.intermediate_size;
+        let gate_up_dim = cfg.gate_up_dim();
+        let num_tokens = 1;
+        let q_end = q_dim;
+        let k_end = q_end + kv_dim;
+
+        let fp8w = weights.fp8.as_ref().unwrap();
+        let gemv_qkv_s = fp8w.gemv_qkv_scale.unwrap();
+        let gemv_oproj_s = fp8w.gemv_o_proj_scale.unwrap();
+        let gemv_gateup_s = fp8w.gemv_gate_up_scale.unwrap();
+        let gemv_down_s = fp8w.gemv_down_scale.unwrap();
+
+        // Step 1: fused (add+)norm + QKV FP8 GEMV  [1 kernel]
+        if let Some(prev_mlp) = prev_mlp_out {
+            let kernel = self.loader.get_func("gemv_fp8", "fused_add_norm_fp8_gemv_kernel")?;
+            let grid_x = ((qkv_dim + 7) / 8) as u32;
+            let smem = (hidden_size * 4 + 32) as u32;
+            unsafe {
+                self.stream.launch_builder(&kernel)
+                    .arg(&scratch.qkv_buf)
+                    .arg(&scratch.residual_tmp)
+                    .arg(hidden)
+                    .arg(prev_mlp)
+                    .arg(weights.input_layernorm_weight)
+                    .arg(fp8w.qkv_fp8)
+                    .arg(gemv_qkv_s)
+                    .arg(&cfg.rms_norm_eps)
+                    .arg(&(hidden_size as i32))
+                    .arg(&(qkv_dim as i32))
+                    .launch(LaunchConfig {
+                        grid_dim: (grid_x, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: smem,
+                    })
+                    .map_err(|e| LLMError::GpuError(format!("gemv qkv add_norm: {e}")))?;
+            }
+        } else {
+            let kernel = self.loader.get_func("gemv_fp8", "fused_norm_fp8_gemv_kernel")?;
+            let grid_x = ((qkv_dim + 7) / 8) as u32;
+            let smem = (hidden_size * 4 + 32) as u32;
+            unsafe {
+                self.stream.launch_builder(&kernel)
+                    .arg(&scratch.qkv_buf)
+                    .arg(hidden)
+                    .arg(weights.input_layernorm_weight)
+                    .arg(fp8w.qkv_fp8)
+                    .arg(gemv_qkv_s)
+                    .arg(&cfg.rms_norm_eps)
+                    .arg(&(hidden_size as i32))
+                    .arg(&(qkv_dim as i32))
+                    .launch(LaunchConfig {
+                        grid_dim: (grid_x, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: smem,
+                    })
+                    .map_err(|e| LLMError::GpuError(format!("gemv qkv norm: {e}")))?;
+            }
+        }
+
+        // Step 2: fused RoPE + KV cache write  [1 kernel]
+        self.fused_rope_cache_write_batch(&mut scratch.qkv_buf, attn, num_tokens)?;
+
+        // Step 3: attention  [1-2 kernels]
+        self.attention(
+            &scratch.qkv_buf, attn, q_end, num_tokens,
+            &mut scratch.attn_out,
+            &mut scratch.attn_split_out,
+            &mut scratch.attn_split_max,
+            &mut scratch.attn_split_sum,
+            fa3,
+        )?;
+
+        // Residual source for O-proj residual connection
+        let residual_src = if prev_mlp_out.is_some() {
+            &scratch.residual_tmp
+        } else {
+            hidden
+        };
+
+        // Step 4: O-proj FP8 GEMV  [1 kernel]
+        {
+            let kernel = self.loader.get_func("gemv_fp8", "gemv_fp8_kernel")?;
+            let grid_x = ((hidden_size + 7) / 8) as u32;
+            unsafe {
+                self.stream.launch_builder(&kernel)
+                    .arg(&scratch.o_proj_out)
+                    .arg(&scratch.attn_out)
+                    .arg(fp8w.o_proj_fp8)
+                    .arg(gemv_oproj_s)
+                    .arg(&(hidden_size as i32))
+                    .arg(&(q_dim as i32))
+                    .launch(LaunchConfig {
+                        grid_dim: (grid_x, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 32,
+                    })
+                    .map_err(|e| LLMError::GpuError(format!("gemv oproj: {e}")))?;
+            }
+        }
+
+        // Step 5: residual add + post-attn norm + GateUp FP8 GEMV  [1 kernel]
+        {
+            let kernel = self.loader.get_func("gemv_fp8", "fused_add_norm_fp8_gemv_kernel")?;
+            let grid_x = ((gate_up_dim + 7) / 8) as u32;
+            let smem = (hidden_size * 4 + 32) as u32;
+            unsafe {
+                self.stream.launch_builder(&kernel)
+                    .arg(&scratch.gate_up_out)
+                    .arg(residual_write)
+                    .arg(residual_src)
+                    .arg(&scratch.o_proj_out)
+                    .arg(weights.post_attention_layernorm_weight)
+                    .arg(fp8w.gate_up_fp8)
+                    .arg(gemv_gateup_s)
+                    .arg(&cfg.rms_norm_eps)
+                    .arg(&(hidden_size as i32))
+                    .arg(&(gate_up_dim as i32))
+                    .launch(LaunchConfig {
+                        grid_dim: (grid_x, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: smem,
+                    })
+                    .map_err(|e| LLMError::GpuError(format!("gemv gateup add_norm: {e}")))?;
+            }
+        }
+
+        // Step 6: fused SiLU*mul + Down FP8 GEMV  [1 kernel]
+        {
+            let kernel = self.loader.get_func("fused_silu_down_gemv", "fused_cute_silu_down_fp8_gemv")?;
+            let grid_x = ((hidden_size + 7) / 8) as u32;
+            unsafe {
+                self.stream.launch_builder(&kernel)
+                    .arg(down_write)
+                    .arg(&scratch.gate_up_out)                                    // gate
+                    .arg(&scratch.gate_up_out.slice(intermediate..gate_up_dim))    // up
+                    .arg(fp8w.down_proj_fp8)
+                    .arg(gemv_down_s)
+                    .arg(&(hidden_size as i32))
+                    .arg(&(intermediate as i32))
+                    .launch(LaunchConfig {
+                        grid_dim: (grid_x, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 32,
+                    })
+                    .map_err(|e| LLMError::GpuError(format!("gemv silu_down: {e}")))?;
+            }
+        }
+
+        // GEMV path does NOT fuse down+residual (returns false)
+        // The next layer's GEMV path handles the residual add in the fused_add_norm kernel
+        Ok(false)
     }
 
     // =================================================================

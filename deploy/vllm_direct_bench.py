@@ -78,11 +78,11 @@ def bench_concurrency(
 def main():
     parser = argparse.ArgumentParser(description="vLLM direct engine benchmark")
     parser.add_argument("--model", default="Qwen/Qwen2.5-7B")
-    parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--output", default="/root/results_vllm_direct.json")
-    parser.add_argument("--concurrency", type=str, default="1,4,16,32,64,128",
+    parser.add_argument("--concurrency", type=str, default="1,32,64,128",
                         help="Comma-separated concurrency levels")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--ignore-eos", action="store_true", default=True)

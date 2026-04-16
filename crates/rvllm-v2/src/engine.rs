@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use rvllm_core::prelude::{
     CompletionOutput, FinishReason, RequestId, RequestOutput, SamplingParams, SequenceId, TokenId,
@@ -27,6 +28,14 @@ struct EngineRequest {
 
 pub struct StepPending {
     sched_out: SchedulerOutput,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StepTimings {
+    pub scheduler_us: u64,
+    pub forward_us: u64,
+    pub output_us: u64,
+    pub total_us: u64,
 }
 
 /// Maximum consecutive decode-only steps before forcing an admission round.
@@ -151,6 +160,49 @@ impl<B: BlockManagerOps> Engine<B> {
         // Recycle the diff so Vec capacity is reused next step
         self.scheduler.recycle_diff(sched_out.diff);
         Ok(result)
+    }
+
+    pub fn step_profiled(&mut self) -> Result<(Vec<V2RequestOutput>, StepTimings), EngineError> {
+        let t_total = Instant::now();
+
+        let t0 = Instant::now();
+        let sched_out = if self.should_use_decode_lane() {
+            self.decode_steps_since_admission += 1;
+            self.scheduler.schedule_decode_only()
+        } else {
+            self.decode_steps_since_admission = 0;
+            self.scheduler.schedule()
+        };
+        let scheduler_us = t0.elapsed().as_micros() as u64;
+
+        if sched_out.diff.is_empty() {
+            self.scheduler.recycle_diff(sched_out.diff);
+            return Ok((Vec::new(), StepTimings {
+                scheduler_us,
+                ..Default::default()
+            }));
+        }
+
+        let t1 = Instant::now();
+        let fwd_output = self
+            .worker
+            .step(&sched_out.diff)
+            .map_err(|e| EngineError::Worker(e.to_string()))?;
+        let forward_us = t1.elapsed().as_micros() as u64;
+
+        let t2 = Instant::now();
+        let result = self.process_forward_output(&sched_out, &fwd_output);
+        let output_us = t2.elapsed().as_micros() as u64;
+
+        self.scheduler.recycle_diff(sched_out.diff);
+
+        let timings = StepTimings {
+            scheduler_us,
+            forward_us,
+            output_us,
+            total_us: t_total.elapsed().as_micros() as u64,
+        };
+        Ok((result, timings))
     }
 
     pub fn step_launch(&mut self) -> Result<Option<StepPending>, EngineError> {
@@ -524,8 +576,15 @@ impl<B: BlockManagerOps> Engine<B> {
         }
 
         if !req.sampling_params.stop_strings.is_empty() {
-            let mut check_ids = req.output_token_ids.clone();
-            check_ids.push(token_id);
+            // Use a sliding window of the last 50 tokens instead of cloning the full history.
+            // Stop strings are short, so checking a tail window suffices.
+            let window = 50;
+            let start = req.output_token_ids.len().saturating_sub(window);
+            let check_ids: Vec<TokenId> = req.output_token_ids[start..]
+                .iter()
+                .copied()
+                .chain(std::iter::once(token_id))
+                .collect();
             if let Ok(text) = self.tokenizer.decode(&check_ids) {
                 for stop in &req.sampling_params.stop_strings {
                     if text.contains(stop.as_str()) {

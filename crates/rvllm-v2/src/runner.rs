@@ -57,6 +57,11 @@ struct ModelWeightsStore {
     fp8_lm_head: Option<CudaSlice<u8>>,
     fp8_lm_head_scale: Option<CudaSlice<f32>>,
     fp8_enabled: bool,
+    // Per-row f16 scale buffers for GEMV N=1 dispatch (broadcast from per-tensor scale)
+    gemv_qkv_scales: Vec<CudaSlice<f16>>,
+    gemv_o_proj_scales: Vec<CudaSlice<f16>>,
+    gemv_gate_up_scales: Vec<CudaSlice<f16>>,
+    gemv_down_scales: Vec<CudaSlice<f16>>,
 }
 
 /// Offsets into the packed metadata GPU buffer (i32 elements).
@@ -226,6 +231,10 @@ impl GpuModelRunner {
                 fp8_lm_head: None,
                 fp8_lm_head_scale: None,
                 fp8_enabled: false,
+                gemv_qkv_scales: Vec::new(),
+                gemv_o_proj_scales: Vec::new(),
+                gemv_gate_up_scales: Vec::new(),
+                gemv_down_scales: Vec::new(),
             },
             embed_tokens,
             lm_head_weight,
@@ -272,11 +281,16 @@ impl GpuModelRunner {
         let mut fp8_gate_up_scales = Vec::with_capacity(num_layers);
         let mut fp8_down = Vec::with_capacity(num_layers);
         let mut fp8_down_scales = Vec::with_capacity(num_layers);
+        let mut gemv_qkv_scales = Vec::with_capacity(num_layers);
+        let mut gemv_o_proj_scales = Vec::with_capacity(num_layers);
+        let mut gemv_gate_up_scales = Vec::with_capacity(num_layers);
+        let mut gemv_down_scales = Vec::with_capacity(num_layers);
 
         for layer_idx in 0..num_layers {
             // Read f16 weights from GPU to CPU for quantization
+            // Returns (fp8_data, per-tensor_scale, per-row_gemv_scale_f16)
             let quantize_and_upload = |weight: &CudaSlice<f16>, out_dim: usize, in_dim: usize, name: &str|
-                -> Result<(CudaSlice<u8>, CudaSlice<f32>)>
+                -> Result<(CudaSlice<u8>, CudaSlice<f32>, CudaSlice<f16>)>
             {
                 let cpu_f16: Vec<f16> = self.stream.clone_dtoh(weight)
                     .map_err(|e| LLMError::GpuError(format!("{name} DtoH: {e}")))?;
@@ -285,8 +299,13 @@ impl GpuModelRunner {
                     .map_err(|e| LLMError::GpuError(format!("{name} fp8 HtoD: {e}")))?;
                 let gpu_scale = self.stream.clone_htod(&[q.scale])
                     .map_err(|e| LLMError::GpuError(format!("{name} scale HtoD: {e}")))?;
+                // Broadcast per-tensor scale to per-row f16 buffer for GEMV kernels
+                let scale_f16 = f16::from_f32(q.scale);
+                let gemv_scale_buf: Vec<f16> = vec![scale_f16; out_dim];
+                let gpu_gemv_scale = self.stream.clone_htod(&gemv_scale_buf)
+                    .map_err(|e| LLMError::GpuError(format!("{name} gemv scale HtoD: {e}")))?;
                 tracing::debug!(layer_idx, name, out_dim, in_dim, scale = q.scale, "FP8 quantized");
-                Ok((gpu_fp8, gpu_scale))
+                Ok((gpu_fp8, gpu_scale, gpu_gemv_scale))
             };
 
             let cfg = self.layers[layer_idx].config_ref();
@@ -296,13 +315,13 @@ impl GpuModelRunner {
             let intermediate = cfg.intermediate_size;
             let gate_up_dim = cfg.gate_up_dim();
 
-            let (qkv_fp8, qkv_s) = quantize_and_upload(
+            let (qkv_fp8, qkv_s, qkv_gs) = quantize_and_upload(
                 &self.weights.fused_qkv[layer_idx], qkv_dim, hidden, "qkv")?;
-            let (oproj_fp8, oproj_s) = quantize_and_upload(
+            let (oproj_fp8, oproj_s, oproj_gs) = quantize_and_upload(
                 &self.weights.o_proj[layer_idx], hidden, q_dim, "o_proj")?;
-            let (gateup_fp8, gateup_s) = quantize_and_upload(
+            let (gateup_fp8, gateup_s, gateup_gs) = quantize_and_upload(
                 &self.weights.fused_gate_up[layer_idx], gate_up_dim, hidden, "gate_up")?;
-            let (down_fp8, down_s) = quantize_and_upload(
+            let (down_fp8, down_s, down_gs) = quantize_and_upload(
                 &self.weights.down_proj[layer_idx], hidden, intermediate, "down_proj")?;
 
             fp8_qkv.push(qkv_fp8);
@@ -313,6 +332,10 @@ impl GpuModelRunner {
             fp8_gate_up_scales.push(gateup_s);
             fp8_down.push(down_fp8);
             fp8_down_scales.push(down_s);
+            gemv_qkv_scales.push(qkv_gs);
+            gemv_o_proj_scales.push(oproj_gs);
+            gemv_gate_up_scales.push(gateup_gs);
+            gemv_down_scales.push(down_gs);
         }
 
         self.weights.fp8_qkv = fp8_qkv;
@@ -323,6 +346,10 @@ impl GpuModelRunner {
         self.weights.fp8_gate_up_scales = fp8_gate_up_scales;
         self.weights.fp8_down = fp8_down;
         self.weights.fp8_down_scales = fp8_down_scales;
+        self.weights.gemv_qkv_scales = gemv_qkv_scales;
+        self.weights.gemv_o_proj_scales = gemv_o_proj_scales;
+        self.weights.gemv_gate_up_scales = gemv_gate_up_scales;
+        self.weights.gemv_down_scales = gemv_down_scales;
 
         // Quantize LM head weight
         {
@@ -431,6 +458,10 @@ impl GpuModelRunner {
                     gate_up_scale: &weights.fp8_gate_up_scales[layer_idx],
                     down_proj_fp8: &weights.fp8_down[layer_idx],
                     down_proj_scale: &weights.fp8_down_scales[layer_idx],
+                    gemv_qkv_scale: weights.gemv_qkv_scales.get(layer_idx),
+                    gemv_o_proj_scale: weights.gemv_o_proj_scales.get(layer_idx),
+                    gemv_gate_up_scale: weights.gemv_gate_up_scales.get(layer_idx),
+                    gemv_down_scale: weights.gemv_down_scales.get(layer_idx),
                 })
             } else {
                 None
@@ -604,6 +635,10 @@ impl GpuModelRunner {
                     gate_up_scale: &weights.fp8_gate_up_scales[layer_idx],
                     down_proj_fp8: &weights.fp8_down[layer_idx],
                     down_proj_scale: &weights.fp8_down_scales[layer_idx],
+                    gemv_qkv_scale: weights.gemv_qkv_scales.get(layer_idx),
+                    gemv_o_proj_scale: weights.gemv_o_proj_scales.get(layer_idx),
+                    gemv_gate_up_scale: weights.gemv_gate_up_scales.get(layer_idx),
+                    gemv_down_scale: weights.gemv_down_scales.get(layer_idx),
                 })
             } else {
                 None
@@ -1095,6 +1130,10 @@ impl GpuModelRunner {
                     gate_up_scale: &weights.fp8_gate_up_scales[layer_idx],
                     down_proj_fp8: &weights.fp8_down[layer_idx],
                     down_proj_scale: &weights.fp8_down_scales[layer_idx],
+                    gemv_qkv_scale: weights.gemv_qkv_scales.get(layer_idx),
+                    gemv_o_proj_scale: weights.gemv_o_proj_scales.get(layer_idx),
+                    gemv_gate_up_scale: weights.gemv_gate_up_scales.get(layer_idx),
+                    gemv_down_scale: weights.gemv_down_scales.get(layer_idx),
                 })
             } else {
                 None

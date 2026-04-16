@@ -13,7 +13,7 @@ categories = ["science", "concurrency", "hardware-support"]
 
 [features]
 default = ["cuda"]
-cuda = ["rvllm-gpu/cuda", "rvllm-gpu/cublaslt", "rvllm-model-loader/cuda", "dep:cudarc"]
+cuda = ["rvllm-gpu/cuda", "rvllm-gpu/cublaslt", "rvllm-gpu/hf-download", "rvllm-model-loader/cuda", "dep:cudarc", "dep:rvllm-autotune"]
 cuda-graphs = ["cuda", "rvllm-gpu/cuda-graphs"]
 advanced = [
     "dep:rvllm-fusion",
