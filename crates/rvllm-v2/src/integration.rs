@@ -351,7 +351,7 @@ fn run_serving_loop(
             }
         }
 
-        let outputs = match engine.step() {
+        let outputs = match engine.step_pipelined() {
             Ok(outputs) => outputs,
             Err(e) => {
                 warn!("engine step failed: {e}");
@@ -359,6 +359,17 @@ fn run_serving_loop(
             }
         };
 
+        for output in &outputs {
+            if output.finished {
+                if let Some(tx) = response_map.remove(&output.request_id) {
+                    let _ = tx.send(vec![output.clone()]);
+                }
+            }
+        }
+    }
+
+    // Drain any final pipelined step before shutdown.
+    if let Ok(outputs) = engine.step_pipelined_flush() {
         for output in &outputs {
             if output.finished {
                 if let Some(tx) = response_map.remove(&output.request_id) {
