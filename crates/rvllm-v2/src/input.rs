@@ -61,8 +61,9 @@ impl InputBuilder {
            && self.cached_decode_keys.len() == requests.len()
         {
             // Reuse cached key order -- just refresh per-sequence values
-            let keys: Vec<_> = self.cached_decode_keys.clone();
-            for &id in &keys {
+            // Iterate by index to avoid cloning the key Vec (borrow checker)
+            for i in 0..self.cached_decode_keys.len() {
+                let id = self.cached_decode_keys[i];
                 let req = &requests[&id];
                 self.add_decode_request(req, block_size);
             }

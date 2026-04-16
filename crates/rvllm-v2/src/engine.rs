@@ -63,6 +63,7 @@ pub struct Engine<B: BlockManagerOps> {
     prev_pending: Option<PipelinedPending>,
     // Pre-allocated output buffers (reused across steps)
     reusable_step_results: Vec<(SequenceId, TokenId, bool)>,
+    reusable_request_outputs: Vec<V2RequestOutput>,
 }
 
 impl<B: BlockManagerOps> Engine<B> {
@@ -84,6 +85,7 @@ impl<B: BlockManagerOps> Engine<B> {
             decode_steps_since_admission: 0,
             prev_pending: None,
             reusable_step_results: Vec::with_capacity(256),
+            reusable_request_outputs: Vec::with_capacity(256),
         }
     }
 
@@ -491,7 +493,7 @@ impl<B: BlockManagerOps> Engine<B> {
                     output_token_ids,
                     finished: req.finished,
                     finish_reason: req.finish_reason,
-                    logprobs: Vec::new(),
+                    logprob: 0.0,
                 });
             }
         }
@@ -510,7 +512,10 @@ impl<B: BlockManagerOps> Engine<B> {
     ) -> Vec<V2RequestOutput> {
         let diff = &sched_out.diff;
         self.reusable_step_results.clear();
-        let mut request_outputs: Vec<V2RequestOutput> = Vec::new();
+        // Swap out the reusable buffer -- caller gets the pre-allocated Vec,
+        // and we get back an empty one (possibly with capacity from last return).
+        let mut request_outputs = std::mem::take(&mut self.reusable_request_outputs);
+        request_outputs.clear();
         let mut token_idx = 0;
 
         // Process added (prefill) requests
@@ -569,6 +574,14 @@ impl<B: BlockManagerOps> Engine<B> {
         request_outputs
     }
 
+    /// Return a consumed output Vec so its capacity can be reused next step.
+    pub fn recycle_request_outputs(&mut self, mut outputs: Vec<V2RequestOutput>) {
+        outputs.clear();
+        if outputs.capacity() > self.reusable_request_outputs.capacity() {
+            self.reusable_request_outputs = outputs;
+        }
+    }
+
     fn build_request_outputs(
         &self,
         diff: &StepDiff,
@@ -599,7 +612,7 @@ impl<B: BlockManagerOps> Engine<B> {
                     output_token_ids,
                     finished: req.finished,
                     finish_reason: req.finish_reason,
-                    logprobs: vec![logprob],
+                    logprob,
                 });
             }
         }
@@ -621,7 +634,7 @@ impl<B: BlockManagerOps> Engine<B> {
                     output_token_ids,
                     finished: req.finished,
                     finish_reason: req.finish_reason,
-                    logprobs: vec![logprob],
+                    logprob,
                 });
             }
         }
@@ -718,7 +731,7 @@ impl<B: BlockManagerOps> Engine<B> {
                 index: 0,
                 text: v2out.output_text.clone(),
                 token_ids: v2out.output_token_ids.clone(),
-                cumulative_logprob: v2out.logprobs.iter().sum(),
+                cumulative_logprob: v2out.logprob,
                 logprobs: None,
                 finish_reason: v2out.finish_reason,
             }],

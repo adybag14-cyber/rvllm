@@ -16,6 +16,21 @@ use crate::types::{
     TokenId, WorkerRequest,
 };
 
+/// Reinterpret `&[i32]` as `&[TokenId]` (u32) without copying.
+/// Safety: i32 and u32 have identical size, alignment, and no invalid bit patterns.
+#[inline(always)]
+fn i32_slice_as_token_ids(s: &[i32]) -> &[TokenId] {
+    unsafe { std::slice::from_raw_parts(s.as_ptr() as *const TokenId, s.len()) }
+}
+
+/// Reinterpret `Vec<i32>` as `Vec<TokenId>` (u32) without allocating or copying.
+/// Safety: i32 and u32 have identical size, alignment, and no invalid bit patterns.
+#[inline(always)]
+fn vec_i32_to_token_ids(v: Vec<i32>) -> Vec<TokenId> {
+    let mut v = std::mem::ManuallyDrop::new(v);
+    unsafe { Vec::from_raw_parts(v.as_mut_ptr() as *mut TokenId, v.len(), v.capacity()) }
+}
+
 // ===================================================================
 // WorkerConfig
 // ===================================================================
@@ -189,59 +204,47 @@ impl Worker {
                     graph.replay_on(self.runner.cuda_stream())
                         .map_err(|e| WorkerError::Runner(format!("graph replay: {e}")))?;
                     let token_ids_i32 = self.runner.read_graph_output(num_seqs)?;
-                    let token_ids: Vec<TokenId> =
-                        token_ids_i32.iter().map(|&t| t as TokenId).collect();
+                    let token_ids = i32_slice_as_token_ids(token_ids_i32).to_vec();
                     self.forward_count += 1;
                     return Ok(ForwardOutput { token_ids, logprobs: Vec::new() });
                 }
-            }
-        }
 
-        // Slow path: clone input for methods that take &mut self on Worker
-        let input = input_ref.clone();
-
-        if input.is_all_decode {
-            let actual_batch = input.num_seqs;
-
-            // Try CUDA graph capture for decode batches
-            if self.graph_enabled {
-                if let Some(padded) = padded_batch_size(actual_batch) {
-                    let count = self.warmup_count.entry(padded).or_insert(0);
-                    *count += 1;
-                    if *count == GRAPH_WARMUP_CALLS {
-                        match self.capture_decode_graph(&input, actual_batch, padded) {
-                            Ok(output) => {
-                                self.forward_count += 1;
-                                return Ok(output);
-                            }
-                            Err(e) => {
-                                warn!(padded, "graph capture failed, disabling for this bucket: {e}");
-                            }
+                // Graph capture check (one-time per bucket during warmup)
+                let count = self.warmup_count.entry(padded).or_insert(0);
+                *count += 1;
+                if *count == GRAPH_WARMUP_CALLS {
+                    // Graph capture needs &mut self -- clone input (one-time cost per bucket)
+                    let input = input_ref.clone();
+                    match self.capture_decode_graph(&input, num_seqs, padded) {
+                        Ok(output) => {
+                            self.forward_count += 1;
+                            return Ok(output);
+                        }
+                        Err(e) => {
+                            warn!(padded, "graph capture failed, disabling for this bucket: {e}");
                         }
                     }
+                    // Capture failed, fall through to normal forward -- rebuild input_ref
+                    let input_ref = self.input_builder.build(&self.requests, self.block_size);
+                    let token_ids_i32 = self.runner
+                        .forward_greedy(input_ref, &self.kv_cache)
+                        .map_err(|e| WorkerError::Runner(format!("{e}")))?;
+                    return Ok(ForwardOutput {
+                        token_ids: vec_i32_to_token_ids(token_ids_i32),
+                        logprobs: Vec::new(),
+                    });
                 }
             }
-
-            // Normal forward (pre-graph-capture warmup)
-            let token_ids_i32 = self.runner
-                .forward_greedy(&input, &self.kv_cache)
-                .map_err(|e| WorkerError::Runner(format!("{e}")))?;
-            let token_ids: Vec<TokenId> = token_ids_i32.iter().map(|&t| t as TokenId).collect();
-            Ok(ForwardOutput {
-                token_ids,
-                logprobs: Vec::new(),
-            })
-        } else {
-            // Mixed batch (prefill + decode): still use GPU argmax to avoid massive logits DtoH
-            let token_ids_i32 = self.runner
-                .forward_greedy(&input, &self.kv_cache)
-                .map_err(|e| WorkerError::Runner(format!("{e}")))?;
-            let token_ids: Vec<TokenId> = token_ids_i32.iter().map(|&t| t as TokenId).collect();
-            Ok(ForwardOutput {
-                token_ids,
-                logprobs: Vec::new(),
-            })
         }
+
+        // Normal forward: disjoint field borrows (runner + kv_cache vs input_builder)
+        let token_ids_i32 = self.runner
+            .forward_greedy(input_ref, &self.kv_cache)
+            .map_err(|e| WorkerError::Runner(format!("{e}")))?;
+        Ok(ForwardOutput {
+            token_ids: vec_i32_to_token_ids(token_ids_i32),
+            logprobs: Vec::new(),
+        })
     }
 
     // =================================================================
@@ -264,23 +267,24 @@ impl Worker {
         // Decode-only with no adds/removes: use cached key order (skip sort)
         let set_changed = !diff.added.is_empty() || !diff.removed.is_empty();
         let is_decode_only = diff.added.is_empty();
-        let input = if is_decode_only {
-            self.input_builder.build_decode_only(&self.requests, self.block_size, set_changed).clone()
+        let input_ref = if is_decode_only {
+            self.input_builder.build_decode_only(&self.requests, self.block_size, set_changed)
         } else {
-            self.input_builder.build(&self.requests, self.block_size).clone()
+            self.input_builder.build(&self.requests, self.block_size)
         };
-        let num_seqs = input.num_seqs;
+        let num_seqs = input_ref.num_seqs;
+        let is_all_decode = input_ref.is_all_decode;
 
-        if input.is_all_decode {
+        if is_all_decode {
             if self.graph_enabled {
                 if let Some(padded) = padded_batch_size(num_seqs) {
                     if self.graph_pool.has_graph(num_seqs) {
                         // Incremental patch when no sequences added/removed and prior offsets exist
                         let has_block_changes = !diff.block_ops.copies.is_empty();
                         if !set_changed && self.runner.has_metadata_offsets() {
-                            self.runner.patch_metadata_decode(&input, padded, has_block_changes)?;
+                            self.runner.patch_metadata_decode(input_ref, padded, has_block_changes)?;
                         } else {
-                            self.runner.upload_metadata_padded(&input, padded)?;
+                            self.runner.upload_metadata_padded(input_ref, padded)?;
                         }
                         let graph = self.graph_pool.get(num_seqs).unwrap();
                         graph.replay_on(self.runner.cuda_stream())
@@ -295,7 +299,7 @@ impl Worker {
                 }
             }
             // No graph: launch forward async then enqueue DtoH
-            self.runner.forward_greedy_launch(&input, &self.kv_cache)
+            self.runner.forward_greedy_launch(input_ref, &self.kv_cache)
                 .map_err(|e| WorkerError::Runner(format!("{e}")))?;
             self.runner.launch_dtoh(num_seqs)
                 .map_err(|e| WorkerError::Runner(format!("{e}")))?;
@@ -303,7 +307,7 @@ impl Worker {
             self.pending = Some(PendingForward { num_seqs, is_decode: true, stored_output: None });
         } else {
             // Mixed prefill+decode: launch forward + enqueue DtoH
-            self.runner.forward_greedy_launch(&input, &self.kv_cache)
+            self.runner.forward_greedy_launch(input_ref, &self.kv_cache)
                 .map_err(|e| WorkerError::Runner(format!("{e}")))?;
             self.runner.launch_dtoh(num_seqs)
                 .map_err(|e| WorkerError::Runner(format!("{e}")))?;
@@ -335,7 +339,7 @@ impl Worker {
             .map_err(|e| WorkerError::Runner(format!("{e}")))?;
         let token_ids_i32 = self.runner.read_completed_output();
         let token_ids: Vec<TokenId> =
-            token_ids_i32.iter().map(|&t| t as TokenId).collect();
+            i32_slice_as_token_ids(&token_ids_i32).to_vec();
         Ok(ForwardOutput { token_ids, logprobs: Vec::new() })
     }
 
@@ -371,7 +375,7 @@ impl Worker {
 
         let token_ids_i32 = self.runner.read_completed_output();
         let token_ids: Vec<TokenId> =
-            token_ids_i32.iter().map(|&t| t as TokenId).collect();
+            i32_slice_as_token_ids(&token_ids_i32).to_vec();
         Ok(ForwardOutput { token_ids, logprobs: Vec::new() })
     }
 
@@ -402,15 +406,17 @@ impl Worker {
         if self.requests.is_empty() {
             return Ok(ForwardOutput::default());
         }
-        let input = self.input_builder.build(&self.requests, self.block_size).clone();
-        if input.is_all_decode {
+        let input_ref = self.input_builder.build(&self.requests, self.block_size);
+        let is_all_decode = input_ref.is_all_decode;
+        if is_all_decode {
             let token_ids_i32 = self.runner
-                .forward_greedy(&input, &self.kv_cache)
+                .forward_greedy(input_ref, &self.kv_cache)
                 .map_err(|e| WorkerError::Runner(format!("{e}")))?;
-            let token_ids: Vec<TokenId> = token_ids_i32.iter().map(|&t| t as TokenId).collect();
             self.forward_count += 1;
-            Ok(ForwardOutput { token_ids, logprobs: Vec::new() })
+            Ok(ForwardOutput { token_ids: vec_i32_to_token_ids(token_ids_i32), logprobs: Vec::new() })
         } else {
+            // Mixed batch needs clone: execute_forward takes &mut self overlapping input_builder borrow
+            let input = input_ref.clone();
             self.forward_count += 1;
             let logits = self.execute_forward(&input)?;
             Ok(self.sample_greedy(&logits, &input))
@@ -600,7 +606,7 @@ impl Worker {
                 // Read output from the warmup+capture forward
                 let token_ids_i32 = self.runner.read_graph_output(actual_batch)?;
                 let token_ids: Vec<TokenId> =
-                    token_ids_i32.iter().map(|&t| t as TokenId).collect();
+                    i32_slice_as_token_ids(&token_ids_i32).to_vec();
                 Ok(ForwardOutput {
                     token_ids,
                     logprobs: Vec::new(),

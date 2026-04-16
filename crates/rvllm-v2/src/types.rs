@@ -200,5 +200,5 @@ pub struct V2RequestOutput {
     pub output_token_ids: Vec<TokenId>,
     pub finished: bool,
     pub finish_reason: Option<FinishReason>,
-    pub logprobs: Vec<f32>,
+    pub logprob: f32,
 }
