@@ -12,7 +12,7 @@ use cudarc::driver::sys as cu_sys;
 use cudarc::driver::{CudaContext, DevicePtr, DevicePtrMut};
 use half::f16;
 use rvllm_gpu::cutlass_autotune::CutlassAutotuneCache;
-use rvllm_gpu::cutlass_ffi::{CutlassKernels, HGEMM_VARIANTS, OPROJ_RESIDUAL_VARIANTS, GATEUP_SILU_VARIANTS, FP8_GEMM_VARIANTS};
+use rvllm_gpu::cutlass_ffi::{CutlassKernels, HGEMM_VARIANTS, OPROJ_RESIDUAL_VARIANTS, GATEUP_SILU_VARIANTS, FP8_GEMM_VARIANTS, FP8_GEMM_RESIDUAL_VARIANTS};
 use std::ffi::c_void;
 use std::path::PathBuf;
 
@@ -46,6 +46,12 @@ const FP8_SHAPES: &[(usize, usize, &str)] = &[
     (37888, 3584, "gate_up"),
     (3584, 18944, "down"),
     (152064, 3584, "lm_head"),
+];
+
+// FP8 GEMM + residual shapes: down-proj fused with residual add
+// C = A @ W + residual, shape (M, hidden, intermediate) = (M, 3584, 18944)
+const FP8_RESIDUAL_SHAPES: &[(usize, usize, &str)] = &[
+    (3584, 18944, "down+residual"),
 ];
 
 const M_VALUES: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128, 256];
@@ -429,6 +435,47 @@ fn bench_fp8_gemm_variant(
     Some(median(&mut times))
 }
 
+/// Time a single FP8 GEMM + residual variant. Returns median microseconds or None.
+fn bench_fp8_gemm_residual_variant(
+    cutlass: &CutlassKernels,
+    variant: usize,
+    cu_stream: cu_sys::CUstream,
+    m: usize, n: usize, k: usize,
+    a_ptr: u64, b_ptr: u64, c_ptr: u64,
+    as_ptr: u64, bs_ptr: u64, r_ptr: u64,
+    ws_ptr: u64, ws_size: usize, stream_ptr: u64,
+) -> Option<f32> {
+    let ws_needed = cutlass.fp8_gemm_residual_workspace_size(variant, m as i32, n as i32, k as i32)?;
+    if ws_needed > ws_size { return None; }
+
+    if cutlass.fp8_gemm_residual(variant, c_ptr, a_ptr, b_ptr, as_ptr, bs_ptr, r_ptr,
+        m as i32, n as i32, k as i32, ws_ptr, ws_size, stream_ptr).is_err() {
+        return None;
+    }
+    let r = unsafe { cu_sys::cuStreamSynchronize(cu_stream) };
+    if r != cu_sys::CUresult::CUDA_SUCCESS { return None; }
+
+    for _ in 0..WARMUP_ITERS {
+        let _ = cutlass.fp8_gemm_residual(variant, c_ptr, a_ptr, b_ptr, as_ptr, bs_ptr, r_ptr,
+            m as i32, n as i32, k as i32, ws_ptr, ws_size, stream_ptr);
+    }
+    let r = unsafe { cu_sys::cuStreamSynchronize(cu_stream) };
+    if r != cu_sys::CUresult::CUDA_SUCCESS { return None; }
+
+    let mut times = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        let start = CuEvent::new();
+        let stop = CuEvent::new();
+        start.record(cu_stream);
+        let _ = cutlass.fp8_gemm_residual(variant, c_ptr, a_ptr, b_ptr, as_ptr, bs_ptr, r_ptr,
+            m as i32, n as i32, k as i32, ws_ptr, ws_size, stream_ptr);
+        stop.record(cu_stream);
+        stop.sync();
+        times.push(stop.elapsed_ms(&start) * 1000.0);
+    }
+    Some(median(&mut times))
+}
+
 // -- Detailed results for the report JSON --
 
 #[derive(serde::Serialize)]
@@ -504,10 +551,12 @@ fn main() {
     let oproj_loaded = cutlass.oproj_residual_variant_count();
     let gateup_loaded = cutlass.gateup_silu_variant_count();
     let fp8_loaded = cutlass.fp8_gemm_variant_count();
+    let fp8_res_loaded = cutlass.fp8_gemm_residual_variant_count();
     println!("Loaded {hgemm_loaded}/{HGEMM_VARIANTS} HGEMM variants");
     println!("Loaded {oproj_loaded}/{OPROJ_RESIDUAL_VARIANTS} oproj+residual variants");
     println!("Loaded {gateup_loaded}/{GATEUP_SILU_VARIANTS} gateup+SiLU variants");
     println!("Loaded {fp8_loaded}/{FP8_GEMM_VARIANTS} FP8 GEMM variants");
+    println!("Loaded {fp8_res_loaded}/{FP8_GEMM_RESIDUAL_VARIANTS} FP8 GEMM+residual variants");
     if hgemm_loaded == 0 {
         eprintln!("ERROR: No HGEMM autotune variants in .so -- build cutlass_hgemm_autotune.cu first");
         std::process::exit(1);
@@ -522,6 +571,7 @@ fn main() {
         .chain(OPROJ_SHAPES.iter().map(|&(n, k, _)| (n, k)))
         .chain(GATEUP_SHAPES.iter().map(|&(n, k, _)| (n, k)))
         .chain(FP8_SHAPES.iter().map(|&(n, k, _)| (n, k)))
+        .chain(FP8_RESIDUAL_SHAPES.iter().map(|&(n, k, _)| (n, k)))
         .collect();
     let max_a = all_shapes.iter().map(|&(_, k)| max_m * k).max().unwrap();
     let max_b = all_shapes.iter().map(|&(n, k)| n * k).max().unwrap();
@@ -533,6 +583,15 @@ fn main() {
         for &m in M_VALUES {
             for v in 0..FP8_GEMM_VARIANTS {
                 if let Some(ws) = cutlass.fp8_gemm_variant_workspace_size(v, m as i32, n as i32, k as i32) {
+                    dyn_ws_bytes = dyn_ws_bytes.max(ws);
+                }
+            }
+        }
+    }
+    for &(n, k, _) in FP8_RESIDUAL_SHAPES {
+        for &m in M_VALUES {
+            for v in 0..FP8_GEMM_RESIDUAL_VARIANTS {
+                if let Some(ws) = cutlass.fp8_gemm_residual_workspace_size(v, m as i32, n as i32, k as i32) {
                     dyn_ws_bytes = dyn_ws_bytes.max(ws);
                 }
             }
@@ -825,6 +884,84 @@ fn main() {
         }
     }
 
+    // ===================================================================
+    // FP8 GEMM + residual variants (output = FP8 GEMM + residual add)
+    // ===================================================================
+    if fp8_res_loaded > 0 {
+        println!();
+        println!("Benchmarking FP8 GEMM + residual ({fp8_res_loaded} variants)");
+        println!("{}", "=".repeat(72));
+
+        for &(n, k, proj) in FP8_RESIDUAL_SHAPES {
+            println!();
+            println!("--- FP8+residual {proj} (N={n}, K={k}) ---");
+
+            for &m in M_VALUES {
+                println!();
+                println!("FP8+residual Shape M={m} N={n} K={k}:");
+
+                let mut best: Option<(usize, f32)> = None;
+                for v in 0..FP8_GEMM_RESIDUAL_VARIANTS {
+                    match bench_fp8_gemm_residual_variant(
+                        &cutlass, v, cu_stream, m, n, k,
+                        fp8_a_ptr, fp8_b_ptr, c_ptr,
+                        fp8_as_ptr, fp8_bs_ptr, r_ptr,
+                        ws_ptr, ws_bytes, stream_ptr,
+                    ) {
+                        Some(us) => {
+                            println!("  fp8res_v{v}: {us:8.1} us");
+                            match best {
+                                None => best = Some((v, us)),
+                                Some((_, bt)) if us < bt => best = Some((v, us)),
+                                _ => {}
+                            }
+                        }
+                        None => {}
+                    }
+                }
+
+                // Compare against best non-residual FP8 GEMM (the alternative path)
+                let fp8_baseline = {
+                    let mut best_fp8: Option<f32> = None;
+                    for v in 0..FP8_GEMM_VARIANTS {
+                        if let Some(us) = bench_fp8_gemm_variant(
+                            &cutlass, v, cu_stream, m, n, k,
+                            fp8_a_ptr, fp8_b_ptr, c_ptr,
+                            fp8_as_ptr, fp8_bs_ptr,
+                            ws_ptr, ws_bytes, stream_ptr,
+                        ) {
+                            match best_fp8 {
+                                None => best_fp8 = Some(us),
+                                Some(bt) if us < bt => best_fp8 = Some(us),
+                                _ => {}
+                            }
+                        }
+                    }
+                    best_fp8
+                };
+                if let Some(fp8_us) = fp8_baseline {
+                    println!("  FP8 GEMM only (no residual): {fp8_us:8.1} us");
+                }
+
+                total += 1;
+                match best {
+                    Some((v, us)) => {
+                        cache.insert_fp8_gemm_residual(m, n, k, v);
+                        cutlass_wins += 1;
+                        let note = if let Some(fp8_us) = fp8_baseline {
+                            format!(" (vs FP8-only {fp8_us:.1} us = {:.1}% overhead for free residual)", (us / fp8_us - 1.0) * 100.0)
+                        } else { String::new() };
+                        println!("  BEST: fp8res_v{v} ({us:.1} us){note}");
+                    }
+                    None => {
+                        cublas_wins += 1;
+                        println!("  NO FP8+RESIDUAL VARIANT WORKED for M={m} N={n} K={k}");
+                    }
+                }
+            }
+        }
+    }
+
     // Summary
     println!();
     println!("{}", "=".repeat(72));
@@ -840,6 +977,7 @@ fn main() {
     println!("  oproj_residual entries: {}", cache.oproj_residual.len());
     println!("  gateup_silu entries: {}", cache.gateup_silu.len());
     println!("  fp8_gemm entries: {}", cache.fp8_gemm.len());
+    println!("  fp8_gemm_residual entries: {}", cache.fp8_gemm_residual.len());
 
     // Compact table
     println!();

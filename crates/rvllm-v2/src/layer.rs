@@ -184,8 +184,9 @@ pub(crate) fn cutlass_fp8_gemm_dispatch(
 /// FP8 GEMM + residual add (fused in CUTLASS epilogue).
 /// D = cast<f16>(a_scales * b_scale * GEMM(act_fp8, weight_fp8) + residual)
 /// Eliminates the intermediate o_proj_out / down_out buffer.
-fn cutlass_fp8_gemm_residual_dispatch(
+fn cutlass_fp8_gemm_residual_autotuned(
     cutlass: &CutlassKernels,
+    variant: usize,
     stream: &CudaStream,
     m: usize, n: usize, k: usize,
     act_fp8: &CudaSlice<u8>,
@@ -204,10 +205,6 @@ fn cutlass_fp8_gemm_residual_dispatch(
     let (res_ptr, _) = residual.device_ptr(stream);
     let (out_ptr, _) = output_f16.device_ptr_mut(stream);
     let (wk_ptr, _) = workspace.device_ptr_mut(stream);
-
-    // Variant 0 (64x128x128 WS) is verified neutral for O-proj [M, 3584, 3584].
-    // FP8FastAccum variants (v4+) regress with the residual EVT epilogue.
-    let variant = if m <= 64 { 0 } else { 1 };
 
     cutlass.fp8_gemm_residual(
         variant,
@@ -1084,14 +1081,24 @@ impl GpuTransformerLayer {
                 &scratch.gate_up_out, num_tokens, intermediate,
                 &mut scratch.fp8_act_scratch, &mut scratch.fp8_act_scale,
             )?;
-            // Down-proj uses autotuned non-residual FP8 GEMM (residual kernel lacks
-            // autotune for K=intermediate shapes and regresses vs autotuned path)
-            cutlass_fp8_gemm_dispatch(
-                ck, autotune, &self.stream, num_tokens, hidden_size, intermediate,
-                &scratch.fp8_act_scratch, &scratch.fp8_act_scale,
-                fp8w.down_proj_fp8, fp8w.down_proj_scale,
-                down_write, &mut scratch.cutlass_workspace,
-            )?;
+            // FP8 down-proj: use fused residual variant if autotuned, else plain FP8 GEMM
+            if let Some(variant) = autotune.and_then(|at| at.best_fp8_gemm_residual(num_tokens, hidden_size, intermediate)) {
+                cutlass_fp8_gemm_residual_autotuned(
+                    ck, variant, &self.stream, num_tokens, hidden_size, intermediate,
+                    &scratch.fp8_act_scratch, &scratch.fp8_act_scale,
+                    fp8w.down_proj_fp8, fp8w.down_proj_scale,
+                    &*residual_write, down_write,
+                    &mut scratch.cutlass_workspace,
+                )?;
+                used_fused_downproj = true;
+            } else {
+                cutlass_fp8_gemm_dispatch(
+                    ck, autotune, &self.stream, num_tokens, hidden_size, intermediate,
+                    &scratch.fp8_act_scratch, &scratch.fp8_act_scale,
+                    fp8w.down_proj_fp8, fp8w.down_proj_scale,
+                    down_write, &mut scratch.cutlass_workspace,
+                )?;
+            }
         } else {
             // SiLU activation (skip if fused gateup+silu already wrote to silu_out)
             if !used_fused_gateup {

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "cuda")]
-use crate::cutlass_ffi::{FP8_GEMM_VARIANTS, GATEUP_SILU_VARIANTS, HGEMM_VARIANTS, OPROJ_RESIDUAL_VARIANTS};
+use crate::cutlass_ffi::{FP8_GEMM_VARIANTS, FP8_GEMM_RESIDUAL_VARIANTS, GATEUP_SILU_VARIANTS, HGEMM_VARIANTS, OPROJ_RESIDUAL_VARIANTS};
 
 /// Persistent cache mapping (M,N,K) shapes to the best CUTLASS variant index.
 /// Every shape used at runtime must have an entry -- missing entries panic.
@@ -25,6 +25,8 @@ pub struct CutlassAutotuneCache {
     pub gateup_silu: HashMap<String, usize>,
     #[serde(default)]
     pub fp8_gemm: HashMap<String, usize>,
+    #[serde(default)]
+    pub fp8_gemm_residual: HashMap<String, usize>,
 }
 
 impl Default for CutlassAutotuneCache {
@@ -34,6 +36,7 @@ impl Default for CutlassAutotuneCache {
             oproj_residual: HashMap::new(),
             gateup_silu: HashMap::new(),
             fp8_gemm: HashMap::new(),
+            fp8_gemm_residual: HashMap::new(),
         }
     }
 }
@@ -98,12 +101,20 @@ impl CutlassAutotuneCache {
         self.fp8_gemm.insert(shape_key(m, n, k), variant);
     }
 
+    pub fn best_fp8_gemm_residual(&self, m: usize, n: usize, k: usize) -> Option<usize> {
+        lookup_nearest(&self.fp8_gemm_residual, m, n, k)
+    }
+
+    pub fn insert_fp8_gemm_residual(&mut self, m: usize, n: usize, k: usize, variant: usize) {
+        self.fp8_gemm_residual.insert(shape_key(m, n, k), variant);
+    }
+
     pub fn load(path: &Path) -> Self {
         match std::fs::read_to_string(path) {
             Ok(data) => match serde_json::from_str::<CutlassAutotuneCache>(&data) {
                 Ok(cache) => {
                     let total =
-                        cache.hgemm.len() + cache.oproj_residual.len() + cache.gateup_silu.len() + cache.fp8_gemm.len();
+                        cache.hgemm.len() + cache.oproj_residual.len() + cache.gateup_silu.len() + cache.fp8_gemm.len() + cache.fp8_gemm_residual.len();
                     tracing::info!(
                         path = %path.display(),
                         entries = total,
@@ -148,7 +159,7 @@ impl CutlassAutotuneCache {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.hgemm.is_empty() && self.oproj_residual.is_empty() && self.gateup_silu.is_empty() && self.fp8_gemm.is_empty()
+        self.hgemm.is_empty() && self.oproj_residual.is_empty() && self.gateup_silu.is_empty() && self.fp8_gemm.is_empty() && self.fp8_gemm_residual.is_empty()
     }
 }
 
@@ -529,6 +540,88 @@ pub fn autotune_fp8_gemm_shape(
     best
 }
 
+/// Benchmark all FP8 GEMM + residual variants for a given shape.
+/// Returns (best_variant_index, best_time_us) or None if no variant was loaded.
+#[cfg(feature = "cuda")]
+pub fn autotune_fp8_gemm_residual_shape(
+    cutlass: &CutlassKernels,
+    stream: &Arc<CudaStream>,
+    m: usize,
+    n: usize,
+    k: usize,
+    warmup_iters: usize,
+    bench_iters: usize,
+) -> Option<(usize, f32)> {
+    let a_buf: CudaSlice<u8> = stream.alloc_zeros(m * k).ok()?;
+    let b_buf: CudaSlice<u8> = stream.alloc_zeros(n * k).ok()?;
+    let a_scales: CudaSlice<f32> = stream.alloc_zeros(m).ok()?;
+    let b_scale: CudaSlice<f32> = stream.alloc_zeros(1).ok()?;
+    let res_buf: CudaSlice<half::f16> = stream.alloc_zeros(m * n).ok()?;
+    let mut c_buf: CudaSlice<half::f16> = stream.alloc_zeros(m * n).ok()?;
+
+    let mut max_ws: usize = 0;
+    for v in 0..FP8_GEMM_RESIDUAL_VARIANTS {
+        if let Some(ws) = cutlass.fp8_gemm_residual_workspace_size(v, m as i32, n as i32, k as i32) {
+            max_ws = max_ws.max(ws);
+        }
+    }
+    max_ws = max_ws.max(4 * 1024 * 1024);
+    let ws_buf: CudaSlice<u8> = stream.alloc_zeros(max_ws).ok()?;
+
+    let (a_ptr, _ag) = DevicePtr::device_ptr(&a_buf, stream);
+    let (b_ptr, _bg) = DevicePtr::device_ptr(&b_buf, stream);
+    let (as_ptr, _asg) = DevicePtr::device_ptr(&a_scales, stream);
+    let (bs_ptr, _bsg) = DevicePtr::device_ptr(&b_scale, stream);
+    let (r_ptr, _rg) = DevicePtr::device_ptr(&res_buf, stream);
+    let (c_ptr, _cg) = DevicePtrMut::device_ptr_mut(&mut c_buf, stream);
+    let (ws_ptr, _wsg) = DevicePtr::device_ptr(&ws_buf, stream);
+
+    let a_raw = a_ptr as u64;
+    let b_raw = b_ptr as u64;
+    let as_raw = as_ptr as u64;
+    let bs_raw = bs_ptr as u64;
+    let r_raw = r_ptr as u64;
+    let c_raw = c_ptr as u64;
+    let ws_raw = ws_ptr as u64;
+    let stream_raw = stream.cu_stream() as u64;
+    let mi = m as i32;
+    let ni = n as i32;
+    let ki = k as i32;
+
+    let mut best: Option<(usize, f32)> = None;
+
+    for v in 0..FP8_GEMM_RESIDUAL_VARIANTS {
+        if cutlass
+            .fp8_gemm_residual(v, c_raw, a_raw, b_raw, as_raw, bs_raw, r_raw, mi, ni, ki, ws_raw, max_ws, stream_raw)
+            .is_err()
+        {
+            continue;
+        }
+        if stream.synchronize().is_err() {
+            continue;
+        }
+
+        let time = unsafe {
+            time_gpu_us(stream, warmup_iters, bench_iters, || {
+                let _ = cutlass.fp8_gemm_residual(
+                    v, c_raw, a_raw, b_raw, as_raw, bs_raw, r_raw, mi, ni, ki, ws_raw, max_ws, stream_raw,
+                );
+            })
+        };
+
+        if let Ok(t) = time {
+            tracing::debug!(variant = v, time_us = t, m, n, k, "fp8_gemm_residual variant timed");
+            match &best {
+                None => best = Some((v, t)),
+                Some((_, bt)) if t < *bt => best = Some((v, t)),
+                _ => {}
+            }
+        }
+    }
+
+    best
+}
+
 /// Benchmark cuBLAS HGEMM as a baseline for comparison.
 /// Returns time in microseconds per iteration.
 #[cfg(feature = "cuda")]
@@ -609,6 +702,7 @@ pub fn run_full_autotune(
     oproj_shapes: &[(usize, usize, usize)],
     gateup_shapes: &[(usize, usize, usize)],
     fp8_gemm_shapes: &[(usize, usize, usize)],
+    fp8_gemm_residual_shapes: &[(usize, usize, usize)],
     warmup_iters: usize,
     bench_iters: usize,
 ) -> CutlassAutotuneCache {
@@ -619,6 +713,7 @@ pub fn run_full_autotune(
         oproj = oproj_shapes.len(),
         gateup = gateup_shapes.len(),
         fp8_gemm = fp8_gemm_shapes.len(),
+        fp8_gemm_residual = fp8_gemm_residual_shapes.len(),
         "starting CUTLASS autotune pass"
     );
 
@@ -657,11 +752,21 @@ pub fn run_full_autotune(
         }
     }
 
+    for &(m, n, k) in fp8_gemm_residual_shapes {
+        if let Some((variant, time_us)) =
+            autotune_fp8_gemm_residual_shape(cutlass, stream, m, n, k, warmup_iters, bench_iters)
+        {
+            tracing::info!(m, n, k, variant, time_us = format!("{:.1}", time_us), "fp8_gemm_residual best");
+            cache.fp8_gemm_residual.insert(shape_key(m, n, k), variant);
+        }
+    }
+
     tracing::info!(
         hgemm = cache.hgemm.len(),
         oproj = cache.oproj_residual.len(),
         gateup = cache.gateup_silu.len(),
         fp8_gemm = cache.fp8_gemm.len(),
+        fp8_gemm_residual = cache.fp8_gemm_residual.len(),
         "autotune pass complete"
     );
 
@@ -677,6 +782,7 @@ pub fn max_workspace_size(
     oproj_shapes: &[(usize, usize, usize)],
     gateup_shapes: &[(usize, usize, usize)],
     fp8_gemm_shapes: &[(usize, usize, usize)],
+    fp8_gemm_residual_shapes: &[(usize, usize, usize)],
 ) -> usize {
     let mut max_ws: usize = 0;
 
@@ -711,6 +817,15 @@ pub fn max_workspace_size(
         let (mi, ni, ki) = (m as i32, n as i32, k as i32);
         for v in 0..FP8_GEMM_VARIANTS {
             if let Some(ws) = cutlass.fp8_gemm_variant_workspace_size(v, mi, ni, ki) {
+                max_ws = max_ws.max(ws);
+            }
+        }
+    }
+
+    for &(m, n, k) in fp8_gemm_residual_shapes {
+        let (mi, ni, ki) = (m as i32, n as i32, k as i32);
+        for v in 0..FP8_GEMM_RESIDUAL_VARIANTS {
+            if let Some(ws) = cutlass.fp8_gemm_residual_workspace_size(v, mi, ni, ki) {
                 max_ws = max_ws.max(ws);
             }
         }
