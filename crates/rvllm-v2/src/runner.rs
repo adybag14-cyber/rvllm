@@ -1390,7 +1390,7 @@ impl GpuModelRunner {
 
     /// Block until the DtoH copy from launch_dtoh() is complete.
     pub fn wait_dtoh(&self) -> Result<()> {
-        cu_event::synchronize(self.dtoh_event)
+        unsafe { cu_event::synchronize(self.dtoh_event) }
             .map_err(|e| LLMError::GpuError(format!("dtoh event sync: {e}")))?;
         Ok(())
     }
@@ -1413,7 +1413,7 @@ impl GpuModelRunner {
 
 impl Drop for GpuModelRunner {
     fn drop(&mut self) {
-        cu_event::destroy(self.dtoh_event).ok();
+        unsafe { cu_event::destroy(self.dtoh_event) }.ok();
     }
 }
 
