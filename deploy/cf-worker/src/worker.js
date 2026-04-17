@@ -19,9 +19,9 @@ export default {
     if (p.startsWith('/rvllm/')) p = p.slice('/rvllm'.length);
     else if (p === '/rvllm') p = '/';
 
-    // Root redirect: /rvllm  or  /rvllm/  ->  /rvllm/docs/index.html
+    // Root: serve docs/index.html directly (no redirect, stays on /rvllm/)
     if (p === '/' || p === '') {
-      return Response.redirect(`${url.origin}/rvllm/docs/index.html`, 302);
+      p = '/docs/index.html';
     }
 
     // Forward to the static-assets binding.

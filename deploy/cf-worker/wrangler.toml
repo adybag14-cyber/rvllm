@@ -9,12 +9,12 @@ workers_dev = true  # also reachable at rvllm-docs.<account>.workers.dev
 [assets]
 directory = "./site"
 binding = "ASSETS"
-not_found_handling = "single-page-application"
+not_found_handling = "none"
 
 # Route the worker at solidsf.com/rvllm/*. Requires the solidsf.com zone
 # to already be on your Cloudflare account (DNS NS records on Cloudflare).
 # If you don't own that zone yet, comment this out and use the
 # workers.dev URL for testing.
 [[routes]]
-pattern = "solidsf.com/rvllm/*"
+pattern = "docs.solidsf.com/*"
 zone_name = "solidsf.com"
