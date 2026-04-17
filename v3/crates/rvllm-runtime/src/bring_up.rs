@@ -250,7 +250,12 @@ impl Bringup {
         let mlp_out_scale = arena.region("mlp_out_scale", (num_seqs * 4) as usize, 16)?;
 
         let num_blocks_total: u32 = 1024;
-        let block_size: u32 = 64;
+        // FA3 paged_decode block_size (tokens per KV page). Default 64;
+        // sweepable via RVLLM_BLOCK_SIZE to test 32 / 128 / 256.
+        let block_size: u32 = std::env::var("RVLLM_BLOCK_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64);
         let max_blocks_per_seq: u32 = 128;
         // FP8 E4M3 KV: 1 byte/element (was 2 for f16). Halves KV memory
         // and doubles HBM-bandwidth efficiency on attention reads.
