@@ -342,6 +342,13 @@ static int fa3_sm90_paged_decode_impl(
             run_mha_fwd_<90, cutlass::half_t, 128, 128, false, true, false, true>(params, stream);
         }
     }
+    if (getenv("FA3_DEBUG")) {
+        cudaError_t post = cudaStreamSynchronize(stream);
+        cudaError_t last = cudaGetLastError();
+        fprintf(stderr, "fa3[%d]: post-launch sync=%s(%d) last=%s(%d)\n",
+                call_n, cudaGetErrorString(post), (int)post,
+                cudaGetErrorString(last), (int)last);
+    }
 
     return 0;
 }
