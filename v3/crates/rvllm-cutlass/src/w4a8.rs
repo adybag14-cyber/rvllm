@@ -34,6 +34,22 @@ type W4a8GemmFn = unsafe extern "C" fn(
 #[cfg(feature = "cuda")]
 type W4a8WorkspaceFn = unsafe extern "C" fn(m: i32, n: i32, k: i32) -> usize;
 
+// Weight encoder: FP16 [N,K] -> unified-encoded INT4 [N,K/2] bytes + LUT
+// packed FP8 scales [N, K/g, 8] bytes.
+#[cfg(feature = "cuda")]
+#[allow(clippy::type_complexity)]
+type W4a8EncodeFp16Fn = unsafe extern "C" fn(
+    w_fp16: *const std::ffi::c_void,
+    n: i32,
+    k: i32,
+    group_size: i32,
+    w_int4_out: *mut std::ffi::c_void,
+    scales_packed_out: *mut std::ffi::c_void,
+    scales_f32_workspace: *mut std::ffi::c_void,
+    shuffle: i32,
+    stream: *mut std::ffi::c_void,
+) -> i32;
+
 pub struct W4a8Lib {
     pub so_path: PathBuf,
     #[cfg(feature = "cuda")]
@@ -42,6 +58,8 @@ pub struct W4a8Lib {
     gemm_run: W4a8GemmFn,
     #[cfg(feature = "cuda")]
     gemm_ws: W4a8WorkspaceFn,
+    #[cfg(feature = "cuda")]
+    fn_encode_fp16: W4a8EncodeFp16Fn,
 }
 
 impl W4a8Lib {
@@ -78,9 +96,18 @@ impl W4a8Lib {
                         CudaCtx { stream: 0, kernel: "w4a8", launch: None, device: -1 },
                     )
                 })?;
+            let enc_sym: libloading::Symbol<W4a8EncodeFp16Fn> =
+                _lib.get(b"rvllm_w4a8_encode_weight_fp16\0").map_err(|_| {
+                    RvllmError::cuda(
+                        "dlsym rvllm_w4a8_encode_weight_fp16",
+                        CudaErrorKind::LaunchFailed,
+                        CudaCtx { stream: 0, kernel: "w4a8", launch: None, device: -1 },
+                    )
+                })?;
             let gemm_run = *run_sym;
             let gemm_ws = *ws_sym;
-            Ok(Self { so_path: path, _lib, gemm_run, gemm_ws })
+            let fn_encode_fp16 = *enc_sym;
+            Ok(Self { so_path: path, _lib, gemm_run, gemm_ws, fn_encode_fp16 })
         }
         #[cfg(not(feature = "cuda"))]
         Ok(Self { so_path: path })
@@ -156,6 +183,54 @@ impl W4a8Lib {
                 CudaCtx {
                     stream,
                     kernel: "rvllm_w4a8_gemm_run",
+                    launch: None,
+                    device: -1,
+                },
+            ));
+        }
+        Ok(())
+    }
+}
+
+    /// Encode FP16 weights [N, K] (row-major, device ptr) to unified-
+    /// encoded INT4 [N, K/2] bytes + LUT packed FP8 scales [N, K/g, 8]
+    /// bytes. Needs a scratch buffer `scales_f32_ws` of at least
+    /// `N * K/g * 4` bytes.
+    ///
+    /// # Safety
+    /// All device pointers must be valid for the duration of the call.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn encode_fp16(
+        &self,
+        w_fp16: u64,
+        n: i32,
+        k: i32,
+        group_size: i32,
+        w_int4_out: u64,
+        scales_packed_out: u64,
+        scales_f32_ws: u64,
+        shuffle: bool,
+        stream: u64,
+    ) -> Result<()> {
+        let rc = (self.fn_encode_fp16)(
+            w_fp16 as *const _,
+            n,
+            k,
+            group_size,
+            w_int4_out as *mut _,
+            scales_packed_out as *mut _,
+            scales_f32_ws as *mut _,
+            if shuffle { 1 } else { 0 },
+            stream as *mut _,
+        );
+        if rc != 0 {
+            return Err(RvllmError::cuda(
+                "w4a8_encode_fp16",
+                CudaErrorKind::LaunchFailed,
+                CudaCtx {
+                    stream,
+                    kernel: "rvllm_w4a8_encode_weight_fp16",
                     launch: None,
                     device: -1,
                 },
