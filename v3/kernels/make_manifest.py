@@ -11,6 +11,7 @@ from pathlib import Path
 NAME_TO_FILE = {
     "fused_rmsnorm_fp8_quant": "fused_rmsnorm_fp8_quant.ptx",
     "fused_rope_cache": "fused_rope_cache.ptx",
+    "fused_rope_cache_f16tbl": "fused_rope_cache_f16tbl.ptx",
     "fused_silu_fp8_quant": "fused_silu_fp8_quant.ptx",
     "argmax": "argmax.ptx",
     "quantize_activation_fp8": "quantize_activation_fp8.ptx",

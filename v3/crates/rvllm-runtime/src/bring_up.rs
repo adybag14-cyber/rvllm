@@ -521,14 +521,14 @@ fn bytemuck_cast_i32(v: &[i32]) -> &[u8] {
 
 fn load_fused(loader: &KernelLoader) -> Result<FusedModules> {
     let rmsnorm_mod = loader.load_ptx("fused_rmsnorm_fp8_quant")?;
-    let rope_mod = loader.load_ptx("fused_rope_cache")?;
+    let rope_mod = loader.load_ptx("fused_rope_cache_f16tbl")?;
     let silu_mod = loader.load_ptx("fused_silu_fp8_quant")?;
     let argmax_mod = loader.load_ptx("argmax")?;
 
     let fn_rmsnorm = rmsnorm_mod.get_function("fused_rmsnorm_fp8_quant_kernel")?;
     let fn_add_rmsnorm = rmsnorm_mod.get_function("fused_add_rmsnorm_fp8_quant_kernel")?;
     let fn_quantize = rmsnorm_mod.get_function("quantize_fp8_per_token_kernel")?;
-    let fn_rope_cache = rope_mod.get_function("fused_rope_cache_f16_kernel")?;
+    let fn_rope_cache = rope_mod.get_function("fused_rope_cache_f16tbl_kernel")?;
     let fn_silu_mul = silu_mod.get_function("fused_silu_mul_fp8_quant_kernel")?;
     let fn_argmax = argmax_mod.get_function("argmax_kernel")?;
 

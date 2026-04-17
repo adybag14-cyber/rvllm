@@ -519,23 +519,23 @@ fn concat_gate_up(
     Ok(out)
 }
 
-/// Precompute RoPE cos/sin tables as f32 bytes (v2's fused_rope_cache
-/// kernel takes `const float*` tables).
+/// Precompute RoPE cos/sin tables as f16 bytes. The v3 fused_rope_cache
+/// variant takes __half cos/sin, not float — v3 keeps zero f32
+/// activations/constants in the decode path.
 fn rope_cos_sin_bytes(arch: &ModelArch) -> (Vec<u8>, Vec<u8>) {
     let half = arch.head_dim / 2;
-    let mut cos = Vec::with_capacity(arch.max_position_embeddings * half * 4);
-    let mut sin = Vec::with_capacity(arch.max_position_embeddings * half * 4);
+    let mut cos = Vec::with_capacity(arch.max_position_embeddings * half * 2);
+    let mut sin = Vec::with_capacity(arch.max_position_embeddings * half * 2);
     let inv_theta: Vec<f32> = (0..half)
         .map(|i| 1.0 / arch.rope_theta.powf(2.0 * i as f32 / arch.head_dim as f32))
         .collect();
     for pos in 0..arch.max_position_embeddings {
         for &freq in &inv_theta {
             let angle = pos as f32 * freq;
-            cos.extend_from_slice(&angle.cos().to_le_bytes());
-            sin.extend_from_slice(&angle.sin().to_le_bytes());
+            cos.extend_from_slice(&f16::from_f32(angle.cos()).to_le_bytes());
+            sin.extend_from_slice(&f16::from_f32(angle.sin()).to_le_bytes());
         }
     }
-    let _ = f16::from_f32(0.0);
     (cos, sin)
 }
 
