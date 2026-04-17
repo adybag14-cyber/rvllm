@@ -1,0 +1,20 @@
+name = "rvllm-docs"
+main = "src/worker.js"
+compatibility_date = "2026-04-17"
+workers_dev = true  # also reachable at rvllm-docs.<account>.workers.dev
+
+# Static assets. The ./site directory gets populated by build.sh before
+# `wrangler deploy` — it mirrors the repo's docs/ folder under site/docs/
+# so URL /docs/bench.html maps to the real docs/bench.html file.
+[assets]
+directory = "./site"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+# Route the worker at solidsf.com/rvllm/*. Requires the solidsf.com zone
+# to already be on your Cloudflare account (DNS NS records on Cloudflare).
+# If you don't own that zone yet, comment this out and use the
+# workers.dev URL for testing.
+[[routes]]
+pattern = "solidsf.com/rvllm/*"
+zone_name = "solidsf.com"

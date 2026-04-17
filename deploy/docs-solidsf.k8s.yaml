@@ -1,0 +1,223 @@
+# Deploy docs.solidsf.com/rvllm/* on k3s.
+#
+# Serves the rvllm repo's docs/ folder via nginx, with a git-sync sidecar
+# that re-pulls main every 60s so bench.html / index.html / paper PDFs
+# auto-update without redeploying. URL layout mirrors the repo:
+#
+#   https://docs.solidsf.com/rvllm/                -> repo docs/index.html
+#   https://docs.solidsf.com/rvllm/docs/bench.html -> repo docs/bench.html
+#
+# Assumptions:
+#   - k3s with Traefik ingress (default)
+#   - cert-manager installed with ClusterIssuer "letsencrypt-prod"
+#     (swap for traefik ACME if you use that instead; see note at bottom)
+#   - DNS: docs.solidsf.com CNAME -> your ingress LB
+#
+# Apply:
+#   kubectl apply -f deploy/docs-solidsf.k8s.yaml
+#
+# Verify:
+#   kubectl -n rvllm-docs get pods -w
+#   curl -I https://docs.solidsf.com/rvllm/docs/bench.html
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rvllm-docs
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config
+  namespace: rvllm-docs
+data:
+  default.conf: |
+    server {
+      listen       80;
+      server_name  _;
+
+      # Repo root served at /rvllm/. Inside the repo, docs/ is the
+      # site root, so /rvllm/ -> docs/index.html and /rvllm/docs/*
+      # -> docs/* (matches the path layout the bench.html was authored for).
+      location /rvllm/ {
+        alias /repo/rvllm/;
+        index docs/index.html;
+        try_files $uri $uri/ =404;
+
+        # Repo root fallback: if someone hits /rvllm, serve docs/index.html.
+        location = /rvllm/ {
+          return 302 /rvllm/docs/index.html;
+        }
+      }
+
+      # Cache-Control: the static assets (images, PDFs, JS CDN) are safe
+      # to cache for a while. HTML should revalidate often so auto-pulled
+      # updates go live.
+      location ~* \.(html)$ {
+        alias /repo/rvllm/;
+        add_header Cache-Control "no-cache, must-revalidate";
+      }
+      location ~* \.(pdf|png|jpg|jpeg|svg|css|js)$ {
+        alias /repo/rvllm/;
+        add_header Cache-Control "public, max-age=3600";
+      }
+
+      # Health check for k8s readiness probe.
+      location = /healthz {
+        return 200 "ok\n";
+        add_header Content-Type text/plain;
+      }
+    }
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rvllm-docs
+  namespace: rvllm-docs
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: rvllm-docs
+  template:
+    metadata:
+      labels:
+        app: rvllm-docs
+    spec:
+      # Shared empty-dir volume between git-sync (writes) and nginx (reads).
+      volumes:
+        - name: repo
+          emptyDir: {}
+        - name: nginx-config
+          configMap:
+            name: nginx-config
+
+      # Git-sync does the initial clone BEFORE nginx starts, so the first
+      # request already has files to serve.
+      initContainers:
+        - name: git-sync-init
+          image: registry.k8s.io/git-sync/git-sync:v4.2.4
+          args:
+            - --repo=https://github.com/m0at/rvllm
+            - --ref=main
+            - --depth=1
+            - --root=/repo
+            - --link=rvllm
+            - --one-time
+            - --exechook-timeout=60s
+          volumeMounts:
+            - name: repo
+              mountPath: /repo
+          securityContext:
+            runAsUser: 65533
+            runAsGroup: 65533
+
+      containers:
+        # Sidecar: re-pulls main every 60s.
+        - name: git-sync
+          image: registry.k8s.io/git-sync/git-sync:v4.2.4
+          args:
+            - --repo=https://github.com/m0at/rvllm
+            - --ref=main
+            - --depth=1
+            - --root=/repo
+            - --link=rvllm
+            - --period=60s
+          volumeMounts:
+            - name: repo
+              mountPath: /repo
+          securityContext:
+            runAsUser: 65533
+            runAsGroup: 65533
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits:   { cpu: 100m, memory: 128Mi }
+
+        # Main: nginx serving /repo/rvllm/docs/ at /rvllm/.
+        - name: nginx
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 80
+              name: http
+          volumeMounts:
+            - name: repo
+              mountPath: /repo
+              readOnly: true
+            - name: nginx-config
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+          readinessProbe:
+            httpGet: { path: /healthz, port: 80 }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 80 }
+            periodSeconds: 30
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits:   { cpu: 200m, memory: 128Mi }
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rvllm-docs
+  namespace: rvllm-docs
+spec:
+  selector:
+    app: rvllm-docs
+  ports:
+    - port: 80
+      targetPort: 80
+      name: http
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rvllm-docs
+  namespace: rvllm-docs
+  annotations:
+    # cert-manager path — swap if you use Traefik's native ACME.
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # Traefik sometimes needs this to honor HTTPS redirects:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - docs.solidsf.com
+      secretName: docs-solidsf-tls
+  rules:
+    - host: docs.solidsf.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: rvllm-docs
+                port:
+                  number: 80
+
+# ---------------------------------------------------------------------------
+# If you use Traefik's built-in ACME instead of cert-manager, replace the
+# Ingress with an IngressRoute and add a Traefik Middleware for the redirect:
+#
+# apiVersion: traefik.containo.us/v1alpha1
+# kind: IngressRoute
+# metadata: { name: rvllm-docs, namespace: rvllm-docs }
+# spec:
+#   entryPoints: [websecure]
+#   routes:
+#     - match: Host(`docs.solidsf.com`)
+#       kind: Rule
+#       services:
+#         - name: rvllm-docs
+#           port: 80
+#   tls:
+#     certResolver: letsencrypt
+# ---------------------------------------------------------------------------
