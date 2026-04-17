@@ -6,10 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# rvllm-fused: 8 fused kernels (norm+quant, rope+kv, silu+quant, argmax,
-# residual_add, embedding_gather). NO megakernels. See v3/specs/12-fused.md.
-# Every kernel ships: .cu source + Rust binding + pure-Rust f32 reference
-# + cosine-vs-reference unit test (>=0.999 for f16).
+# rvllm-fused: 8 fused kernels (norm+quant, residual+norm+quant,
+# silu+mul+quant, rope+kv-write, argmax, residual_add, embedding).
+# Each ships a Rust launcher with shape/alignment validation and a
+# pure-Rust f32 reference impl. See v3/specs/12-fused.md.
+
+[features]
+default = []
+cuda = ["rvllm-kernels/cuda", "rvllm-mem/cuda"]
 
 [dependencies]
 rvllm-core = { workspace = true }
