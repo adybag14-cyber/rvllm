@@ -239,6 +239,11 @@ impl CutlassLib {
         workspace_size: usize,
         stream: u64,
     ) -> Result<()> {
+        eprintln!(
+            "[rvllm-cutlass] launch_fp8_gemm_residual: plan.variant={}, map keys={:?}",
+            plan.variant.0,
+            self.fp8_gemm_residual.keys().map(|k| k.0).collect::<Vec<_>>()
+        );
         plan.check_workspace(workspace_size)?;
         let f = self.fp8_gemm_residual.get(&plan.variant).ok_or_else(|| {
             eprintln!(
