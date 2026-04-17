@@ -43,6 +43,10 @@ tbody tr.vllm-win td{background:rgba(255,153,119,0.04)}
 footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #151515;color:#666;font-size:0.78rem}
 .caveat{background:#14100a;border:1px solid #3a2818;color:#e5c489;padding:0.9rem 1.1rem;border-radius:8px;margin:1rem 0;font-size:0.88rem}
 .caveat strong{color:#ffd58a}
+.section{page-break-inside:avoid;break-inside:avoid-page}
+.footnote{font-size:0.8rem;color:#888;margin:0.5rem 0 0.8rem;padding:0 0.4rem}
+.footnote strong{color:#bbb}
+@media print{h2{page-break-after:avoid;break-after:avoid-page}.chart-box{page-break-inside:avoid;break-inside:avoid-page}}
 </style>
 </head>
 <body>
@@ -126,8 +130,9 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #151515;color:#66
 <tr class="rvllm-win"><td>512</td><td class="r"><strong>131.5</strong></td><td class="r"><strong>132.1</strong></td><td class="r">985.9</td><td class="r">879.6</td></tr>
 </tbody>
 </table>
+<div class="footnote"><strong>N=8 is an outlier on rvLLM</strong> (cold 414 ms, hot 314 ms). A specific cuBLASLt algo is picked for the (M=8 × 37,888) prefill-phase <code>gate_up</code> GEMM that runs ~5&times; slower than its HBM-BW lower bound. The second prefill pays again because the cached algo is already the slow one. The top-16 heuristic autotune (commit <code>82b1f59</code>, v0.3.1) replaces the single-shot pick with on-device timing and should collapse this cell to the ~50 ms band that N=1/16/64 sit in.</div>
 
-<h2>Where the time goes at N=8 <span class="sub">nsys profile, top-10 kernels per step</span></h2>
+<h2 class="section">Where the time goes at N=8 <span class="sub">nsys profile, top-10 kernels per step</span></h2>
 <div class="chart-box">
   <div class="chart-title"><strong>Per-step kernel time @ N=8</strong> &mdash; captured 21 steady-state steps
     <div class="note">339 kernel launches per step, all captured into one cuGraphLaunch. Total per step = 7.28 ms (bench ms/step). Launch overhead = 0.1% of step. The gap to vLLM is entirely inside the GEMM body, not the launch loop.</div>
@@ -164,7 +169,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #151515;color:#66
 </table>
 <div class="note"><strong>Root cause:</strong> cuBLASLt dispatches a <code>128&times;128&times;128</code> tile for every FP8 linear regardless of M. At M=8, 120/128 rows of the M dimension are padding — SMs are doing useful work on ~6% of the matmul. The two largest shapes (gate_up, down) eat 4.3 ms/step of that slack, which is exactly the entire vLLM gap at N=8 (rvLLM 7.29 ms &minus; vLLM 4.67 ms = 2.62 ms). <strong>Fix</strong>: cuBLASLt top-16 heuristic + on-device autotune, cached per-(M,N,K,epilogue). Landed on commit <code>82b1f59</code>, benched under <code>v0.3.1</code>.</div>
 
-<h2>Deployment footprint</h2>
+<h2 class="section">Deployment footprint</h2>
 <div class="chart-box">
   <div class="chart-title"><strong>Bytes on disk to ship the engine</strong>
     <div class="note">rvLLM: one binary + three CUDA .so files. vLLM: a full conda env including torch, xformers, triton, numpy, and ~500 Python modules.</div>
@@ -172,7 +177,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #151515;color:#66
   <div id="chart-footprint" style="height:280px"></div>
 </div>
 
-<h2>VRAM use on an 80 GB H100</h2>
+<h2 class="section">VRAM use on an 80 GB H100</h2>
 <div class="chart-box">
   <div class="chart-title"><strong>Memory posture at idle</strong>
     <div class="note">rvLLM sizes its HBM arena to exactly what the current batch needs (7 GB weights + sized-for-N KV + scratch). vLLM pre-reserves 74 GB for its paged-KV allocator on server start; the actual amount used at any given moment is similar, but the reservation shape is different.</div>
@@ -180,7 +185,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #151515;color:#66
   <div id="chart-vram" style="height:280px"></div>
 </div>
 
-<h2>Cold start <span class="sub">process launch &rarr; first token ready</span></h2>
+<h2 class="section">Cold start <span class="sub">process launch &rarr; first token ready</span></h2>
 <div class="chart-box">
   <div class="chart-title"><strong>Where the first ~100 seconds goes</strong>
     <div class="note">Stacked breakdown. rvLLM starts serving 20&ndash;60 s faster on first launch; subsequent launches narrow as vLLM's Triton JIT cache warms.</div>
@@ -251,8 +256,8 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
   ];
 
   const footprintData = [
-    { engine: 'rvLLM 0.3.0', binary: 9.2, kernels: 81, deps: 0 },
-    { engine: 'vLLM 0.19',   binary: 0,   kernels: 3000, deps: 8000 }
+    { engine: 'rvLLM 0.3.0', binary: 9.2, kernels: 81, deps: 0,    total: '90 MB (~90 MB total)' },
+    { engine: 'vLLM 0.19',   binary: 0,   kernels: 3000, deps: 8000, total: '11,000 MB (~11 GB total)' }
   ];
 
   const vramData = [
@@ -270,11 +275,15 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
       e(R.BarChart, { data: tsData, margin: { top: 10, right: 24, left: 18, bottom: 8 } },
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
         e(R.XAxis,    { dataKey: 'n', stroke: '#666', label: { value: 'Batch size (concurrent prompts)', position: 'insideBottom', offset: -4, fill: '#888', fontSize: 11 } }),
-        e(R.YAxis,    { stroke: '#666', tickFormatter: v => v.toLocaleString(), label: { value: 'tokens / second', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
+        e(R.YAxis,    { stroke: '#666', domain: [0, 46000], tickFormatter: v => v.toLocaleString(), label: { value: 'tokens / second', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
         e(R.Tooltip,  { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' }, formatter: v => v.toLocaleString() + ' tok/s' }),
         e(R.Legend,   { wrapperStyle: { paddingTop: 8 } }),
-        e(R.Bar, { dataKey: 'rvllm', name: 'rvLLM 0.3.0', fill: '#84E6B7' }),
-        e(R.Bar, { dataKey: 'vllm',  name: 'vLLM 0.19 (hot)', fill: '#5a8bd4' })
+        e(R.Bar, { dataKey: 'rvllm', name: 'rvLLM 0.3.0', fill: '#84E6B7' },
+          e(R.LabelList, { dataKey: 'rvllm', position: 'top', fill: '#b5f3d2', fontSize: 10, formatter: v => v.toLocaleString() })
+        ),
+        e(R.Bar, { dataKey: 'vllm',  name: 'vLLM 0.19 (hot)', fill: '#5a8bd4' },
+          e(R.LabelList, { dataKey: 'vllm', position: 'top', fill: '#8eb0e0', fontSize: 10, formatter: v => v.toLocaleString() })
+        )
       )
     );
   }
@@ -287,8 +296,12 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
         e(R.YAxis, { stroke: '#666', label: { value: 'TTFT (ms, lower is better)', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
         e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' }, formatter: v => v.toFixed(1) + ' ms' }),
         e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
-        e(R.Bar, { dataKey: 'rvllm', name: 'rvLLM 0.3.0 (hot)', fill: '#84E6B7' }),
-        e(R.Bar, { dataKey: 'vllm',  name: 'vLLM 0.19 (hot)',   fill: '#5a8bd4' })
+        e(R.Bar, { dataKey: 'rvllm', name: 'rvLLM 0.3.0 (hot)', fill: '#84E6B7' },
+          e(R.LabelList, { dataKey: 'rvllm', position: 'top', fill: '#b5f3d2', fontSize: 10, formatter: v => v.toFixed(0) })
+        ),
+        e(R.Bar, { dataKey: 'vllm',  name: 'vLLM 0.19 (hot)',   fill: '#5a8bd4' },
+          e(R.LabelList, { dataKey: 'vllm', position: 'top', fill: '#8eb0e0', fontSize: 10, formatter: v => v.toFixed(0) })
+        )
       )
     );
   }
@@ -306,16 +319,19 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
   }
 
   function Footprint(){
+    // Log scale makes the 90 MB vs 11,000 MB comparison actually readable.
     return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
-      e(R.BarChart, { data: footprintData, margin: { top: 10, right: 24, left: 30, bottom: 8 } },
+      e(R.BarChart, { data: footprintData, margin: { top: 24, right: 24, left: 30, bottom: 8 } },
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
         e(R.XAxis, { dataKey: 'engine', stroke: '#666' }),
-        e(R.YAxis, { stroke: '#666', label: { value: 'MB', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
+        e(R.YAxis, { stroke: '#666', scale: 'log', domain: [1, 20000], ticks: [1, 10, 100, 1000, 10000], tickFormatter: v => v.toLocaleString(), label: { value: 'MB (log scale)', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
         e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' }, formatter: v => v.toLocaleString() + ' MB' }),
         e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
         e(R.Bar, { dataKey: 'binary',  name: 'Rust binary',    stackId: 'a', fill: '#84E6B7' }),
         e(R.Bar, { dataKey: 'kernels', name: 'CUDA kernels',   stackId: 'a', fill: '#5a8bd4' }),
-        e(R.Bar, { dataKey: 'deps',    name: 'Python / conda', stackId: 'a', fill: '#ff9977' })
+        e(R.Bar, { dataKey: 'deps',    name: 'Python / conda', stackId: 'a', fill: '#ff9977' },
+          e(R.LabelList, { dataKey: 'total', position: 'top', fill: '#eee', fontSize: 11, fontWeight: 600 })
+        )
       )
     );
   }
@@ -328,8 +344,12 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
         e(R.YAxis, { type: 'category', dataKey: 'engine', stroke: '#aaa', tick: { fontSize: 12, fill: '#c5c5c5' }, width: 70 }),
         e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' }, formatter: v => v.toFixed(1) + ' GB' }),
         e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
-        e(R.Bar, { dataKey: 'reserved', name: 'Reserved / held', stackId: 'a', fill: '#ff9977' }),
-        e(R.Bar, { dataKey: 'free',     name: 'Free on card',    stackId: 'a', fill: '#84E6B7' })
+        e(R.Bar, { dataKey: 'reserved', name: 'Reserved / held', stackId: 'a', fill: '#ff9977' },
+          e(R.LabelList, { dataKey: 'reserved', position: 'insideLeft', fill: '#3d1810', fontSize: 11, fontWeight: 700, formatter: v => v.toFixed(1) + ' GB' })
+        ),
+        e(R.Bar, { dataKey: 'free',     name: 'Free on card',    stackId: 'a', fill: '#84E6B7' },
+          e(R.LabelList, { dataKey: 'free', position: 'insideRight', fill: '#0c2818', fontSize: 11, fontWeight: 700, formatter: v => v.toFixed(1) + ' GB free' })
+        )
       )
     );
   }
