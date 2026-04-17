@@ -88,12 +88,12 @@ impl CublasLt {
             return Err(cublaslt_err("cublasLtMatmulDescCreate"));
         }
 
-        // Set transa = N (no transpose on A), transb = T (transpose on B)
-        // which is required for FP8 TN layout on H100. The cublasLt sys
-        // bindings don't re-export cublasOperation_t; use raw i32:
-        // CUBLAS_OP_N = 0, CUBLAS_OP_T = 1.
-        let transa: i32 = 0;
-        let transb: i32 = 1;
+        // FP8 E4M3 on Hopper requires TN op layout. With cuBLASLt's
+        // column-major convention and row-major input buffers, we use:
+        //   transa = T, transb = N
+        // (raw i32: CUBLAS_OP_N = 0, CUBLAS_OP_T = 1).
+        let transa: i32 = 1;
+        let transb: i32 = 0;
         set_attr(
             desc,
             lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
@@ -135,36 +135,44 @@ impl CublasLt {
             std::mem::size_of_val(&b_scale),
         )?;
 
-        // Matrix layouts. A = [M, K] FP8, B = [N, K] FP8 (cuBLASLt
-        // interprets via transb=T so logical op is A * B^T = [M, N]).
+        // Matrix layouts (cuBLASLt is column-major). We hand it
+        // row-major inputs by swapping the conceptual A/B and
+        // configuring transa=T:
+        //   input_a_for_cublas = weight [N, K] row-major viewed as [K, N] col-major, transa=T
+        //   input_b_for_cublas = activ  [M, K] row-major viewed as [K, M] col-major, transb=N
+        //   output           = [N, M] col-major, i.e. [M, N] row-major (our D).
         let mut layout_a: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
         let mut layout_b: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
         let mut layout_d: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
+        // cublas_A := weight, col-major view of [K rows, N cols], ld = K.
         let r = lt::cublasLtMatrixLayoutCreate(
             &mut layout_a,
             lt::cudaDataType::CUDA_R_8F_E4M3,
-            m as u64,
             k as u64,
-            k as i64, // row-major, ld = K
+            n as u64,
+            k as i64,
         );
         if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
             return Err(cublaslt_err("layout A"));
         }
+        // cublas_B := activation, col-major view of [K rows, M cols], ld = K.
         let r = lt::cublasLtMatrixLayoutCreate(
             &mut layout_b,
             lt::cudaDataType::CUDA_R_8F_E4M3,
-            n as u64,
             k as u64,
+            m as u64,
             k as i64,
         );
         if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
             return Err(cublaslt_err("layout B"));
         }
+        // cublas_D := [N rows, M cols] col-major, ld = N. Memory-equivalent
+        // to our [M, N] row-major output buffer.
         let r = lt::cublasLtMatrixLayoutCreate(
             &mut layout_d,
             lt::cudaDataType::CUDA_R_16F,
-            m as u64,
             n as u64,
+            m as u64,
             n as i64,
         );
         if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
@@ -207,17 +215,20 @@ impl CublasLt {
 
         let one_f32: f32 = 1.0;
         let zero_f32: f32 = 0.0;
+        // Note A/B are swapped vs the logical signature: cublas "A" is
+        // the weight, cublas "B" is the activation, per the col-major
+        // trick above.
         let r = lt::cublasLtMatmul(
             self.handle,
             desc,
             &one_f32 as *const _ as *const _,
-            a_fp8 as *const _,
+            b_fp8 as *const _,  // weight
             layout_a,
-            b_fp8 as *const _,
+            a_fp8 as *const _,  // activation
             layout_b,
             &zero_f32 as *const _ as *const _,
-            std::ptr::null(), // C layout unused when beta=0
-            std::ptr::null_mut(),
+            d_f16 as *const _,  // C (same buffer as D, unused at beta=0)
+            layout_d,
             d_f16 as *mut _,
             layout_d,
             &heur.algo,
