@@ -505,12 +505,17 @@ impl Bringup {
         }
         self.stream.fence()?;
 
-        // Faux-prefill: run 16 eager decode steps with advancing positions
-        // and slot_mapping, so the paged KV cache actually contains real
-        // forward-pass activations before we start timing. vLLM's bench has
-        // real KV from real prompt tokens; this is the closest we can get
-        // without a separate prefill kernel path.
-        const FAUX_PREFILL_STEPS: i32 = 16;
+        // Faux-prefill: eager decode steps with advancing positions that
+        // populate KV pages with real forward-pass activations before
+        // the timed window. Default 16 matches vLLM's input_len=16.
+        // Override via RVLLM_PREFILL to exercise longer-context regimes
+        // (FP8 KV HBM-bandwidth win is context-length-sensitive).
+        let faux_prefill_steps: i32 = std::env::var("RVLLM_PREFILL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(16);
+        #[allow(non_snake_case)]
+        let FAUX_PREFILL_STEPS = faux_prefill_steps;
         let n = num_seqs as usize;
         for step in 0..FAUX_PREFILL_STEPS {
             let pos_host: Vec<i32> = (0..n as i32).map(|i| step + i * 32).collect();
