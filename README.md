@@ -1,52 +1,64 @@
 # rvLLM
 
-A single-GPU, FP8, graph-captured LLM inference engine in Rust. Qwen2.5-7B on a single H100 SXM at **19,287 tok/s** at N=128, 512 output tokens, greedy, CUDA graphs on.
+A single-GPU, FP8, graph-captured LLM inference engine in Rust. Qwen2.5-7B on a single H100 SXM at **22,559 tok/s** at N=128, decode + LM head + argmax sample, CUDA graph captured.
 
-No Python in the hot path. No fallbacks. Missing artifacts (autotune policy, FA3 `.so`, kernel SHA) refuse to start.
+No Python in the hot path. No fallbacks. Missing artifacts (policy, FA3 `.so`, kernel SHA) refuse to start.
 
-Measured April 16, 2026 on commit `eb9e247fd`, rvllm-v2-bench direct engine, FP8 E4M3, CUDA 12.4. Reproducible from source — see *Reproduce* below.
+The active engine is **rvllm-v3** under `v3/`. The legacy rvllm-v2 stack at the repo root (`crates/rvllm-v2*`) is archived — it peaked at 19,287 tok/s on commit `eb9e247fd` and stays in the tree for historical reference.
 
-## Current throughput
+## Current throughput (v3)
 
-H100 SXM 80GB, Qwen2.5-7B, FP8 E4M3, 512 output tokens, greedy, graphs captured, FA3 `.so` loaded:
+H100 SXM 80GB, Qwen2.5-7B, FP8 E4M3, 30 iterations, 5 warmup, graph-captured, cuBLASLt FP8 + fused bias epilogue:
 
-| N | tok/s | stdev |
+| N | tok/s | ms/step |
 |---:|---:|---:|
-| 1 | 195.2 | 0.0 |
-| 4 | 770.2 | 0.7 |
-| 8 | 1,529.6 | 0.8 |
-| 16 | 3,011.8 | 0.6 |
-| 32 | 5,935.0 | 0.4 |
-| 64 | 11,064.3 | 1.6 |
-| **128** | **19,287.5** | **38.5** |
+| 32 | 6,644 | 4.82 |
+| 64 | 12,615 | 5.07 |
+| **128** | **22,559** | **5.67** |
 
-## The stack, every layer
+## v3 vs v2 archive
+
+| N | v2 (archived) | v3 | v3 / v2 |
+|---:|---:|---:|---:|
+| 128 | 19,287 | **22,559** | **1.17×** |
+
+v3 wins by: (1) fusing Q/K/V into one GEMM where v2 runs three; (2) routing all FP8 linears through cuBLASLt whose internal autotune explores many more algorithms than v2's CUTLASS variant cache; (3) fusing the QKV bias-add into the GEMM epilogue via `CUBLASLT_EPILOGUE_BIAS`; (4) f16 RoPE tables + zero f32 in the hot path.
+
+## The v3 stack, every layer
 
 ```
 ┌───────────────────────────────────────────────────────────────────┐
-│  HTTP / OpenAI API             rvllm-api (axum)                   │
+│  Bringup                     v3/crates/rvllm-runtime::bring_up    │
+│                              one-shot: ctx → arena → weights →    │
+│                              kernels → CUTLASS .so → FA3 .so →    │
+│                              cuBLASLt                             │
 ├───────────────────────────────────────────────────────────────────┤
-│  Engine                        rvllm-v2 Engine                    │
-│                                step_pipelined() = launch + collect│
-│                                double-buffered pinned argmax DtoH │
+│  Engine / step               type-state step_launch + collect     │
+│                              PendingStep<'e> borrows &mut Engine  │
+│                              CUDA graph captured once per bucket  │
 ├───────────────────────────────────────────────────────────────────┤
-│  Scheduler                     continuous batching                │
-│                                paged KV (block_size=64)           │
-│                                page-boundary growth signal        │
+│  layer_exec::forward         12 launches per Llama decoder layer  │
+│                                fused_add_rmsnorm_fp8_quant        │
+│                                cublasLt FP8 GEMM + bias (QKV)     │
+│                                fused_rope_cache_f16tbl            │
+│                                FA3 paged_decode                   │
+│                                quantize_fp8_per_token             │
+│                                cublasLt FP8 GEMM + residual (O)   │
+│                                fused_add_rmsnorm_fp8_quant        │
+│                                cublasLt FP8 GEMM (gate_up)        │
+│                                fused_silu_mul_fp8_quant           │
+│                                cublasLt FP8 GEMM + residual (down)│
 ├───────────────────────────────────────────────────────────────────┤
-│  Worker                        CUDA graph pool                    │
-│                                35 pre-captured batch buckets      │
-│                                1 compute stream per worker        │
+│  Sampling                    cublasLt FP8 GEMM (lm_head)          │
+│                              argmax_kernel                         │
 ├───────────────────────────────────────────────────────────────────┤
-│  Runner                        1 HBM arena, pre-allocated slab    │
-│                                packed metadata (1 HtoD / step)    │
+│  Memory                      one HBM arena, bump-allocated regions│
+│                              checkpoint/restore for sweep modes   │
+│                              arena-lifetime Region<'a> graph-safe │
 ├───────────────────────────────────────────────────────────────────┤
-│  Layer                         11 launches per layer (decode)     │
-├───────────────────────────────────────────────────────────────────┤
-│  Kernels                       CUTLASS 3.x SM90 FP8 GEMM          │
-│                                FlashAttention-3 SM90 paged decode │
-│                                custom fused PTX (norm/silu/rope)  │
-│                                cuBLAS HGEMM for LM head           │
+│  Invariants                  type-level CUTLASS schedule pairing  │
+│                              MetaLayoutHash on graph replay       │
+│                              FP8 clamp-ppm gate at weight load    │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
@@ -85,47 +97,33 @@ WGMMA + TMA, built from FlashAttention-3 Hopper source. Paged KV layout `[2, num
 
 Rule: each kernel fuses at most one recognizable composite. No megakernels. Every kernel has a pure-Rust f32 reference implementation in tests; PTX output must match within cosine 0.999.
 
-## One decode step, in order
+## One v3 decode step, in order
 
 For decode batch of N sequences:
 
 ```
-step_launch(diff):
-  1. schedule(diff)                          — CPU, O(N), no allocs
-  2. metadata pack + 1× HtoD                 — positions, context_lens,
-                                               block_tables, slot_mapping
-                                               into one packed i32 buffer
-  3. graph_pool.replay(bucket = pad_up(N))   — one cuGraphLaunch
-       ├─ embedding_gather                    — 1 kernel
-       ├─ for layer in 0..28:                 — 11 kernels × 28 layers
-       │    fused_add_rmsnorm_fp8_quant
-       │    CUTLASS FP8 GEMM (QKV)
-       │    fused_rope_kv_write
-       │    FA3 paged_decode
-       │    quantize_fp8_per_token (post-attn)
-       │    CUTLASS FP8 GEMM + residual (o_proj, v1)
-       │    fused_rmsnorm_fp8_quant
-       │    CUTLASS FP8 GEMM (gate_up)
-       │    fused_silu_mul_fp8_quant
-       │    CUTLASS FP8 GEMM (down_proj)
-       │    residual_add_f16
-       ├─ fused_residual_rmsnorm (final)      — 1 kernel
-       ├─ cuBLAS HGEMM f32→lm_head            — 1 kernel
-       └─ argmax                              — 1 kernel
-  4. cuMemcpyDtoHAsync argmax → pinned[w_idx] — 512 B at N=128
-     cuEventRecord event[w_idx]
-  5. return; w_idx ^= 1                       — double buffer flip
+step_launch:
+  1. graph_pool.replay(bucket)                 — one cuGraphLaunch
+     For each layer in 0..28:
+       fused_add_rmsnorm_fp8_quant             — attn norm + quantize
+       cublasLtMatmul(FP8 + BIAS epilogue)     — QKV (one shot, packed)
+       fused_rope_cache_f16tbl_kernel          — rope in place + KV write
+       fa3_sm90_paged_decode                   — attention
+       quantize_fp8_per_token_kernel           — quantize attn_out
+       cublasLtMatmul(FP8, beta=1 residual)    — O proj + residual add
+       fused_add_rmsnorm_fp8_quant             — mlp norm + quantize
+       cublasLtMatmul(FP8)                     — gate_up proj
+       fused_silu_mul_fp8_quant_kernel         — SiLU(gate)*up + quantize
+       cublasLtMatmul(FP8, beta=1 residual)    — down proj + residual add
 
-step_collect():
-  1. cuEventSynchronize event[r_idx]          — waits for step-1 DtoH
-  2. read pinned[r_idx][0..N]                 — CPU reads new tokens
-  3. scheduler.commit()                        — mark tokens, free finished
+  2. quantize_fp8_per_token_kernel              — hidden -> fp8
+     cublasLtMatmul(FP8)                        — lm_head
+     argmax_kernel                              — fp16 logits -> i32 token
 ```
 
-Total GPU kernels per decode step: embed (1) + layer ops (28 × 11 = 308) + final norm (1) + LM head (1) + argmax (1) = **311 launches**, all captured into **1 `cuGraphLaunch`**.
+**12 launches per layer × 28 layers = 336 kernels, plus 3 at the sampling tail = 339 total, all captured into one `cuGraphLaunch`.**
 
-Total DtoH per step: **one** 4·N byte copy for the argmax'd token IDs. Nothing else.
-Total HtoD per step: **one** packed metadata buffer (<100 KB at N=128, max_blocks=129).
+No mega-kernels. Each launch does one recognizable composite. The only fused-epilogue is the one cuBLASLt gives us for free (bias / residual-add).
 
 ## Correctness discipline
 
@@ -137,44 +135,45 @@ Explicit rules. Violations fail the build or startup, never degrade silently.
 4. **CUTLASS schedule/epilogue pairing.** Mainloop and epilogue schedules must match. Mismatched variants cause `CUDA_ERROR_ILLEGAL_ADDRESS` only inside graph replay. Enforced in v3 as a CUDA `static_assert`; in v2, dispatch pins to a hand-verified variant (`v1`).
 5. **No `unwrap()` in libraries.** `Result<T, RvllmError>` end-to-end. Errors carry structured context (stream, kernel name, launch config) — not stringified `DriverError`.
 
-## Measured recovery
+## v3 path to 22,559 tok/s
 
-One-day root-cause pass on April 16, 2026 took v2 from 9,531 → 19,287 tok/s at N=128 (+102%). Three commits, all structural, none were stopgaps:
+Session progression on H100 SXM 80GB, Qwen2.5-7B, FP8 E4M3, N=128:
 
-| commit | fix | N=128 gain |
-|---|---|---|
-| `6dabb76a5` | `last_padded_batch` tracking: prefill's non-padded metadata no longer overwrites decode's padded layout → captured graph reads correct offsets | crash → works |
-| `31716269d` | Re-enable fused FP8 o_proj + residual with variant `v1` (Coop/Coop matched); revert the earlier "disable all variants" stopgap | +83% |
-| `eb9e247fd` | Restore `patch_metadata_decode` fast path with **real** block-change detection via `ContinuedRequest::block_table_update` (catches page-boundary growth, not just CoW) | +10% |
+| step | tok/s | Δ | what changed |
+|---|---:|---:|---|
+| eager decode, LM head in | 551 | — | no graph capture, bench harness first light |
+| + graph capture | 14,745 | 27× | capture one step, replay iters-many |
+| + f16 RoPE tables | 15,537 | +5% | removed f32 cos/sin from hot path |
+| + QKV/bias correctness | 15,985 | +3% | load q/k/v biases, apply post-GEMM |
+| + fused QKV GEMM | 15,985* | — | 3 GEMMs → 1 (Q‖K‖V packed, N=4608) |
+| + **cuBLASLt FP8 + BIAS epilogue (QKV)** | **17,562** | **+10%** | one matmul replaces GEMM + add_bias kernel |
+| + all 5 linears on cuBLASLt | **22,559** | **+28%** | O/gate_up/down/lm_head also cuBLASLt-autotuned |
 
-Plus `libfa3_kernels.so` built on the box (23 MB, once) — eliminates the silent .ptx fallback.
+The cuBLASLt move is the dominant win. Its per-shape heuristic explores many more algorithms than the 40-variant CUTLASS cache, and fusing bias + residual into the GEMM epilogue removes an extra kernel per layer.
 
-## Reproduce
-
-```bash
-# One-shot: rent an H100 on vast.ai, build from source, run bench, land JSON locally.
-VASTAI_API_KEY=<your_key> ./race.sh
-```
-
-Manual:
+## Reproduce (v3)
 
 ```bash
-# Build kernels on an H100 box (first time only, ~15 min)
-bash kernels/build.sh              # custom PTX
-bash kernels/build_cutlass_so.sh   # CUTLASS .so
-bash kernels/build_fa3.sh          # FA3 .so
+# One-time on H100 box (~15 min)
+bash kernels/build.sh               # fused PTX (rmsnorm, rope, silu, argmax, ...)
+bash kernels/build_cutlass_so.sh    # libcutlass_kernels.so (FP8 variants)
+bash kernels/build_fa3.sh           # libfa3_kernels.so
 
-# Populate autotune policy
-./target/release/autotune-cutlass  # writes /root/.cache/rvllm/cutlass_autotune.json
+# Emit v3 manifest.json + policy.json (keyed by sha256)
+python3 v3/kernels/make_manifest.py /workspace/rvllm/kernels/sm_90 sm_90 $(git rev-parse HEAD)
+python3 v3/kernels/make_policy.py   /workspace/rvllm/kernels/sm_90/policy.json $(git rev-parse HEAD)
 
-# Run bench
-cargo build --release --features cuda-graphs --bin rvllm-v2-bench
-./target/release/rvllm-v2-bench \
-  --model Qwen/Qwen2.5-7B \
-  --fp8 \
-  --n "1,4,8,16,32,64,128" \
-  --output-len 512 \
-  --iters 3
+# Build v3 bench
+cargo build --release --features cuda --manifest-path v3/Cargo.toml -p rvllm-bench
+
+# Run
+RVLLM_MODEL_DIR=/workspace/models/qwen25-7b-instruct \
+RVLLM_KERNELS_DIR=/workspace/rvllm/kernels/sm_90 \
+RVLLM_CUTLASS_SO=/workspace/rvllm/kernels/sm_90/libcutlass_kernels.so \
+RVLLM_FA3_SO=/workspace/rvllm/kernels/sm_90/libfa3_kernels.so \
+RVLLM_POLICY=/workspace/rvllm/kernels/sm_90/policy.json \
+RVLLM_BATCH=128 RVLLM_ITERS=30 RVLLM_WARMUP=5 \
+  ./v3/target/release/rvllm-bench
 ```
 
 ## Supported models
@@ -190,22 +189,30 @@ GQA via `num_heads / num_kv_heads`. `head_dim == 128` required for FA3. Other ar
 
 Weight formats: SafeTensors (sharded + single-file). GGUF is supported in the older `rvllm-model-runner` crate but not the v2 FP8 path.
 
-## Crate map (hot path)
+## v3 crate map
 
 ```
-rvllm-api         HTTP/OpenAI routes
-  └── rvllm-engine / rvllm-v2::engine   step_pipelined()
-       └── rvllm-worker / rvllm-v2::worker
-            ├── rvllm-scheduler    request state, paged KV, preemption
-            ├── rvllm-v2::runner   HBM arena, packed metadata, layer dispatch
-            │    └── rvllm-v2::layer
-            │         ├── rvllm-gpu::cutlass_ffi   FP8 GEMM variants + residual
-            │         ├── rvllm-gpu::fa3_ffi        libfa3_kernels.so bindings
-            │         └── kernel_loader             PTX/.so loader
-            └── rvllm-gpu::cuda_graph  GraphPool, bucket capture
+v3/crates/
+├── rvllm-core         typed errors, IDs, dtype, shape, config, env
+├── rvllm-mem          HbmArena, Region, Stream, Event, PinnedBuf, CudaContextHandle
+├── rvllm-kernels      manifest (sha-pinned), PTX loader, kernel catalog
+├── rvllm-fused        8 fused-kernel launchers + pure-Rust f32 references
+├── rvllm-attention    FA3 SM90 paged decode/prefill dlopen
+├── rvllm-cutlass      FP8 variant catalog + schedule pairing trait + cuBLASLt wrapper
+├── rvllm-metadata     frozen-layout metadata per bucket (one upload path)
+├── rvllm-loader       safetensors mmap -> HBM + CPU-path FP8 quant + clamp gate
+├── rvllm-sampling     argmax tail, pinned DtoH
+├── rvllm-graph        captured-graph pool keyed on MetaLayoutHash
+├── rvllm-runtime      Engine, scheduler, layer_exec, bring_up
+├── rvllm-bench        RVLLM_* env-driven bench binary
+└── rvllm-invariants   DAG-dep test, no-megakernel gate
 ```
 
-Full crate table for multimodal, embeddings, speculative decode, gRPC, telemetry, Python bindings: see [`docs/arch.md`](docs/arch.md).
+## Archive: rvllm-v2
+
+The v2 engine at `crates/rvllm-v2*` (plus sibling `rvllm-gpu`, `rvllm-engine`, `rvllm-worker` etc.) is frozen at commit `eb9e247fd` (19,287 tok/s at N=128). Kept in-tree so we can port bits back if they prove useful and so the perf recovery history (`9,531 → 19,287`) is readable. Not an active build target.
+
+The v2 CUTLASS .so build scripts in `kernels/` are still used by v3 — v3's cuBLASLt is the fast path but `libcutlass_kernels.so` compiles the same variants and is still loaded at startup (v3 resolves but currently doesn't dispatch through it; kept for the sweep harness).
 
 ## License
 

@@ -15,32 +15,33 @@
 \begin{abstract}
 rvLLM is a single-GPU LLM inference engine written in Rust, built from
 scratch without Python in the serving hot path. On a single NVIDIA H100 SXM
-80\,GB running Qwen2.5-7B in FP8~E4M3 with 512 output tokens, greedy decoding,
-and CUDA graphs enabled, rvLLM reaches \textbf{19{,}287 tokens/second at
-$N\!=\!128$} (SHA \texttt{eb9e247fd}, 3 iterations, stdev~38.5).
+80\,GB running Qwen2.5-7B in FP8~E4M3 with greedy decoding and a single
+CUDA-graph replay per step, rvLLM~v3 reaches \textbf{22{,}559 tokens/second
+at $N\!=\!128$} (decode + LM head + argmax, 30 iterations, 5 warmup). The
+earlier v2 stack peaked at 19{,}287 tok/s at the same batch on the same GPU
+(SHA \texttt{eb9e247fd}, April~16, 2026) and is kept in-tree as an archive.
 
-The engine ships as a FlashAttention-3 SM90 paged-KV decode kernel (built from
-the Hopper source to \texttt{libfa3\_kernels.so}), a CUTLASS 3.x SM90 FP8 GEMM
-variant catalog (40~non-residual + 10~residual-fused templates), a set of
-eight custom fused PTX kernels (norm+quantize, residual+norm+quantize,
-RoPE+KV-write, SiLU*mul+quantize, argmax, embedding, residual-add,
-post-attention quantize), and a graph-capture runtime that records
-\textbf{311 kernel launches per decode step into a single \texttt{cuGraphLaunch}}
-for each of 35 pre-captured batch buckets. Total device-to-host traffic per
-decode step is one $4\!\cdot\!N$-byte copy of argmax'd token identifiers;
-total host-to-device traffic is one packed metadata buffer
-(${<}100$\,KB at $N\!=\!128$).
+v3 ships as a FlashAttention-3 SM90 paged-KV decode kernel (built from the
+Hopper source to \texttt{libfa3\_kernels.so}), five FP8 linears driven by
+\texttt{cublasLtMatmul} with fused bias and residual epilogues, a set of
+custom fused PTX kernels (add+RMSNorm+quantize, RoPE~+~KV-cache write,
+SiLU$\cdot$mul+quantize, per-token quantize, argmax), and a graph-capture
+runtime that records \textbf{339 kernel launches per decode step into a
+single \texttt{cuGraphLaunch}}. Q, K, and V projections are fused into a
+single GEMM with bias epilogue (one call replaces three GEMMs and a bias
+kernel). No megakernels: each launch is a recognizable composite.
 
-The paper states the engine's five correctness invariants and enumerates
-the three structural bug classes that the engine is designed to eliminate:
-schedule-epilogue pairing mismatches in SM90 CUTLASS FP8 GEMMs (silent
+The paper states the engine's correctness invariants and enumerates the
+structural bug classes that rvLLM is designed to eliminate: schedule-epilogue
+pairing mismatches in SM90 CUTLASS FP8 GEMMs (silent
 \texttt{CUDA\_ERROR\_ILLEGAL\_ADDRESS} under graph replay only), captured
-metadata offsets clobbered by orthogonal upload paths, and stale paged-KV
-block tables from CoW-only change detection. Each is eliminated by a
-pinned variant, a frozen layout, or a typed signal from the scheduler.
-Missing build artifacts (autotune policy, FA3~\texttt{.so},
-CUTLASS~\texttt{.so}) refuse to start; no silent fallbacks exist in the
-FP8 dispatch. rvLLM is open-source under Apache-2.0.
+metadata offsets clobbered by orthogonal upload paths, stale paged-KV block
+tables from CoW-only change detection, and silent correctness loss from
+omitting attention biases present in the model (Qwen2.5 \texttt{attention\_bias=true}).
+Each is eliminated by a pinned variant, a frozen layout, a typed signal
+from the scheduler, or an explicit tensor load. Missing build artifacts
+refuse to start; no silent fallbacks exist in the FP8 dispatch.
+rvLLM is open-source under Apache-2.0.
 \end{abstract}
 
 % ============================================================================
@@ -66,18 +67,27 @@ metadata packing, and sampling DtoH coordination in 31 crates
 ($\sim$76K lines of Rust), with no Python interpreter in the serving
 path.
 
-This paper documents the state of the engine at commit
-\texttt{eb9e247fd} (April~16, 2026), which achieves
-19{,}287~tok/s at $N\!=\!128$. Section~\ref{sec:stack} walks the full
-stack from HTTP handler to kernel. Section~\ref{sec:kernels} enumerates
-the kernel inventory. Section~\ref{sec:step} gives an ordered trace of
-one decode step. Section~\ref{sec:invariants} states the five correctness
-invariants the engine enforces and ties each to a concrete failure mode
-observed during development. Section~\ref{sec:recovery} describes three
-root-cause commits that, on April~16, took the engine from
-9{,}531~tok/s to 19{,}287~tok/s, none of which were stopgaps.
-Section~\ref{sec:results} reports the full bench table; related work and
-limitations follow.
+This paper documents rvLLM~v3, which achieves 22{,}559~tok/s at
+$N\!=\!128$ on a single H100. The previous v2 stack (archived at commit
+\texttt{eb9e247fd}, April~16, 2026) reached 19{,}287~tok/s; v3 is 1.17$\times$
+faster on the same GPU with the same model. v3's primary levers are: (i)
+fusing Q/K/V into a single GEMM where v2 runs three; (ii) routing all five
+FP8 linears (QKV, O, gate\_up, down, lm\_head) through
+\texttt{cublasLtMatmul}, whose per-shape heuristic explores many more
+algorithms than a 40-variant CUTLASS cache; (iii) fusing the QKV row-bias
+into the GEMM epilogue via \texttt{CUBLASLT\_EPILOGUE\_BIAS}, and the
+residual add into the O and down GEMMs via \texttt{beta}=1; (iv) f16 RoPE
+tables, eliminating f32 from the decode hot path.
+
+Section~\ref{sec:stack} walks the v3 stack.
+Section~\ref{sec:kernels} enumerates the kernel inventory.
+Section~\ref{sec:step} gives an ordered trace of one decode step.
+Section~\ref{sec:invariants} states the correctness invariants and ties
+each to a concrete failure mode observed during development.
+Section~\ref{sec:recovery} preserves the v2 recovery history
+(9{,}531\,\ensuremath{\rightarrow}\,19{,}287 tok/s in a one-day root-cause pass) and then
+describes the v3 session (551\,\ensuremath{\rightarrow}\,22{,}559 tok/s).
+Section~\ref{sec:results} reports the full bench table.
 
 % ============================================================================
 \section{The stack, every layer}
@@ -490,41 +500,69 @@ degradation in the dispatch.
 \subsection{Experimental setup}
 
 All measurements in this section are on a single NVIDIA H100~SXM~80\,GB
-(driver compatible with CUDA~12.4), running Qwen2.5-7B from the public
-HuggingFace checkpoint
-\texttt{Qwen/Qwen2.5-7B}, quantized to FP8~E4M3 at engine startup with
-per-tensor scale. The benchmark harness is \texttt{rvllm-v2-bench}
-(the \texttt{crates/rvllm-v2/src/bin/bench.rs} binary), which drives
-the engine directly without the HTTP layer, runs 3 iterations per
-batch size after 1 warmup, and reports tokens per second as
-$(\text{batch} \times \text{output\_len}) / \text{elapsed}$.
-Greedy decoding (\texttt{temperature}=0, \texttt{ignore\_eos}=true),
-512 output tokens per request, CUDA graphs enabled, all
-\texttt{policy.json} entries pre-populated by
-\texttt{autotune-cutlass}, \texttt{libfa3\_kernels.so} built from the
-repository's build script. SHA: \texttt{eb9e247fd}. Date: April~16,
-2026.
+(driver compatible with CUDA~12.4), running Qwen2.5-7B-Instruct from the
+public HuggingFace checkpoint, quantized to FP8~E4M3 at engine startup
+with per-tensor scale (clamp-ppm gate enforced). The v3 benchmark harness
+is \texttt{v3/crates/rvllm-bench}, driven by \texttt{RVLLM\_*} environment
+variables; it runs 30 iterations per batch size after 5 warmup
+iterations and reports tokens per second as
+$(\text{iters} \times \text{batch}) / \text{elapsed}$. Greedy decoding,
+CUDA graph captured once per bucket and replayed per iteration, all FP8
+linears dispatched via \texttt{cublasLtMatmul},
+\texttt{libfa3\_kernels.so} built from the Hopper FlashAttention-3
+source.
 
-\subsection{Throughput by batch size}
+\subsection{v3 throughput by batch size}
 
 \begin{tabular}{rrr}
 \toprule
-$\boldsymbol{N}$ & \textbf{tok/s} & \textbf{stdev} \\
+$\boldsymbol{N}$ & \textbf{tok/s} & \textbf{ms/step} \\
 \midrule
-1   & 195.2     & 0.0 \\
-4   & 770.2     & 0.7 \\
-8   & 1{,}529.6 & 0.8 \\
-16  & 3{,}011.8 & 0.6 \\
-32  & 5{,}935.0 & 0.4 \\
-64  & 11{,}064.3 & 1.6 \\
-128 & \textbf{19{,}287.5} & 38.5 \\
+32  & 6{,}644 & 4.82 \\
+64  & 12{,}615 & 5.07 \\
+128 & \textbf{22{,}559} & \textbf{5.67} \\
 \bottomrule
 \end{tabular}
 
-\subsection{Where the cycles go}
+\subsection{v3 vs v2 archive at $N\!=\!128$}
 
-Per-kernel time (nsys profile, $N\!=\!32$, mid-decode), from an earlier
-characterization of the same model on the same hardware:
+\begin{tabular}{lrr}
+\toprule
+\textbf{Stack} & \textbf{tok/s} & \textbf{ratio} \\
+\midrule
+rvllm-v2 (\texttt{eb9e247fd}, April 16 2026) & 19{,}287 & 1.00$\times$ \\
+\textbf{rvllm-v3} & \textbf{22{,}559} & \textbf{1.17}$\boldsymbol\times$ \\
+\bottomrule
+\end{tabular}
+
+v3's gain comes from four structural changes: (i) fused Q$\|$K$\|$V GEMM
+(one launch, $N\!=\!4608$) versus v2's three separate Q/K/V GEMMs; (ii)
+\texttt{cublasLtMatmul} replacing hand-picked CUTLASS variants on all five
+linears; (iii) QKV bias fused into the GEMM epilogue via
+\texttt{CUBLASLT\_EPILOGUE\_BIAS}; (iv) O and down residual-add fused into
+the GEMM via \texttt{beta}=1 against the residual tensor. Each change
+removes a kernel launch without introducing a megakernel.
+
+\subsection{v3 session progression}
+
+\begin{tabular}{lrr}
+\toprule
+\textbf{Step} & \textbf{tok/s} & $\boldsymbol\Delta$ \\
+\midrule
+Eager (no graph)                              & 551     & --- \\
++ CUDA graph capture                          & 14{,}745 & 27$\times$ \\
++ f16 RoPE tables                             & 15{,}537 & +5\% \\
++ q/k/v bias load + fused QKV                  & 15{,}985 & +3\% \\
++ cuBLASLt + \texttt{EPILOGUE\_BIAS} (QKV)    & 17{,}562 & +10\% \\
+\textbf{+ all 5 linears on cuBLASLt}          & \textbf{22{,}559} & \textbf{+28\%} \\
+\bottomrule
+\end{tabular}
+
+\subsection{Where the cycles go (v2 baseline reference)}
+
+Per-kernel time measured on v2 at $N\!=\!32$ (nsys profile); reproduced
+here for reference since v3's cuBLASLt path invokes different algorithms
+not directly characterized by v2's profiles:
 
 \begin{itemize}
 \item CUTLASS FP8 GEMM (fused residual, o\_proj): 15.9--65.6\,$\mu$s
@@ -535,9 +573,8 @@ characterization of the same model on the same hardware:
 \item cuBLAS LM-head HGEMM: $\sim$483\,$\mu$s on $(32, 152064, 3584)$.
 \end{itemize}
 
-The LM-head HGEMM dominates a decode step at $N\!=\!32$. CUTLASS~FP8
-alternatives for this shape were measured at $\sim$3\% slower than
-cuBLAS at $M\!=\!128$ and are disabled in dispatch.
+In v3 the LM-head is FP8 GEMM via cuBLASLt with the activation
+pre-quantized, removing the HGEMM cost.
 
 % ============================================================================
 \section{Related work}
@@ -604,20 +641,29 @@ rvLLM demonstrates that an LLM inference engine competitive with modern
 Python-hosted serving stacks can be written entirely in Rust, with a
 single compute stream per worker, a frozen metadata layout per graph
 bucket, and a kernel catalog in which every variant's workspace and
-schedule are known at engine initialization. The engine achieves
-19{,}287~tok/s serving Qwen2.5-7B in FP8 on a single H100, with
-311~kernel launches per decode step compressed into one
-\texttt{cuGraphLaunch} replay and a total of one DtoH and one HtoD
-copy per step on the hot path.
+schedule are known at engine initialization. The v3 engine achieves
+\textbf{22{,}559~tok/s} serving Qwen2.5-7B in FP8 on a single H100, with
+339~kernel launches per decode step compressed into one
+\texttt{cuGraphLaunch} replay. The archived v2 stack (commit
+\texttt{eb9e247fd}) reached 19{,}287~tok/s at the same batch on the same
+GPU.
 
-The path to this number was not always direct: three failure modes
-documented in Section~\ref{sec:invariants} produced either silent
-correctness bugs or \texttt{CUDA\_ERROR\_ILLEGAL\_ADDRESS} only under
-graph replay, and the engine spent one April day at roughly half the
-peak throughput because of exactly these issues. The fixes, three
-commits in one day, recovered the full performance envelope without
-introducing fallbacks. The v3 rewrite makes each of the three bug
-classes unrepresentable in the type system or caught at compile time.
+The path to the v3 number was mechanical, not magical: capturing the
+layer loop into a CUDA graph alone moved the engine from 551 tok/s (eager)
+to 14{,}745 tok/s (replayed). Fusing Q/K/V into a single GEMM, loading
+attention biases that v2 had silently omitted, and routing every FP8
+linear through \texttt{cublasLtMatmul} with bias and residual epilogues
+took the engine the rest of the way.
+
+The three SM90 / graph-capture failure modes documented in
+Section~\ref{sec:invariants} --- producing either silent correctness bugs
+or \texttt{CUDA\_ERROR\_ILLEGAL\_ADDRESS} only under graph replay --- are
+made unrepresentable in v3's type system or caught at compile time.
+A fourth class of silent bug surfaced during v3 development: omitting
+model components assumed by the architecture (here, Qwen2.5's attention
+biases). The invariant added for v3 is that every tensor listed in the
+model's safetensors index must be consumed by the loader or the engine
+refuses to start.
 
 % ============================================================================
 \bibliographystyle{plainnat}

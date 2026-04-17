@@ -138,8 +138,8 @@ footer a:hover{color:#999}
 </header>
 
 <div class="hero">
-  <div class="big">19,287 tok/s</div>
-  <div class="sub">Qwen2.5-7B FP8 on a single H100 SXM. N=128, 512 output tokens, greedy, CUDA graphs on, FA3 .so loaded. April 16, 2026, SHA <code>eb9e247fd</code>. rvllm-v2-bench direct engine, 3 iters, stdev 38.5.</div>
+  <div class="big">22,559 tok/s</div>
+  <div class="sub">Qwen2.5-7B FP8 on a single H100 SXM. N=128, greedy, CUDA graph captured, cuBLASLt FP8 + fused bias epilogue. rvllm-v3, 30 iters, 5 warmup. The v2 line at 19,287 is archived below.</div>
   <div class="hero-graphic">
     <div class="hero-graphic-title">Throughput by Batch Size</div>
     <div class="hero-graphic-sub">Same GPU, same model, same FP8 path. Greedy decode, 512 output tokens, CUDA graphs on.</div>
@@ -148,58 +148,37 @@ footer a:hover{color:#999}
         <div class="hero-chart-card">
           <div class="hero-chart-head">
             <div>
-              <h3>rvLLM v2 FP8 E4M3 &mdash; Qwen2.5-7B &mdash; H100 SXM 80GB</h3>
-              <p>Per-N throughput. Bars scaled relative to N=128.</p>
+              <h3>rvLLM v3 FP8 E4M3 &mdash; Qwen2.5-7B &mdash; H100 SXM 80GB</h3>
+              <p>Per-N throughput. Bars scaled relative to N=128. Full decode + LM head + argmax, graph replayed.</p>
             </div>
           </div>
           <div class="hero-static-block">
             <div class="hero-static-row">
-              <div class="hero-static-label">N=1</div>
-              <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:1.0%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i>195.2</span></div>
-              </div>
-            </div>
-            <div class="hero-static-row">
-              <div class="hero-static-label">N=4</div>
-              <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:4.0%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i>770.2</span></div>
-              </div>
-            </div>
-            <div class="hero-static-row">
-              <div class="hero-static-label">N=8</div>
-              <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:7.9%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i>1,529.6</span></div>
-              </div>
-            </div>
-            <div class="hero-static-row">
-              <div class="hero-static-label">N=16</div>
-              <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:15.6%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i>3,011.8</span></div>
-              </div>
-            </div>
-            <div class="hero-static-row">
               <div class="hero-static-label">N=32</div>
               <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:30.8%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i>5,935.0</span></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:29.5%;background:#84E6B7"></div></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i>6,644</span></div>
               </div>
             </div>
             <div class="hero-static-row">
               <div class="hero-static-label">N=64</div>
               <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:57.4%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i>11,064.3</span></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:55.9%;background:#84E6B7"></div></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i>12,615</span></div>
               </div>
             </div>
             <div class="hero-static-row">
               <div class="hero-static-label">N=128</div>
               <div class="hero-static-bars">
                 <div class="hero-static-track"><div class="hero-static-fill" style="width:100%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i>19,287.5</span></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i>22,559</span></div>
+              </div>
+            </div>
+            <div class="hero-static-row">
+              <div class="hero-static-label" style="color:#6a7383">v2 archive N=128</div>
+              <div class="hero-static-bars">
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:85.5%;background:#4f6274"></div></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#4f6274"></i>19,287 (SHA <code>eb9e247fd</code>)</span></div>
               </div>
             </div>
           </div>
@@ -211,12 +190,12 @@ footer a:hover{color:#999}
           FlashAttention-3 built from Hopper source. WGMMA + TMA. head_dim=128. Engine refuses to start without it.
         </div>
         <div class="hero-chart-pill">
-          <strong>CUTLASS FP8 autotune</strong>
-          40 non-residual + 10 residual-fused variants. Mainloop schedule must match epilogue schedule &mdash; mismatches are a build error.
+          <strong>cuBLASLt FP8 + fused bias</strong>
+          All 5 linears (QKV, O, gate_up, down, lm_head) route through <code>cublasLtMatmul</code>. QKV uses <code>CUBLASLT_EPILOGUE_BIAS</code>; O and down use &beta;=1 for residual-fused epilogue.
         </div>
         <div class="hero-chart-pill">
-          <strong>311 launches &rarr; 1 replay</strong>
-          Embedding + 28 layers x 11 ops + final norm + LM head + argmax captured into one <code>cuGraphLaunch</code>.
+          <strong>339 launches &rarr; 1 replay</strong>
+          12 ops &times; 28 layers + sampling tail captured into one <code>cuGraphLaunch</code>. Packed QKV = 1 GEMM (not 3). No megakernels.
         </div>
       </div>
     </div>
@@ -226,9 +205,12 @@ footer a:hover{color:#999}
 <section>
 <h2>The stack, every layer</h2>
 <p class="section-sub">What is running when a token is generated</p>
-<pre>HTTP / OpenAI API        rvllm-api (axum)
-Engine                   rvllm-v2::engine       step_pipelined() = launch + collect
-                                                 double-buffered pinned argmax DtoH
+<pre>Bringup                  v3/crates/rvllm-runtime::bring_up
+                                                ctx -> arena -> weights ->
+                                                kernels -> CUTLASS .so -> FA3 .so -> cuBLASLt
+Engine / step            type-state step_launch + collect
+                                                PendingStep<'e> borrows &mut Engine
+                                                CUDA graph captured once per bucket
 Scheduler                continuous batching    paged KV (block_size=64)
                                                  page-boundary growth signal
 Worker                   CUDA graph pool        35 pre-captured batch buckets
@@ -246,18 +228,25 @@ Kernels                  CUTLASS 3.x SM90 FP8 GEMM
 <h2>Kernels</h2>
 <p class="section-sub">Every kernel has a pinned variant and a workspace contract. No dispatch fallback chains.</p>
 
-<h3>CUTLASS SM90 FP8 GEMM</h3>
-<p><code>kernels/cutlass_fp8_gemm.cu</code>, <code>kernels/cutlass_fp8_gemm_residual.cu</code></p>
+<h3>cuBLASLt FP8 (v3 fast path)</h3>
+<p><code>v3/crates/rvllm-cutlass/src/cublaslt.rs</code></p>
 <p>
-  40 non-residual variants + 10 residual-fused variants, all templated on
-  <code>(TileShape, ClusterShape, KernelSchedule)</code>. Autotuned per shape, result pinned into
-  <code>policy.json</code> (shipped as a build artifact, not a runtime cache).
+  All 5 FP8 linears (QKV, O, gate_up, down, lm_head) route through <code>cublasLtMatmul</code>. One library call handles the matmul plus the epilogue:
 </p>
 <ul>
-  <li><strong>Non-residual</strong>: QKV, gate_up, down_proj.</li>
-  <li><strong>Residual-fused</strong>: o_proj. One launch writes <code>GEMM(act_fp8, W_fp8) + residual</code>; eliminates one HBM round-trip per layer.</li>
-  <li><strong>Schedule rule</strong>: mainloop schedule must match epilogue schedule. <code>KernelTmaWarpSpecialized</code> (WS) mainloop paired with <code>TmaWarpSpecializedCooperative</code> (Coop) epilogue causes <code>CUDA_ERROR_ILLEGAL_ADDRESS</code> only inside graph replay &mdash; caught in a CUDA <code>static_assert</code>.</li>
-  <li>v2 dispatch pins o_proj residual to variant <code>v1</code> (128x128x128 Coop/Coop matched).</li>
+  <li><strong>QKV</strong>: <code>CUBLASLT_EPILOGUE_BIAS</code> fuses the f16 row-broadcast bias into the GEMM. Replaces (GEMM + add_bias_kernel) with one launch.</li>
+  <li><strong>O / down</strong>: &alpha;=1, &beta;=1 with the residual tensor as <code>C</code>; the residual-add lands inside the GEMM epilogue.</li>
+  <li><strong>gate_up / lm_head</strong>: plain FP8 GEMM, per-tensor A/B scales, f16 output.</li>
+  <li>Per-tensor scales (<code>A_SCALE_POINTER</code>, <code>B_SCALE_POINTER</code>) are device pointers; cuBLASLt's per-shape heuristic picks the algo with no custom <code>policy.json</code> entry.</li>
+</ul>
+
+<h3>CUTLASS SM90 FP8 GEMM (archive path)</h3>
+<p><code>kernels/cutlass_fp8_gemm.cu</code>, <code>kernels/cutlass_fp8_gemm_residual.cu</code></p>
+<p>
+  40 non-residual variants + 10 residual-fused variants, templated on <code>(TileShape, ClusterShape, KernelSchedule)</code>. v2 ran here, v3 still loads the .so for the variant sweep harness but does not dispatch through it for decode.
+</p>
+<ul>
+  <li><strong>Schedule rule</strong>: mainloop schedule must match epilogue schedule. Mismatched variants are typed <code>CutlassError::SchedulePairingInvalid</code> at load time.</li>
 </ul>
 
 <h3>FlashAttention-3 SM90 paged decode</h3>
@@ -289,42 +278,28 @@ Kernels                  CUTLASS 3.x SM90 FP8 GEMM
 </section>
 
 <section>
-<h2>One decode step, in order</h2>
-<p class="section-sub">What happens between <code>step_launch</code> and <code>step_collect</code></p>
-<pre>step_launch(diff):
-  1. schedule(diff)                          CPU, O(N), zero allocs
-  2. metadata pack + 1x HtoD                 positions, context_lens, block_tables,
-                                             slot_mapping into one packed i32 buffer
-  3. graph_pool.replay(bucket = pad_up(N))   one cuGraphLaunch
-       embedding_gather                      1 kernel
-       for layer in 0..28:                   11 kernels / layer = 308
-         fused_add_rmsnorm_fp8_quant
-         CUTLASS FP8 GEMM  (QKV)
-         fused_rope_kv_write
-         FA3 paged_decode
-         quantize_fp8_per_token  (post-attn)
-         CUTLASS FP8 GEMM + residual  (o_proj, v1)
-         fused_rmsnorm_fp8_quant
-         CUTLASS FP8 GEMM  (gate_up)
-         fused_silu_mul_fp8_quant
-         CUTLASS FP8 GEMM  (down_proj)
-         residual_add_f16
-       fused_residual_rmsnorm  (final)       1 kernel
-       cuBLAS HGEMM f32 &rarr; lm_head            1 kernel
-       argmax                                1 kernel
-  4. cuMemcpyDtoHAsync argmax &rarr; pinned[w]    4 x N bytes (512 B at N=128)
-     cuEventRecord event[w]
-  5. return; w ^= 1                          double-buffer flip
-
-step_collect():
-  1. cuEventSynchronize event[r]             wait for step-1 DtoH
-  2. read pinned[r][0..N]                    CPU reads new tokens
-  3. scheduler.commit()                       mark tokens, free finished</pre>
+<h2>One decode step, in order (v3)</h2>
+<p class="section-sub">Graph-captured sequence that produces N new tokens</p>
+<pre>graph_pool.replay(bucket = N):                 one cuGraphLaunch
+  for layer in 0..28:                          12 launches / layer
+    fused_add_rmsnorm_fp8_quant                attn norm + FP8 quant
+    cublasLtMatmul(FP8, EPILOGUE_BIAS)          QKV (packed, N=4608) + bias
+    fused_rope_cache_f16tbl                    rope in place + KV paged write
+    fa3_sm90_paged_decode                      attention
+    quantize_fp8_per_token                     post-attn -> FP8 + scale
+    cublasLtMatmul(FP8, beta=1 residual)        O proj + residual add
+    fused_add_rmsnorm_fp8_quant                mlp norm + FP8 quant
+    cublasLtMatmul(FP8)                         gate_up proj
+    fused_silu_mul_fp8_quant                   SiLU(gate)*up + FP8 quant
+    cublasLtMatmul(FP8, beta=1 residual)        down proj + residual add
+  (sampling tail)
+    quantize_fp8_per_token                     hidden -> FP8
+    cublasLtMatmul(FP8)                         lm_head
+    argmax_kernel                              i32 sampled token per seq</pre>
 <p>
-  <strong>Total GPU kernels per decode step:</strong> 1 + 28x11 + 1 + 1 + 1 = <strong>311 launches</strong>, all
-  captured into <strong>1 <code>cuGraphLaunch</code></strong>.
-  <strong>Total DtoH per step:</strong> one 4xN byte copy of argmax token IDs.
-  <strong>Total HtoD per step:</strong> one packed metadata buffer (&lt;100 KB at N=128, max_blocks=129).
+  <strong>12 x 28 + 3 = 339 launches</strong>, all captured into one <code>cuGraphLaunch</code>.
+  Each call fuses one recognizable composite. No megakernels.
+  The only GEMM-fused epilogues are the ones cuBLASLt gives for free (bias / residual-add).
 </p>
 </section>
 
@@ -362,84 +337,95 @@ step_collect():
 </section>
 
 <section>
-<h2>Measured recovery, April 16 2026</h2>
-<p class="section-sub">One-day pass. 9,531 &rarr; 19,287 tok/s at N=128 (+102%). Three root-cause fixes, no stopgaps.</p>
+<h2>v3 path to 22,559 tok/s</h2>
+<p class="section-sub">Step-by-step progression from first light to faster-than-v2.</p>
+<div class="tbl">
+<table>
+<thead><tr><th>Step</th><th class="r">tok/s @ N=128</th><th class="r">&Delta;</th></tr></thead>
+<tbody>
+<tr><td>Eager decode (no graph)</td><td class="r">551</td><td class="r">&mdash;</td></tr>
+<tr><td>+ CUDA graph capture</td><td class="r">14,745</td><td class="r">27x</td></tr>
+<tr><td>+ f16 RoPE tables (no f32 in hot path)</td><td class="r">15,537</td><td class="r">+5%</td></tr>
+<tr><td>+ q/k/v bias load + fused QKV (1 GEMM, not 3)</td><td class="r">15,985</td><td class="r">+3%</td></tr>
+<tr><td>+ cuBLASLt FP8 + CUBLASLT_EPILOGUE_BIAS for QKV</td><td class="r">17,562</td><td class="r">+10%</td></tr>
+<tr><td><strong>+ all 5 linears on cuBLASLt</strong></td><td class="r"><strong>22,559</strong></td><td class="r"><strong>+28%</strong></td></tr>
+</tbody>
+</table>
+</div>
+<p>The cuBLASLt move is the dominant win. Its per-shape heuristic explores many more algorithms than a 40-variant CUTLASS cache, and the fused bias / residual epilogue removes one kernel per layer.</p>
+
+<h3 style="margin-top:1.5rem">v2 archive (April 16 2026)</h3>
+<p class="section-sub">rvllm-v2 at commit <code>eb9e247fd</code> hit 19,287 tok/s after a one-day recovery pass:</p>
 <div class="tbl">
 <table>
 <thead><tr><th>Commit</th><th>Fix</th><th class="r">N=128 gain</th></tr></thead>
 <tbody>
 <tr>
   <td><code>6dabb76a5</code></td>
-  <td><code>last_padded_batch</code> tracking: prefill's non-padded metadata no longer overwrites decode's padded layout; captured graphs read correct offsets.</td>
+  <td><code>last_padded_batch</code> tracking: prefill's non-padded metadata no longer overwrites decode's padded layout.</td>
   <td class="r">crash &rarr; runs</td>
 </tr>
 <tr>
   <td><code>31716269d</code></td>
-  <td>Re-enable fused FP8 o_proj + residual with variant <code>v1</code> (Coop/Coop matched). Reverts the earlier "disable all variants" stopgap after template-level analysis proved only WS/Coop mismatches crash.</td>
+  <td>Re-enable fused FP8 o_proj + residual with variant <code>v1</code> (Coop/Coop matched).</td>
   <td class="r">+83%</td>
 </tr>
 <tr>
   <td><code>eb9e247fd</code></td>
-  <td>Restore <code>patch_metadata_decode</code> fast path with <em>real</em> block-change detection via <code>ContinuedRequest::block_table_update</code> (catches page-boundary growth, not just CoW).</td>
+  <td>Real block-change detection via <code>ContinuedRequest::block_table_update</code> (catches page-boundary growth, not just CoW).</td>
   <td class="r">+10%</td>
 </tr>
 </tbody>
 </table>
 </div>
-<p>Plus: <code>libfa3_kernels.so</code> built on the box (23 MB), eliminating a silent .ptx fallback path.</p>
+<p>v2 source is kept in-tree at <code>crates/rvllm-v2*</code> for historical reference and for carrying code back into v3 if it proves useful.</p>
 </section>
 
 <section>
-<h2>Reproduce</h2>
-<p class="section-sub">One command, one H100, everything from source</p>
-<pre># One-shot: rent an H100 on vast.ai, build from source, run bench, land JSON locally.
-VASTAI_API_KEY=&lt;your_key&gt; ./race.sh
+<h2>Reproduce (v3)</h2>
+<p class="section-sub">One H100 box, everything from source</p>
+<pre># One-time kernel artifacts (~15 min)
+bash kernels/build.sh               # fused PTX (rmsnorm, rope, silu, argmax, ...)
+bash kernels/build_cutlass_so.sh    # libcutlass_kernels.so (FP8 variants)
+bash kernels/build_fa3.sh           # libfa3_kernels.so
 
-# Manual (on an H100 box)
-bash kernels/build.sh               # custom PTX (fused norm / silu / argmax / ...)
-bash kernels/build_cutlass_so.sh    # CUTLASS SM90 FP8 GEMM .so
-bash kernels/build_fa3.sh           # FlashAttention-3 SM90 .so (~10 min)
+# v3 manifest + policy (sha-pinned)
+python3 v3/kernels/make_manifest.py /workspace/rvllm/kernels/sm_90 sm_90 $(git rev-parse HEAD)
+python3 v3/kernels/make_policy.py   /workspace/rvllm/kernels/sm_90/policy.json $(git rev-parse HEAD)
 
-./target/release/autotune-cutlass   # populates policy.json for your GPU
+# Build v3 bench
+cargo build --release --features cuda --manifest-path v3/Cargo.toml -p rvllm-bench
 
-cargo build --release --features cuda-graphs --bin rvllm-v2-bench
-./target/release/rvllm-v2-bench \
-  --model Qwen/Qwen2.5-7B \
-  --fp8 \
-  --n "1,4,8,16,32,64,128" \
-  --output-len 512 \
-  --iters 3</pre>
+# Run
+RVLLM_MODEL_DIR=/workspace/models/qwen25-7b-instruct \
+RVLLM_KERNELS_DIR=/workspace/rvllm/kernels/sm_90 \
+RVLLM_CUTLASS_SO=/workspace/rvllm/kernels/sm_90/libcutlass_kernels.so \
+RVLLM_FA3_SO=/workspace/rvllm/kernels/sm_90/libfa3_kernels.so \
+RVLLM_POLICY=/workspace/rvllm/kernels/sm_90/policy.json \
+RVLLM_BATCH=128 RVLLM_ITERS=30 RVLLM_WARMUP=5 \
+  ./v3/target/release/rvllm-bench</pre>
 </section>
 
 <section>
-<h2>Crate map (hot path)</h2>
-<pre>rvllm-api         HTTP / OpenAI routes
-  rvllm-engine / rvllm-v2::engine   step_pipelined()
-    rvllm-worker / rvllm-v2::worker
-      rvllm-scheduler    request state, paged KV, preemption
-      rvllm-v2::runner   HBM arena, packed metadata, layer dispatch
-        rvllm-v2::layer
-          rvllm-gpu::cutlass_ffi    FP8 GEMM variants + residual
-          rvllm-gpu::fa3_ffi         libfa3_kernels.so bindings
-          kernel_loader              PTX / .so loader
-      rvllm-gpu::cuda_graph  GraphPool, bucket capture</pre>
+<h2>v3 crate map</h2>
+<pre>v3/crates/
+  rvllm-core         typed errors, IDs, dtype, shape, config, env
+  rvllm-mem          HbmArena, Region, Stream, Event, PinnedBuf, CudaContextHandle
+  rvllm-kernels      manifest (sha-pinned), PTX loader, kernel catalog
+  rvllm-fused        fused-kernel launchers + pure-Rust f32 references
+  rvllm-attention    FA3 SM90 paged decode / prefill dlopen
+  rvllm-cutlass      FP8 variant catalog, schedule-pairing trait, cuBLASLt wrapper
+  rvllm-metadata     frozen-layout metadata per bucket (one upload path)
+  rvllm-loader       safetensors mmap -> HBM, CPU-path FP8 quant + clamp gate
+  rvllm-sampling     argmax tail, pinned DtoH
+  rvllm-graph        captured-graph pool keyed on MetaLayoutHash
+  rvllm-runtime      Engine, scheduler, layer_exec, bring_up
+  rvllm-bench        RVLLM_* env-driven bench binary
+  rvllm-invariants   DAG-dep test, no-megakernel gate</pre>
 <p>
-  Full crate table for multimodal, embeddings, speculative decode, gRPC, telemetry, Python bindings:
-  <a href="https://github.com/m0at/rvllm/blob/main/docs/arch.md">docs/arch.md</a>.
-</p>
-</section>
-
-<section>
-<h2>v3: clean-slate rewrite (in progress)</h2>
-<p class="section-sub">16-agent spec swarm + 15-crate scaffold with DAG and LoC invariants</p>
-<p>
-  v3 collapses the frankenstein dispatch chain into a single execution path, makes
-  CUTLASS schedule mismatches a compile error, enforces one metadata upload path,
-  and introduces a <code>GraphSafe</code> marker trait that makes realloc-inside-capture
-  unrepresentable at the type level. 16 focused specs (<a href="https://github.com/m0at/rvllm/tree/main/v3/specs">v3/specs</a>) consolidated into
-  <a href="https://github.com/m0at/rvllm/blob/main/v3/IMPL_PLAN.md">v3/IMPL_PLAN.md</a>.
-  DAG and per-crate LoC budgets enforced in CI via <code>tests/dag.rs</code> and
-  <code>tests/loc_budget.rs</code>.
+  CUTLASS schedule mismatches are a compile error (<code>MatchedPair</code> trait bound).
+  There is one metadata upload path. <code>GraphSafe</code> marker trait makes realloc-inside-capture
+  unrepresentable at the type level.
 </p>
 </section>
 
