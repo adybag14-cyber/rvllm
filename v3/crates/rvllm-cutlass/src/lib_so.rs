@@ -104,11 +104,16 @@ impl CutlassLib {
                             variant_missing(&path, vid, "fp8_gemm_residual")
                         })?;
                     let w: libloading::Symbol<WorkspaceSizeFn> =
-                        lib.get(ws_c.as_bytes()).map_err(|_| {
+                        lib.get(ws_c.as_bytes()).map_err(|e| {
+                            eprintln!(
+                                "[rvllm-cutlass] dlsym fail: ws name={:?} vid={} err={:?}",
+                                ws_name_str, vid.0, e
+                            );
                             variant_missing(&path, vid, "fp8_gemm_residual_ws")
                         })?;
                     fp8_gemm_residual.insert(vid, *f);
                     fp8_gemm_residual_ws.insert(vid, *w);
+                    eprintln!("[rvllm-cutlass] loaded residual vid={}", vid.0);
                 }
             } else {
                 let fn_c = format!("{fn_name_str}\0");
@@ -116,15 +121,33 @@ impl CutlassLib {
                 unsafe {
                     let f: libloading::Symbol<Fp8GemmFn> = lib
                         .get(fn_c.as_bytes())
-                        .map_err(|_| variant_missing(&path, vid, "fp8_gemm"))?;
+                        .map_err(|e| {
+                            eprintln!(
+                                "[rvllm-cutlass] dlsym fail: name={:?} vid={} err={:?}",
+                                fn_name_str, vid.0, e
+                            );
+                            variant_missing(&path, vid, "fp8_gemm")
+                        })?;
                     let w: libloading::Symbol<WorkspaceSizeFn> = lib
                         .get(ws_c.as_bytes())
-                        .map_err(|_| variant_missing(&path, vid, "fp8_gemm_ws"))?;
+                        .map_err(|e| {
+                            eprintln!(
+                                "[rvllm-cutlass] dlsym fail: ws name={:?} vid={} err={:?}",
+                                ws_name_str, vid.0, e
+                            );
+                            variant_missing(&path, vid, "fp8_gemm_ws")
+                        })?;
                     fp8_gemm.insert(vid, *f);
                     fp8_gemm_ws.insert(vid, *w);
+                    eprintln!("[rvllm-cutlass] loaded non-residual vid={}", vid.0);
                 }
             }
         }
+        eprintln!(
+            "[rvllm-cutlass] load complete; non-residual keys={:?}; residual keys={:?}",
+            fp8_gemm.keys().map(|k| k.0).collect::<Vec<_>>(),
+            fp8_gemm_residual.keys().map(|k| k.0).collect::<Vec<_>>()
+        );
 
         Ok(Self {
             so_path: path,
