@@ -285,7 +285,9 @@ impl Bringup {
         let residual_ptr = residual.device_ptr();
 
         let one_step = || -> Result<()> {
-            for layer in &self.model.layers {
+            for (layer_idx, layer) in self.model.layers.iter().enumerate() {
+                let layer_kv_base =
+                    kv_cache.device_ptr() + (layer_idx as u64) * (kv_per_layer as u64);
                 let w = layer_exec::LayerWeights {
                     attn_norm_gamma: layer.input_layernorm.offset_bytes,
                     qkv_fp8: layer.qkv.offset_bytes,
@@ -304,8 +306,8 @@ impl Bringup {
                     q_out: q_out.device_ptr(),
                     k_out: k_out.device_ptr(),
                     v_out: v_out.device_ptr(),
-                    k_cache: kv_cache.device_ptr(),
-                    v_cache: kv_cache.device_ptr() + (kv_per_layer / 2) as u64,
+                    k_cache: layer_kv_base,
+                    v_cache: layer_kv_base + (kv_per_layer / 2) as u64,
                     attn_out: attn_out.device_ptr(),
                     attn_out_fp8: attn_out_fp8.device_ptr(),
                     attn_out_scale: attn_out_scale.device_ptr(),
