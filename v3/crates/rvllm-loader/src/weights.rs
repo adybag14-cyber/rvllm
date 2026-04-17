@@ -47,7 +47,7 @@ pub struct LayerWeights {
 #[derive(Debug)]
 pub struct LoadedModel {
     pub embedding: F16Weight,
-    pub lm_head: F16Weight,
+    pub lm_head_fp8: Fp8Weight,
     pub final_norm: F16Weight,
     pub rope_cos: F16Weight,
     pub rope_sin: F16Weight,

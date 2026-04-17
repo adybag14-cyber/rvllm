@@ -272,6 +272,18 @@ impl Bringup {
             inter,
             rvllm_core::DType::Fp8E4M3,
         )?;
+        let vocab = arch.vocab_size as u32;
+        let plan_lm_head = Fp8GemmPlan::from_policy(
+            &self.policy,
+            num_seqs,
+            vocab,
+            hidden,
+            rvllm_core::DType::Fp8E4M3,
+        )?;
+
+        // LM head scratch: batch x vocab f16 logits + batch sampled tokens.
+        let logits = arena.region("logits", (num_seqs * vocab * 2) as usize, 16)?;
+        let sampled_tokens = arena.region("sampled_tokens", (num_seqs * 4) as usize, 16)?;
 
         let dims = layer_exec::LayerDims {
             num_tokens: num_seqs,
@@ -361,6 +373,41 @@ impl Bringup {
                     stream,
                 )?;
             }
+            // LM head: quantize residual -> fp8, GEMM -> logits (f16),
+            // argmax over vocab -> sampled_tokens[i32].
+            rvllm_fused::QuantizeFp8PerTokenLaunch {
+                num_tokens: num_seqs,
+                dim: hidden,
+            }
+            .launch(
+                self.fused_modules.fn_quantize,
+                hidden_fp8.device_ptr(),
+                hidden_scale.device_ptr(),
+                residual_ptr,
+                stream,
+            )?;
+            #[cfg(feature = "cuda")]
+            self.cutlass.launch_fp8_gemm(
+                &plan_lm_head,
+                logits.device_ptr(),
+                hidden_fp8.device_ptr(),
+                self.model.lm_head_fp8.offset_bytes,
+                hidden_scale.device_ptr(),
+                self.model.lm_head_fp8.scale_ptr,
+                cutlass_ws.device_ptr(),
+                cutlass_ws_bytes,
+                stream,
+            )?;
+            rvllm_fused::ArgmaxLaunch {
+                num_tokens: num_seqs,
+                vocab,
+            }
+            .launch(
+                self.fused_modules.fn_argmax,
+                logits.device_ptr(),
+                sampled_tokens.device_ptr(),
+                stream,
+            )?;
             Ok(())
         };
 

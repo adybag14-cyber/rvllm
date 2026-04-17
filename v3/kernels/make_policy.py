@@ -10,12 +10,13 @@ import sys
 
 SHAPES = {
     # Qwen2.5-7B: hidden=3584, heads=28, kv_heads=4, head_dim=128, intermediate=18944
-    # For each bucket M, emit the 6 plans a layer needs.
+    # For each bucket M, emit the 6 plans a layer needs + lm_head.
     "buckets": [1, 4, 8, 16, 32, 64, 128],
     "hidden": 3584,
     "q_dim": 3584,  # 28 * 128
     "kv_dim": 512,  # 4 * 128
     "intermediate": 18944,
+    "vocab": 152064,
 }
 
 
@@ -34,12 +35,13 @@ def main():
     ws = 16 * 1024 * 1024  # conservative workspace budget
 
     for m in SHAPES["buckets"]:
-        # Non-residual: Q, K, V, gate_up
+        # Non-residual: Q, K, V, gate_up, lm_head
         for n, k in [
             (q_dim, hidden),        # Q
             (kv_dim, hidden),       # K
             (kv_dim, hidden),       # V (same shape; duplicate key ok)
             (2 * inter, hidden),    # gate||up
+            (SHAPES["vocab"], hidden),  # lm_head
         ]:
             key = f"{m}_{n}_{k}_Fp8E4M3"
             entries[key] = {"variant": 0, "workspace_bytes": ws}

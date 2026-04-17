@@ -184,7 +184,14 @@ pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Resul
 
     let embedding = upload_f16("embedding", "model.embed_tokens.weight")?;
     let final_norm = upload_f16("final_norm", "model.norm.weight")?;
-    let lm_head = upload_f16("lm_head", "lm_head.weight")?;
+    // LM head as FP8 per-tensor, so the final GEMM matches the layer path.
+    let lm_head_fp8 = upload_fp8_from(
+        arena,
+        "lm_head",
+        &must_get("lm_head.weight")?,
+        &shards,
+        model_dir,
+    )?;
 
     // RoPE cos/sin table -- precompute at load time.
     let (cos_bytes, sin_bytes) = rope_cos_sin_bytes(arch);
@@ -300,7 +307,7 @@ pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Resul
 
     Ok(LoadedModel {
         embedding,
-        lm_head,
+        lm_head_fp8,
         final_norm,
         rope_cos,
         rope_sin,
