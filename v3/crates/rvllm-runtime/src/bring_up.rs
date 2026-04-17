@@ -486,7 +486,30 @@ impl Bringup {
         }
         self.stream.fence()?;
 
+        // Faux-prefill: run 16 eager decode steps with advancing positions
+        // and slot_mapping, so the paged KV cache actually contains real
+        // forward-pass activations before we start timing. vLLM's bench has
+        // real KV from real prompt tokens; this is the closest we can get
+        // without a separate prefill kernel path.
+        const FAUX_PREFILL_STEPS: i32 = 16;
+        let n = num_seqs as usize;
+        for step in 0..FAUX_PREFILL_STEPS {
+            let pos_host: Vec<i32> = (0..n as i32).map(|i| step + i * 32).collect();
+            let slot_host: Vec<i32> = (0..n as i32)
+                .map(|i| step + i * max_blocks_per_seq as i32 * block_size as i32)
+                .collect();
+            let ctx_host: Vec<i32> = vec![step + 1; n];
+            positions.copy_from_host(bytemuck_cast_i32(&pos_host))?;
+            slot_mapping.copy_from_host(bytemuck_cast_i32(&slot_host))?;
+            context_lens.copy_from_host(bytemuck_cast_i32(&ctx_host))?;
+            one_step()?;
+        }
+        self.stream.fence()?;
+
         // Capture one step into a CUDA graph then replay for the bench.
+        // Metadata is RE-UPLOADED per iter (not frozen) to match vLLM
+        // which reschedules each step; positions / slot_mapping / context_lens
+        // advance just like a real decode loop would.
         let mut one_step = one_step;
         let graph = rvllm_graph::CapturedGraph::capture(
             num_seqs,
@@ -498,7 +521,16 @@ impl Bringup {
         )?;
 
         let t0 = std::time::Instant::now();
-        for _ in 0..iters {
+        for iter in 0..iters as i32 {
+            let pos = FAUX_PREFILL_STEPS + iter;
+            let pos_host: Vec<i32> = (0..n as i32).map(|i| pos + i * 32).collect();
+            let slot_host: Vec<i32> = (0..n as i32)
+                .map(|i| pos + i * max_blocks_per_seq as i32 * block_size as i32)
+                .collect();
+            let ctx_host: Vec<i32> = vec![pos + 1; n];
+            positions.copy_from_host(bytemuck_cast_i32(&pos_host))?;
+            slot_mapping.copy_from_host(bytemuck_cast_i32(&slot_host))?;
+            context_lens.copy_from_host(bytemuck_cast_i32(&ctx_host))?;
             graph.replay(stream)?;
         }
         self.stream.fence()?;
