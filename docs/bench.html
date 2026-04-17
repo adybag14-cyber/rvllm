@@ -355,8 +355,8 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
   ];
 
   const footprintData = [
-    { engine: 'rvLLM 0.3.0', binary: 9.2, kernels: 81, deps: 0,    total: '90 MB (~90 MB total)' },
-    { engine: 'vLLM 0.19',   binary: 0,   kernels: 3000, deps: 8000, total: '11,000 MB (~11 GB total)' }
+    { engine: 'rvLLM 0.3.0', total: 90,    label: '~90 MB   (9.2 MB binary + 81 MB kernels)' },
+    { engine: 'vLLM 0.19',   total: 11000, label: '~11,000 MB   (torch 1.8 GB + vllm 1.2 GB + conda env)' }
   ];
 
   const vramData = [
@@ -442,29 +442,33 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
 
   function Nsys(){
     return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
-      e(R.BarChart, { data: nsysData, layout: 'vertical', margin: { top: 10, right: 24, left: 260, bottom: 8 } },
+      e(R.BarChart, { data: nsysData, layout: 'vertical', margin: { top: 10, right: 40, left: 10, bottom: 18 } },
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
-        e(R.XAxis, { type: 'number', stroke: '#666', label: { value: 'ms per step', position: 'insideBottom', offset: -4, fill: '#888', fontSize: 11 } }),
-        e(R.YAxis, { type: 'category', dataKey: 'name', stroke: '#aaa', tick: { fontSize: 11, fill: '#c5c5c5' }, width: 250 }),
+        e(R.XAxis, { type: 'number', stroke: '#666', label: { value: 'ms per step', position: 'insideBottom', offset: -8, fill: '#888', fontSize: 11 } }),
+        e(R.YAxis, { type: 'category', dataKey: 'name', stroke: '#aaa', tick: { fontSize: 11, fill: '#c5c5c5' }, width: 220, interval: 0 }),
         e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' }, formatter: v => v.toFixed(3) + ' ms' }),
-        e(R.Bar, { dataKey: 'ms', fill: '#84E6B7' })
+        e(R.Bar, { dataKey: 'ms', fill: '#84E6B7' },
+          e(R.LabelList, { dataKey: 'ms', position: 'right', fill: '#b5f3d2', fontSize: 11, formatter: v => v.toFixed(2) + ' ms' })
+        )
       )
     );
   }
 
   function Footprint(){
-    // Log scale makes the 90 MB vs 11,000 MB comparison actually readable.
+    // Log-scale single-total bars. Zero stack segments break Recharts log
+    // scale, so we render the total and put the breakdown in the label.
     return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
-      e(R.BarChart, { data: footprintData, margin: { top: 24, right: 24, left: 30, bottom: 8 } },
+      e(R.BarChart, { data: footprintData, margin: { top: 24, right: 40, left: 30, bottom: 8 } },
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
-        e(R.XAxis, { dataKey: 'engine', stroke: '#666' }),
-        e(R.YAxis, { stroke: '#666', scale: 'log', domain: [1, 20000], ticks: [1, 10, 100, 1000, 10000], tickFormatter: v => v.toLocaleString(), label: { value: 'MB (log scale)', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
+        e(R.XAxis, { dataKey: 'engine', stroke: '#ccc', tick: { fill: '#ddd', fontSize: 12 } }),
+        e(R.YAxis, { stroke: '#666', scale: 'log', domain: [10, 30000], ticks: [10, 100, 1000, 10000], tickFormatter: v => v.toLocaleString(), label: { value: 'MB (log scale)', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
         e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' }, formatter: v => v.toLocaleString() + ' MB' }),
-        e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
-        e(R.Bar, { dataKey: 'binary',  name: 'Rust binary',    stackId: 'a', fill: '#84E6B7' }),
-        e(R.Bar, { dataKey: 'kernels', name: 'CUDA kernels',   stackId: 'a', fill: '#5a8bd4' }),
-        e(R.Bar, { dataKey: 'deps',    name: 'Python / conda', stackId: 'a', fill: '#ff9977' },
-          e(R.LabelList, { dataKey: 'total', position: 'top', fill: '#eee', fontSize: 11, fontWeight: 600 })
+        e(R.Bar, { dataKey: 'total', name: 'Total footprint',
+          shape: (p) => {
+            const fill = p.payload.engine === 'rvLLM 0.3.0' ? '#84E6B7' : '#ff9977';
+            return e('rect', { x: p.x, y: p.y, width: p.width, height: p.height, fill: fill, rx: 3 });
+          } },
+          e(R.LabelList, { dataKey: 'label', position: 'top', fill: '#eee', fontSize: 11, fontWeight: 600 })
         )
       )
     );
