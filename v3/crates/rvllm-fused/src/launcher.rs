@@ -111,6 +111,38 @@ impl ArgmaxLaunch {
         }
         Ok(())
     }
+
+    /// Issue the `argmax_kernel` launch.
+    ///
+    /// Kernel sig (from spec 12 and v2's argmax.cu):
+    ///   `argmax_kernel(logits: *const f32, out: *mut i32, vocab: i32)`
+    /// grid = (num_tokens, 1, 1); block = (min(vocab, 1024), 1, 1).
+    ///
+    /// # Safety
+    /// Caller must ensure `logits_ptr` / `out_ptr` are live device
+    /// pointers for the kernel's duration (graph capture or eager).
+    pub unsafe fn launch(
+        &self,
+        kernel: rvllm_kernels::KernelFn,
+        logits_ptr: u64,
+        out_ptr: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.validate()?;
+        let vocab = self.vocab as i32;
+        // Kernel args must outlive the launch call — keep bindings alive.
+        let mut logits_ptr = logits_ptr;
+        let mut out_ptr = out_ptr;
+        let mut vocab_arg = vocab;
+        let args = [
+            (&mut logits_ptr) as *mut u64 as *mut core::ffi::c_void,
+            (&mut out_ptr) as *mut u64 as *mut core::ffi::c_void,
+            (&mut vocab_arg) as *mut i32 as *mut core::ffi::c_void,
+        ];
+        let block_dim = (self.vocab.min(1024), 1, 1);
+        let grid = (self.num_tokens, 1, 1);
+        crate::launch_raw::launch_raw(kernel, grid, block_dim, 0, stream, &args)
+    }
 }
 
 // ---------------------------------------------------------------------------
