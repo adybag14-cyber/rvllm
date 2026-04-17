@@ -7,8 +7,17 @@ license.workspace = true
 authors.workspace = true
 
 # rvllm-mem: HBM arena, Region, Tensor, Stream, Event, CaptureScope, GraphSafe,
-#            PinnedPool, KvLayout. See v3/specs/{04,05}.md.
+#            PinnedPool, KvLayout. Per v3/specs/{04,05}.md.
+#
+# The type-level invariants (GraphSafe, lifetimes that reject realloc-in-capture,
+# type-state PendingStep) compile everywhere. Actual CUDA FFI is behind the
+# `cuda` feature so the crate builds and tests on hosts without CUDA.
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
 
 [dependencies]
 rvllm-core = { workspace = true }
 half = { workspace = true }
+cudarc = { version = "0.19", features = ["driver"], optional = true }

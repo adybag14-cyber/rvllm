@@ -1,0 +1,153 @@
+//! `HbmArena`: a single `cuMemAlloc` slab with bump-allocated `Region`s.
+//!
+//! The invariant this type carries is *no realloc*. Once `HbmArena::new`
+//! returns, the arena's device base pointer never changes. `region()`
+//! hands out sub-ranges that live for the arena's lifetime.
+//!
+//! `Region<'a>` is the handle. A captured CUDA graph binds device pointers
+//! derived from `Region`s; because those pointers are stable for the
+//! arena's lifetime and the borrow-checker keeps the arena alive longer
+//! than any borrowed `Region`, replay is always sound.
+
+use core::marker::PhantomData;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+use rvllm_core::{CudaCtx, CudaErrorKind, Result, RvllmError};
+
+use crate::graph_safe::GraphSafe;
+
+/// Bump-allocated HBM slab. One per device, constructed once at engine init.
+#[derive(Debug)]
+pub struct HbmArena<'ctx> {
+    base: u64,
+    capacity: usize,
+    used: AtomicUsize,
+    // Tie lifetime to a &'ctx Context marker (not modeled yet; lifetime
+    // exists so that `Region<'a>` can never outlive the arena).
+    _ctx: PhantomData<&'ctx ()>,
+}
+
+impl<'ctx> HbmArena<'ctx> {
+    /// Construct a CPU-side test arena (no GPU). Useful for unit tests
+    /// of the bookkeeping. Pretends to own `bytes` starting at some
+    /// fake device base.
+    ///
+    /// The GPU constructor lives behind `#[cfg(feature = "cuda")]` in
+    /// `hbm_cuda.rs` once that feature is enabled.
+    pub fn new_host_stub(bytes: usize) -> Self {
+        Self {
+            base: 0x0001_0000_0000_0000, // fake device pointer
+            capacity: bytes,
+            used: AtomicUsize::new(0),
+            _ctx: PhantomData,
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn used(&self) -> usize {
+        self.used.load(Ordering::Relaxed)
+    }
+
+    pub fn free(&self) -> usize {
+        self.capacity - self.used()
+    }
+
+    /// Carve a named, aligned region out of the arena. Takes `&self`
+    /// (not `&mut self`) so a `CaptureScope` holding `&HbmArena` can
+    /// still call `region` during init — but *inside* a captured
+    /// region, `region` must not be reachable. (`CaptureScope::record`
+    /// does not pass the arena in; see `capture.rs`.)
+    pub fn region<'a>(
+        &'a self,
+        name: &'static str,
+        bytes: usize,
+        align: usize,
+    ) -> Result<Region<'a>> {
+        let align = align.max(1);
+        let prev = self.used.load(Ordering::Acquire);
+        let aligned_start = prev.next_multiple_of(align);
+        let end = aligned_start.checked_add(bytes).ok_or_else(|| {
+            RvllmError::cuda(
+                "HbmArena::region",
+                CudaErrorKind::AllocFailed,
+                CudaCtx::setup(),
+            )
+        })?;
+        if end > self.capacity {
+            return Err(RvllmError::cuda(
+                "HbmArena::region",
+                CudaErrorKind::AllocFailed,
+                CudaCtx::setup(),
+            ));
+        }
+        // Monotonic bump; no contention in the single-worker model.
+        self.used.store(end, Ordering::Release);
+        Ok(Region {
+            arena: self,
+            name,
+            offset: aligned_start,
+            len: bytes,
+        })
+    }
+}
+
+/// A named, immutable range inside an `HbmArena`. Borrowing it prevents
+/// the arena from being dropped; the device pointer is stable for the
+/// region's lifetime.
+#[derive(Debug)]
+pub struct Region<'a> {
+    arena: &'a HbmArena<'a>,
+    name: &'static str,
+    offset: usize,
+    len: usize,
+}
+
+impl<'a> Region<'a> {
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    /// Device pointer of the region. Stable for `'a`.
+    pub fn device_ptr(&self) -> u64 {
+        self.arena.base + self.offset as u64
+    }
+}
+
+// A `Region` is GraphSafe: it borrows the arena, the arena is fixed-size
+// and non-reallocating, and the region's device pointer is constant for
+// the lifetime of the borrow. Capture may bind `&Region`.
+unsafe impl<'a> GraphSafe for Region<'a> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bump_allocation_is_monotonic_and_aligned() {
+        let a = HbmArena::new_host_stub(1 << 20);
+        let r1 = a.region("a", 100, 16).unwrap();
+        assert_eq!(r1.device_ptr() % 16, 0);
+        let r2 = a.region("b", 200, 256).unwrap();
+        assert_eq!(r2.device_ptr() % 256, 0);
+        assert!(r2.device_ptr() > r1.device_ptr());
+        assert!(a.used() >= 300);
+    }
+
+    #[test]
+    fn exhaustion_returns_err() {
+        let a = HbmArena::new_host_stub(1024);
+        let _ok = a.region("ok", 512, 1).unwrap();
+        let err = a.region("too big", 1024, 1).unwrap_err();
+        let s = format!("{err}");
+        assert!(s.contains("cuda"));
+        assert!(s.contains("HbmArena::region"));
+    }
+}
