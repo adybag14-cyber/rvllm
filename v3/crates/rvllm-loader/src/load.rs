@@ -453,8 +453,13 @@ fn upload_fp8(
     let fp8 = quantize_to_fp8_bytes(&f32_vals, q.scale);
     let region = arena.region(region_name, fp8.len(), 16)?;
     unsafe { region.copy_from_host(&fp8)? };
+    // Also stage the per-tensor scale as a 4-byte device scalar.
+    let scale_region = arena.region("fp8_scale", 4, 4)?;
+    let scale_bytes = q.scale.to_le_bytes();
+    unsafe { scale_region.copy_from_host(&scale_bytes)? };
     Ok(Fp8Weight {
         offset_bytes: region.device_ptr() - arena_base(arena),
+        scale_ptr: scale_region.device_ptr(),
         shape: shape.to_vec(),
         scale: q.scale,
         clamp_ppm: q.clamp_ppm,

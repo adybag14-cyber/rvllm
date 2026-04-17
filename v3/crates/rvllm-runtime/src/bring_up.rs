@@ -284,14 +284,14 @@ impl Bringup {
                 let w = layer_exec::LayerWeights {
                     attn_norm_gamma: layer.input_layernorm.offset_bytes,
                     qkv_fp8: layer.qkv.offset_bytes,
-                    qkv_scale: 0,
+                    qkv_scale: layer.qkv.scale_ptr,
                     o_fp8: layer.o_proj.offset_bytes,
-                    o_scale: 0,
+                    o_scale: layer.o_proj.scale_ptr,
                     mlp_norm_gamma: layer.post_attention_layernorm.offset_bytes,
                     gate_up_fp8: layer.gate_up.offset_bytes,
-                    gate_up_scale: 0,
+                    gate_up_scale: layer.gate_up.scale_ptr,
                     down_fp8: layer.down_proj.offset_bytes,
-                    down_scale: 0,
+                    down_scale: layer.down_proj.scale_ptr,
                 };
                 let scratch = layer_exec::LayerScratch {
                     hidden_fp8: hidden_fp8.device_ptr(),
