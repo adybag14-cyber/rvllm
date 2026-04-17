@@ -6,10 +6,16 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# rvllm-attention: FA3 SM90 paged decode + prefill. No PTX fallback.
-# Engine refuses to start without libfa3_kernels.so. See v3/specs/10-attention.md.
+# rvllm-attention: FA3 SM90 paged decode + prefill wrapper.
+# Engine refuses to start without libfa3_kernels.so. No PTX fallback.
+# See v3/specs/10-attention.md.
+
+[features]
+default = []
+cuda = ["rvllm-kernels/cuda", "rvllm-mem/cuda", "dep:libloading"]
 
 [dependencies]
 rvllm-core = { workspace = true }
 rvllm-mem = { workspace = true }
 rvllm-kernels = { workspace = true }
+libloading = { version = "0.8", optional = true }
