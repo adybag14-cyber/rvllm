@@ -262,9 +262,18 @@ static int fa3_sm90_paged_decode_impl(
     int size_one_kv_head = params.seqlen_k * head_dim * 2 * kv_bytes_per_elem;  // K+V
     int ns = num_splits_heuristic(total_mblocks, num_sm, num_n_blocks,
                                   num_m_blocks, size_one_kv_head,
-                                  false /*is_causal_or_local*/, 128);
+                                  params.is_causal || params.is_local, 128);
     params.num_splits = ns;
     bool use_split = ns > 1;
+
+    if (getenv("FA3_DEBUG")) {
+        fprintf(stderr, "fa3: b=%d h=%d h_k=%d d=%d seqlen_q=%d seqlen_k=%d total_q=%d "
+                "causal=%d varlen_q=%d fp8=%d split=%d ns=%d num_m=%d num_n=%d tot_mb=%d\n",
+                params.b, params.h, params.h_k, params.d,
+                params.seqlen_q, params.seqlen_k, params.total_q,
+                (int)params.is_causal, cu_seqlens_q_ptr != nullptr ? 1 : 0,
+                (int)is_fp8, (int)use_split, ns, num_m_blocks, num_n_blocks, total_mblocks);
+    }
 
     // Scheduler metadata setup — matches upstream hopper/flash_api.cpp:
     //   varlen_sort_batches = !is_local
