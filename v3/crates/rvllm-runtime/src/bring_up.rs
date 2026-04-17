@@ -344,15 +344,26 @@ impl Bringup {
             Ok(())
         };
 
-        // Warmup.
+        // Eager warmup so any first-run kernel setup lands outside the graph.
         for _ in 0..warmup {
             one_step()?;
         }
         self.stream.fence()?;
 
+        // Capture one step into a CUDA graph then replay for the bench.
+        let mut one_step = one_step;
+        let graph = rvllm_graph::CapturedGraph::capture(
+            num_seqs,
+            max_blocks_per_seq,
+            rvllm_metadata::MetadataLayout::compute(num_seqs, max_blocks_per_seq).hash(),
+            rvllm_graph::GraphFingerprint([0u8; 32]),
+            stream,
+            || one_step(),
+        )?;
+
         let t0 = std::time::Instant::now();
         for _ in 0..iters {
-            one_step()?;
+            graph.replay(stream)?;
         }
         self.stream.fence()?;
         let elapsed = t0.elapsed();
