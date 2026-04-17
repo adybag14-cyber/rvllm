@@ -160,13 +160,9 @@ extern "C" int rvllm_w4a8_gemm_run(
     auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(n, m, 1));
     auto stride_S = cutlass::make_cute_packed_stride(StrideS{}, cute::make_shape(n, scale_k, 1));
 
-    // Reordered B layout: N-major tiles with the 8-elem-per-thread atom.
-    Layout layout_B_reordered = tile_to_shape(
-        LayoutAtomQuant{},
-        cute::make_shape(n, k, 1),
-        cute::conditional_t<::cutlass::gemm::detail::is_k_major<LayoutB>(),
-            Step<_2,_1,_3>, Step<_1,_2,_3>>{}
-    );
+    // Reordered B layout — follow example 55 line 399: shape-only overload.
+    auto shape_B = cute::make_shape(n, k, 1);
+    LayoutB_Reordered layout_B_reordered = cute::tile_to_shape(LayoutAtomQuant{}, shape_B);
 
     typename Gemm::Arguments arguments {
         cutlass::gemm::GemmUniversalMode::kGemm,
@@ -221,12 +217,8 @@ extern "C" size_t rvllm_w4a8_gemm_workspace_size(int m, int n, int k) {
     auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(n, m, 1));
     auto stride_S = cutlass::make_cute_packed_stride(StrideS{}, cute::make_shape(n, scale_k, 1));
 
-    Layout layout_B_reordered = tile_to_shape(
-        LayoutAtomQuant{},
-        cute::make_shape(n, k, 1),
-        cute::conditional_t<::cutlass::gemm::detail::is_k_major<LayoutB>(),
-            Step<_2,_1,_3>, Step<_1,_2,_3>>{}
-    );
+    auto shape_B = cute::make_shape(n, k, 1);
+    LayoutB_Reordered layout_B_reordered = cute::tile_to_shape(LayoutAtomQuant{}, shape_B);
 
     typename Gemm::Arguments arguments {
         cutlass::gemm::GemmUniversalMode::kGemm,
