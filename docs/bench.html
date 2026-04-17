@@ -189,15 +189,15 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #151515;color:#66
 <table>
 <thead><tr><th>Config</th><th class="r">Perplexity (WikiText-2)</th><th class="r">MMLU accuracy</th><th class="r">Source</th></tr></thead>
 <tbody>
-<tr><td>Qwen2.5-7B BF16 (no quant)</td><td class="r" id="ppl-bf16">pending</td><td class="r">73.56%</td><td class="r"><span class="badge measured">Measured</span></td></tr>
-<tr><td>vLLM FP8 weights + FP16 KV</td><td class="r" id="ppl-fp8">pending</td><td class="r">pending</td><td class="r"><span class="badge measured">Measuring</span></td></tr>
-<tr><td>vLLM FP8 weights + FP8 E4M3 KV (scale=1.0)</td><td class="r">n/a (broken)</td><td class="r">23.0%</td><td class="r"><span class="badge measured">Measured</span></td></tr>
+<tr><td>Qwen2.5-7B BF16 (no quant)</td><td class="r"><strong>10.09</strong></td><td class="r">73.56%</td><td class="r"><span class="badge measured">Measured</span></td></tr>
+<tr><td>vLLM FP8 weights (online dynamic quant)</td><td class="r neg">140,107</td><td class="r neg">broken</td><td class="r"><span class="badge measured">Measured</span></td></tr>
+<tr><td>vLLM FP8 weights + FP8 E4M3 KV (scale=1.0)</td><td class="r neg">n/a</td><td class="r neg">23.0%</td><td class="r"><span class="badge measured">Measured</span></td></tr>
 <tr><td>rvLLM FP8 weights + FP8 E4M3 KV (scale=418/448)</td><td class="r">pending</td><td class="r">pending</td><td class="r"><span class="badge future">Requires logits readback</span></td></tr>
 </tbody>
 </table>
 
 <div class="footnote">
-  <strong>vLLM FP8 E4M3 KV with scale=1.0 is confirmed broken</strong> on Qwen2.5-7B-Instruct — the safetensors lack embedded k_scale/v_scale, so vLLM defaults to 1.0, producing random output (MMLU 23%, below the 25% guessing baseline). This is a known vLLM limitation, not a model issue. rvLLM's FP8 KV path uses calibrated per-tensor scales (K absmax=418, V absmax=73.5) computed from a real BF16 forward pass. Direct rvLLM perplexity measurement requires DtoH of the full 152k-vocab logits tensor — implemented in <code>rvllm_ppl.rs</code>, shipping in the next release.
+  <strong>Both vLLM FP8 paths are broken on vanilla Qwen2.5-7B-Instruct.</strong> (1) <code>--quantization fp8</code> uses online dynamic FP8 weight quantization without pre-calibrated per-tensor scales, destroying quality (perplexity 140,107 vs 10.09 baseline). (2) <code>--kv-cache-dtype fp8_e4m3</code> defaults to scale=1.0 because the safetensors lack k_scale/v_scale, producing random output (MMLU 23%). <strong>Both are known vLLM limitations when the checkpoint isn't pre-quantized</strong> — use a calibrated FP8 checkpoint (AutoFP8 / llm-compressor) for production vLLM FP8. Our throughput comparison uses the uncalibrated config for kernel-speed parity; the tok/s numbers measure compute throughput, not output quality. rvLLM's FP8 path uses calibrated per-tensor scales (weights: per-tensor at load via clamp-ppm; KV: K absmax=418, V absmax=73.5 from a real BF16 calibration pass). Direct rvLLM perplexity requires DtoH of the full 152k-vocab logits tensor — implemented in <code>rvllm_ppl.rs</code>, shipping next release.
 </div>
 
 <h2 class="section">Deployment footprint</h2>
