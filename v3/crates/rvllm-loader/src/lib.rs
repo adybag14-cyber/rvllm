@@ -1,4 +1,16 @@
-// rvllm-loader — scaffold only. See v3/specs/06-loader.md.
-//   pub mod safetensors;  // HF mmap -> CPU staging
-//   pub mod fp8_quant;    // GPU-side abs_max + write FP8 + scale, count clamps
-//   pub mod placement;    // deterministic HBM placement: same (model, rt, gpu) = same addrs
+//! rvllm-loader: HF safetensors → GPU, with FP8 quant at load.
+//!
+//! The invariants:
+//! - Weights are stored in typed fields, not parallel Vecs indexed by
+//!   integer (v2's frequent desync source).
+//! - FP8 per-tensor quant runs the clamp-% gate; a tensor exceeding
+//!   10 ppm clamp rate returns `LoaderError::Fp8MisScaled` — the model
+//!   is mis-scaled, not a viable FP8 candidate, and the engine refuses
+//!   to proceed.
+//! - Full weight set resident before first forward; no lazy loading.
+
+pub mod fp8_quant;
+pub mod weights;
+
+pub use fp8_quant::{check_clamp_gate, quantize_per_tensor_ref, QuantResult, FP8_E4M3_MAX};
+pub use weights::{F16Weight, Fp8Weight, LayerWeights, LoadedModel};

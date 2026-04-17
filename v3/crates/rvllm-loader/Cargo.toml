@@ -6,8 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# rvllm-loader: HF safetensors -> GPU layout. GPU-side FP8 quant.
-# Hard-fail on >0.001% clamp. See v3/specs/06-loader.md.
+# rvllm-loader: HF safetensors -> GPU layout, GPU-side FP8 quant with
+# hard-fail clamp% gate. See v3/specs/06-loader.md.
+
+[features]
+default = []
+cuda = ["rvllm-mem/cuda"]
 
 [dependencies]
 rvllm-core = { workspace = true }
