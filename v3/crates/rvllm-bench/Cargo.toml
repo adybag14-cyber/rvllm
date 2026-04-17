@@ -13,6 +13,10 @@ authors.workspace = true
 name = "rvllm-bench"
 path = "src/main.rs"
 
+[features]
+default = []
+cuda = ["rvllm-runtime/cuda"]
+
 [dependencies]
 rvllm-core = { workspace = true }
 rvllm-runtime = { workspace = true }

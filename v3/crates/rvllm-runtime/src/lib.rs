@@ -9,11 +9,13 @@
 //! One codepath. No sync vs pipelined duality. Graph replay is a
 //! transparent implementation detail.
 
+pub mod bring_up;
 pub mod engine;
 pub mod layer_exec;
 pub mod sched_state;
 pub mod scheduler;
 
+pub use bring_up::{Bringup, EnginePaths, FusedModules};
 pub use engine::{Engine, PendingStep, StepOutput};
 pub use layer_exec::{forward, LayerDims};
 pub use sched_state::{ReqState, Request};

@@ -358,6 +358,7 @@ dependencies = [
  "rvllm-mem",
  "rvllm-metadata",
  "rvllm-sampling",
+ "serde_json",
  "tracing",
 ]
 

@@ -34,3 +34,4 @@ rvllm-graph = { workspace = true }
 rvllm-loader = { workspace = true }
 rvllm-sampling = { workspace = true }
 tracing = { workspace = true }
+serde_json = { workspace = true }
