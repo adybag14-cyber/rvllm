@@ -69,13 +69,13 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #151515;color:#66
 <div class="pill-row">
   <div class="pill">
     <div class="label">peak tok/s (N=512)</div>
-    <strong>41,560</strong>
-    <div class="caption">rvLLM 0.3.0 &mdash; +32% vs vLLM 0.19</div>
+    <strong>43,780</strong>
+    <div class="caption">rvLLM 0.3.1 &mdash; +39% vs vLLM 0.19</div>
   </div>
   <div class="pill">
     <div class="label">hot TTFT @ N=128</div>
-    <strong>83&nbsp;ms</strong>
-    <div class="caption">vLLM: 348&nbsp;ms at same batch (4.2&times;)</div>
+    <strong>55&nbsp;ms</strong>
+    <div class="caption">vLLM: 348&nbsp;ms at same batch (6.3&times;)</div>
   </div>
   <div class="pill">
     <div class="label">deployment footprint</div>
@@ -104,13 +104,13 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #151515;color:#66
 <table>
 <thead><tr><th>N</th><th class="r">rvLLM 0.3.0</th><th class="r">vLLM 0.19 (hot)</th><th class="r">&Delta;</th></tr></thead>
 <tbody>
-<tr class="vllm-win"><td>1</td><td class="r">137</td><td class="r">223</td><td class="r neg">vLLM +62.6%</td></tr>
-<tr class="vllm-win"><td>8</td><td class="r">1,095</td><td class="r">1,712</td><td class="r neg">vLLM +56.4%</td></tr>
-<tr class="vllm-win"><td>16</td><td class="r">2,318</td><td class="r">3,342</td><td class="r neg">vLLM +44.2%</td></tr>
-<tr class="rvllm-win"><td>64</td><td class="r"><strong>12,477</strong></td><td class="r">11,151</td><td class="r pos"><strong>rvLLM +11.9%</strong></td></tr>
-<tr class="rvllm-win"><td>128</td><td class="r"><strong>21,946</strong></td><td class="r">17,778</td><td class="r pos"><strong>rvLLM +23.4%</strong></td></tr>
-<tr class="rvllm-win"><td>256</td><td class="r"><strong>33,968</strong></td><td class="r">24,270</td><td class="r pos"><strong>rvLLM +40.0%</strong></td></tr>
-<tr class="rvllm-win"><td>512</td><td class="r"><strong>41,560</strong></td><td class="r">31,485</td><td class="r pos"><strong>rvLLM +32.0%</strong></td></tr>
+<tr class="vllm-win"><td>1</td><td class="r">137</td><td class="r">223</td><td class="r neg">vLLM +62.8%</td></tr>
+<tr class="vllm-win"><td>8</td><td class="r">1,096</td><td class="r">1,712</td><td class="r neg">vLLM +56.2%</td></tr>
+<tr class="vllm-win"><td>16</td><td class="r">2,313</td><td class="r">3,342</td><td class="r neg">vLLM +44.5%</td></tr>
+<tr class="rvllm-win"><td>64</td><td class="r"><strong>12,528</strong></td><td class="r">11,151</td><td class="r pos"><strong>rvLLM +12.3%</strong></td></tr>
+<tr class="rvllm-win"><td>128</td><td class="r"><strong>22,339</strong></td><td class="r">17,778</td><td class="r pos"><strong>rvLLM +25.6%</strong></td></tr>
+<tr class="rvllm-win"><td>256</td><td class="r"><strong>32,129</strong></td><td class="r">24,270</td><td class="r pos"><strong>rvLLM +32.4%</strong></td></tr>
+<tr class="rvllm-win"><td>512</td><td class="r"><strong>43,780</strong></td><td class="r">31,485</td><td class="r pos"><strong>rvLLM +39.0%</strong></td></tr>
 </tbody>
 </table>
 
@@ -125,13 +125,13 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #151515;color:#66
 <table>
 <thead><tr><th>N</th><th class="r">rvLLM cold</th><th class="r">rvLLM hot</th><th class="r">vLLM cold</th><th class="r">vLLM hot</th></tr></thead>
 <tbody>
-<tr><td>1</td><td class="r">48.1</td><td class="r">49.0</td><td class="r">444.5</td><td class="r"><strong>25.2</strong></td></tr>
-<tr><td>8</td><td class="r">414.0</td><td class="r">314.5</td><td class="r neg">6,075.9</td><td class="r"><strong>47.3</strong></td></tr>
-<tr class="rvllm-win"><td>16</td><td class="r"><strong>53.6</strong></td><td class="r"><strong>46.3</strong></td><td class="r">82.2</td><td class="r">75.2</td></tr>
-<tr class="rvllm-win"><td>64</td><td class="r"><strong>50.8</strong></td><td class="r"><strong>51.4</strong></td><td class="r">213.3</td><td class="r">200.8</td></tr>
-<tr class="rvllm-win"><td>128</td><td class="r"><strong>80.5</strong></td><td class="r"><strong>83.2</strong></td><td class="r">386.3</td><td class="r">347.6</td></tr>
-<tr class="rvllm-win"><td>256</td><td class="r"><strong>112.7</strong></td><td class="r"><strong>77.7</strong></td><td class="r">581.2</td><td class="r">622.2</td></tr>
-<tr class="rvllm-win"><td>512</td><td class="r"><strong>131.5</strong></td><td class="r"><strong>132.1</strong></td><td class="r">985.9</td><td class="r">879.6</td></tr>
+<tr><td>1</td><td class="r">55.9</td><td class="r">48.8</td><td class="r">444.5</td><td class="r"><strong>25.2</strong></td></tr>
+<tr class="rvllm-win"><td>8</td><td class="r"><strong>66.8</strong></td><td class="r"><strong>43.8</strong></td><td class="r neg">6,075.9</td><td class="r">47.3</td></tr>
+<tr class="rvllm-win"><td>16</td><td class="r"><strong>75.5</strong></td><td class="r"><strong>45.0</strong></td><td class="r">82.2</td><td class="r">75.2</td></tr>
+<tr class="rvllm-win"><td>64</td><td class="r"><strong>144.8</strong></td><td class="r"><strong>58.8</strong></td><td class="r">213.3</td><td class="r">200.8</td></tr>
+<tr class="rvllm-win"><td>128</td><td class="r"><strong>173.3</strong></td><td class="r"><strong>55.3</strong></td><td class="r">386.3</td><td class="r">347.6</td></tr>
+<tr class="rvllm-win"><td>256</td><td class="r"><strong>297.1</strong></td><td class="r"><strong>72.8</strong></td><td class="r">581.2</td><td class="r">622.2</td></tr>
+<tr class="rvllm-win"><td>512</td><td class="r"><strong>512.7</strong></td><td class="r"><strong>117.9</strong></td><td class="r">985.9</td><td class="r">879.6</td></tr>
 </tbody>
 </table>
 <div class="footnote"><strong>N=8 is an outlier on rvLLM</strong> (cold 414 ms, hot 314 ms). A specific cuBLASLt algo is picked for the (M=8 × 37,888) prefill-phase <code>gate_up</code> GEMM that runs ~5&times; slower than its HBM-BW lower bound. The second prefill pays again because the cached algo is already the slow one. The top-16 heuristic autotune (commit <code>82b1f59</code>, v0.3.1) replaces the single-shot pick with on-device timing and should collapse this cell to the ~50 ms band that N=1/16/64 sit in.</div>
@@ -321,24 +321,25 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
   const e = React.createElement;
   const R = Recharts;
 
+  // Post FP8-scale-fix numbers (v0.3.1, scale = 418/448 calibrated from Qwen2.5-7B)
   const tsData = [
     { n: '1',   rvllm:    137, vllm:    223 },
-    { n: '8',   rvllm:  1095, vllm:   1712 },
-    { n: '16',  rvllm:  2318, vllm:   3342 },
-    { n: '64',  rvllm: 12477, vllm:  11151 },
-    { n: '128', rvllm: 21946, vllm:  17778 },
-    { n: '256', rvllm: 33968, vllm:  24270 },
-    { n: '512', rvllm: 41560, vllm:  31485 }
+    { n: '8',   rvllm:  1096, vllm:   1712 },
+    { n: '16',  rvllm:  2313, vllm:   3342 },
+    { n: '64',  rvllm: 12528, vllm:  11151 },
+    { n: '128', rvllm: 22339, vllm:  17778 },
+    { n: '256', rvllm: 32129, vllm:  24270 },
+    { n: '512', rvllm: 43780, vllm:  31485 }
   ];
 
   const ttftData = [
-    { n: '1',   rvllm:  49.04, vllm:  25.15 },
-    { n: '8',   rvllm: 314.46, vllm:  47.25 },
-    { n: '16',  rvllm:  46.30, vllm:  75.18 },
-    { n: '64',  rvllm:  51.35, vllm: 200.78 },
-    { n: '128', rvllm:  83.20, vllm: 347.59 },
-    { n: '256', rvllm:  77.74, vllm: 622.22 },
-    { n: '512', rvllm: 132.12, vllm: 879.60 }
+    { n: '1',   rvllm:  48.79, vllm:  25.15 },
+    { n: '8',   rvllm:  43.84, vllm:  47.25 },
+    { n: '16',  rvllm:  45.01, vllm:  75.18 },
+    { n: '64',  rvllm:  58.81, vllm: 200.78 },
+    { n: '128', rvllm:  55.27, vllm: 347.59 },
+    { n: '256', rvllm:  72.80, vllm: 622.22 },
+    { n: '512', rvllm: 117.92, vllm: 879.60 }
   ];
 
   const nsysData = [
