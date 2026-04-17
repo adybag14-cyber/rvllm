@@ -527,8 +527,16 @@ impl Bringup {
             .unwrap_or(16);
         #[allow(non_snake_case)]
         let FAUX_PREFILL_STEPS = faux_prefill_steps;
+        let measure_ttft: bool =
+            std::env::var("RVLLM_TTFT").ok().as_deref() == Some("1");
+
+        // Pinned host buffer so we can DtoH the sampled tokens without
+        // implicit host-side blocking (needed for a tight TTFT reading).
+        let mut ttft_host_buf: rvllm_mem::PinnedBuf<i32> =
+            rvllm_mem::PinnedBuf::new(num_seqs as usize)?;
         let n = num_seqs as usize;
-        for step in 0..FAUX_PREFILL_STEPS {
+
+        let set_step_meta = |step: i32| -> Result<()> {
             let pos_host: Vec<i32> = (0..n as i32).map(|i| step + i * 32).collect();
             let slot_host: Vec<i32> = (0..n as i32)
                 .map(|i| step + i * max_blocks_per_seq as i32 * block_size as i32)
@@ -537,14 +545,35 @@ impl Bringup {
             positions.copy_from_host(bytemuck_cast_i32(&pos_host))?;
             slot_mapping.copy_from_host(bytemuck_cast_i32(&slot_host))?;
             context_lens.copy_from_host(bytemuck_cast_i32(&ctx_host))?;
-            one_step()?;
-        }
-        self.stream.fence()?;
+            Ok(())
+        };
+
+        // Faux-prefill loop: when not measuring TTFT just run it normally;
+        // when measuring TTFT, wrap the whole "prompt ingest -> first token
+        // on host" sequence in a timer.
+        let sampled_d_ptr = sampled_tokens.device_ptr();
+        let ttft_ns: Option<u128> = if measure_ttft {
+            self.stream.fence()?;
+            let t_ttft_start = std::time::Instant::now();
+            for step in 0..FAUX_PREFILL_STEPS {
+                set_step_meta(step)?;
+                one_step()?;
+            }
+            // Fence to ensure prefill's sampled_tokens are written before DtoH.
+            self.stream.fence()?;
+            dtoh_async_sync(sampled_d_ptr, ttft_host_buf.as_mut_ptr(), n * 4, stream)?;
+            self.stream.fence()?;
+            Some(t_ttft_start.elapsed().as_nanos())
+        } else {
+            for step in 0..FAUX_PREFILL_STEPS {
+                set_step_meta(step)?;
+                one_step()?;
+            }
+            self.stream.fence()?;
+            None
+        };
 
         // Capture one step into a CUDA graph then replay for the bench.
-        // Metadata is RE-UPLOADED per iter (not frozen) to match vLLM
-        // which reschedules each step; positions / slot_mapping / context_lens
-        // advance just like a real decode loop would.
         let mut one_step = one_step;
         let graph = rvllm_graph::CapturedGraph::capture(
             num_seqs,
@@ -557,15 +586,7 @@ impl Bringup {
 
         let t0 = std::time::Instant::now();
         for iter in 0..iters as i32 {
-            let pos = FAUX_PREFILL_STEPS + iter;
-            let pos_host: Vec<i32> = (0..n as i32).map(|i| pos + i * 32).collect();
-            let slot_host: Vec<i32> = (0..n as i32)
-                .map(|i| pos + i * max_blocks_per_seq as i32 * block_size as i32)
-                .collect();
-            let ctx_host: Vec<i32> = vec![pos + 1; n];
-            positions.copy_from_host(bytemuck_cast_i32(&pos_host))?;
-            slot_mapping.copy_from_host(bytemuck_cast_i32(&slot_host))?;
-            context_lens.copy_from_host(bytemuck_cast_i32(&ctx_host))?;
+            set_step_meta(FAUX_PREFILL_STEPS + iter)?;
             graph.replay(stream)?;
         }
         self.stream.fence()?;
@@ -575,6 +596,7 @@ impl Bringup {
             total_ns: elapsed.as_nanos(),
             iters,
             num_seqs,
+            ttft_ns,
         })
     }
 
@@ -585,6 +607,7 @@ impl Bringup {
             total_ns: 0,
             iters,
             num_seqs,
+            ttft_ns: None,
         })
     }
 
@@ -602,6 +625,7 @@ impl Bringup {
             total_ns: 0,
             iters,
             num_seqs,
+            ttft_ns: None,
         })
     }
 }
@@ -612,6 +636,9 @@ pub struct BenchResult {
     pub total_ns: u128,
     pub iters: u32,
     pub num_seqs: u32,
+    /// Time from "prefill starts" to "first sampled token on host" in ns.
+    /// None if TTFT measurement was not requested.
+    pub ttft_ns: Option<u128>,
 }
 
 #[cfg(feature = "cuda")]
@@ -619,6 +646,24 @@ fn bytemuck_cast_i32(v: &[i32]) -> &[u8] {
     // SAFETY: i32 has a defined bit layout; we only read these bytes,
     // and the output slice is the same length/alignment.
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
+}
+
+/// Async DtoH of `bytes` from device `src` to host `dst` on `stream`.
+/// Caller must fence the stream afterwards to ensure the copy completes.
+#[cfg(feature = "cuda")]
+fn dtoh_async_sync(src: u64, dst: *mut i32, bytes: usize, stream: u64) -> Result<()> {
+    use cudarc::driver::sys::*;
+    let r = unsafe {
+        cuMemcpyDtoHAsync_v2(dst as *mut _, src, bytes, stream as CUstream)
+    };
+    if r != CUresult::CUDA_SUCCESS {
+        return Err(rvllm_core::RvllmError::cuda(
+            "cuMemcpyDtoHAsync",
+            rvllm_core::CudaErrorKind::Other,
+            rvllm_core::CudaCtx::setup(),
+        ));
+    }
+    Ok(())
 }
 
 fn load_fused(loader: &KernelLoader) -> Result<FusedModules> {

@@ -94,13 +94,21 @@ fn print_result(r: rvllm_runtime::bring_up::BenchResult) {
         0.0
     };
     let ms_per_step = r.ns_per_step as f64 / 1.0e6;
+    let ttft_str = r
+        .ttft_ns
+        .map(|n| format!(" ttft={:.2}ms", n as f64 / 1.0e6))
+        .unwrap_or_default();
     eprintln!(
-        "bench: batch={} iters={} -> {:.0} tok/s ({:.3} ms/step)",
-        r.num_seqs, r.iters, tok_per_sec, ms_per_step
+        "bench: batch={} iters={} -> {:.0} tok/s ({:.3} ms/step){}",
+        r.num_seqs, r.iters, tok_per_sec, ms_per_step, ttft_str
     );
+    let ttft_json = r
+        .ttft_ns
+        .map(|n| format!(",\"ttft_ms\":{:.3}", n as f64 / 1.0e6))
+        .unwrap_or_default();
     println!(
-        "{{\"batch\":{},\"iters\":{},\"tok_per_sec\":{:.1},\"ms_per_step\":{:.4}}}",
-        r.num_seqs, r.iters, tok_per_sec, ms_per_step
+        "{{\"batch\":{},\"iters\":{},\"tok_per_sec\":{:.1},\"ms_per_step\":{:.4}{}}}",
+        r.num_seqs, r.iters, tok_per_sec, ms_per_step, ttft_json
     );
 }
 

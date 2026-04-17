@@ -73,9 +73,11 @@ extern "C" int fa3_sm90_workspace_size(
 }
 
 // Internal dispatcher: both fp16 KV and fp8 (e4m3) KV paths share param setup.
-// Caller sets is_fp8=false for the original path and is_fp8=true for FP8 KV.
-// When is_fp8=true, q_descale_ptr / k_descale_ptr / v_descale_ptr point at
-// per-tensor f32 scale scalars on the device (strides zeroed for broadcast).
+// Decode path: cu_seqlens_q == nullptr, max_seqlen_q == 1, total_q == batch_size.
+// Prefill path: cu_seqlens_q is the per-seq Q offset prefix sum of length
+// batch+1; max_seqlen_q is the longest seq's Q length; total_q is the
+// sum; is_causal_prefill == true applies a causal mask so query t only
+// sees K positions 0..=t within its own seq.
 static int fa3_sm90_paged_decode_impl(
     void* q_ptr,
     void* k_cache_ptr,
@@ -83,6 +85,9 @@ static int fa3_sm90_paged_decode_impl(
     void* o_ptr,
     int*  block_tables_ptr,
     int*  context_lens_ptr,
+    int*  cu_seqlens_q_ptr,   // nullptr for decode
+    int   max_seqlen_q,       // 1 for decode
+    int   total_q,            // batch_size for decode, sum of Q lens for prefill
     void* workspace_ptr,
     float scale,
     int   batch_size,
@@ -93,6 +98,7 @@ static int fa3_sm90_paged_decode_impl(
     int   max_blocks_per_seq,
     int   num_blocks_total,
     bool  is_fp8,
+    bool  is_causal_prefill,
     float* q_descale_ptr,
     float* k_descale_ptr,
     float* v_descale_ptr,
@@ -144,10 +150,11 @@ static int fa3_sm90_paged_decode_impl(
     params.v_descale_batch_stride = 0;
     params.v_descale_head_stride  = 0;
 
-    // Q: [batch, num_heads, head_dim] treated as [batch, 1, num_heads, head_dim]
+    // Q: decode is [batch, num_heads, head_dim] (1 row per seq).
+    // Prefill is [total_q, num_heads, head_dim] indexed via cu_seqlens_q.
     params.q_ptr = q_ptr;
     params.q_batch_stride = num_heads * head_dim;
-    params.q_row_stride = num_heads * head_dim;  // only 1 row per batch
+    params.q_row_stride = num_heads * head_dim;
     params.q_head_stride = head_dim;
 
     // K: [num_blocks_total, block_size, num_kv_heads, head_dim]
@@ -177,11 +184,11 @@ static int fa3_sm90_paged_decode_impl(
     params.d_rounded = 128;
     params.dv = head_dim;
     params.dv_rounded = 128;
-    params.seqlen_q = 1;
+    params.seqlen_q = max_seqlen_q;
     params.seqlen_k = max_blocks_per_seq * block_size;
-    params.seqlen_q_rounded = 128;  // rounded up to kBlockM
+    params.seqlen_q_rounded = round_multiple(max_seqlen_q, kBlockM);
     params.seqlen_k_rounded = round_multiple(params.seqlen_k, kBlockN);
-    params.total_q = batch_size;  // for varlen: total number of query tokens
+    params.total_q = total_q;  // decode: batch; prefill: sum of per-seq Q lens
 
     // Paged KV
     params.page_table = block_tables_ptr;
@@ -192,7 +199,7 @@ static int fa3_sm90_paged_decode_impl(
 
     // Varlen via seqused_k (actual context lengths per sequence)
     params.seqused_k = context_lens_ptr;
-    params.cu_seqlens_q = nullptr;
+    params.cu_seqlens_q = cu_seqlens_q_ptr;   // nullptr for decode
     params.cu_seqlens_k = nullptr;
     params.cu_seqlens_knew = nullptr;
     params.seqused_q = nullptr;
@@ -227,11 +234,12 @@ static int fa3_sm90_paged_decode_impl(
     params.p_dropout_in_uint8_t = 255;
     params.rp_dropout = 1.0f;
 
-    // Non-causal for decode (seqlen_q=1, full attention to all KV)
-    params.is_causal = false;
+    // Decode: seqlen_q == 1, non-causal (query sees all prior KV).
+    // Prefill: causal self-attention over Q-then-KV, query t sees K 0..=t.
+    params.is_causal = is_causal_prefill;
     params.is_local = false;
     params.window_size_left = params.seqlen_k - 1;
-    params.window_size_right = 0;  // seqlen_q - 1 = 0
+    params.window_size_right = is_causal_prefill ? 0 : 0;  // right=0 in both
     params.attention_chunk = 0;
 
     // Architecture
@@ -246,7 +254,8 @@ static int fa3_sm90_paged_decode_impl(
 
     // Determine num_splits
     int qhead_per_khead = num_heads / num_kv_heads;
-    int num_m_blocks = (1 * qhead_per_khead + kBlockM - 1) / kBlockM;  // seqlen_q=1
+    // Decode: 1 query token per seq. Prefill: max_seqlen_q query tokens.
+    int num_m_blocks = (max_seqlen_q * qhead_per_khead + kBlockM - 1) / kBlockM;
     int num_n_blocks = (params.seqlen_k + kBlockN - 1) / kBlockN;
     int total_mblocks = batch_size * num_kv_heads * num_m_blocks;
     int kv_bytes_per_elem = is_fp8 ? 1 : 2;
@@ -342,10 +351,13 @@ int fa3_sm90_paged_decode(
 ) {
     return fa3_sm90_paged_decode_impl(
         q_ptr, k_cache_ptr, v_cache_ptr, o_ptr,
-        block_tables_ptr, context_lens_ptr, workspace_ptr,
+        block_tables_ptr, context_lens_ptr,
+        /*cu_seqlens_q=*/nullptr, /*max_seqlen_q=*/1, /*total_q=*/batch_size,
+        workspace_ptr,
         scale, batch_size, num_heads, num_kv_heads, head_dim,
         block_size, max_blocks_per_seq, num_blocks_total,
-        /*is_fp8=*/false, /*q_descale=*/nullptr, /*k_descale=*/nullptr, /*v_descale=*/nullptr,
+        /*is_fp8=*/false, /*is_causal_prefill=*/false,
+        /*q_descale=*/nullptr, /*k_descale=*/nullptr, /*v_descale=*/nullptr,
         stream);
 }
 
@@ -375,10 +387,53 @@ int fa3_sm90_paged_decode_fp8(
 ) {
     return fa3_sm90_paged_decode_impl(
         q_fp8_ptr, k_cache_fp8_ptr, v_cache_fp8_ptr, o_f16_ptr,
-        block_tables_ptr, context_lens_ptr, workspace_ptr,
+        block_tables_ptr, context_lens_ptr,
+        /*cu_seqlens_q=*/nullptr, /*max_seqlen_q=*/1, /*total_q=*/batch_size,
+        workspace_ptr,
         scale, batch_size, num_heads, num_kv_heads, head_dim,
         block_size, max_blocks_per_seq, num_blocks_total,
-        /*is_fp8=*/true, q_descale_ptr, k_descale_ptr, v_descale_ptr,
+        /*is_fp8=*/true, /*is_causal_prefill=*/false,
+        q_descale_ptr, k_descale_ptr, v_descale_ptr,
+        stream);
+}
+
+// FP8 E4M3 paged PREFILL: Q / K cache / V cache are FP8. cu_seqlens_q
+// gives per-seq offsets in a varlen [total_q, num_heads, head_dim] Q
+// tensor; max_seqlen_q is the longest per-seq Q length. Causal
+// self-attention (query t only sees K 0..=t within its own seq).
+int fa3_sm90_paged_prefill_fp8(
+    void* q_fp8_ptr,
+    void* k_cache_fp8_ptr,
+    void* v_cache_fp8_ptr,
+    void* o_f16_ptr,
+    int*  block_tables_ptr,
+    int*  context_lens_ptr,
+    int*  cu_seqlens_q_ptr,
+    void* workspace_ptr,
+    float* q_descale_ptr,
+    float* k_descale_ptr,
+    float* v_descale_ptr,
+    float scale,
+    int   total_q,
+    int   max_seqlen_q,
+    int   batch_size,
+    int   num_heads,
+    int   num_kv_heads,
+    int   head_dim,
+    int   block_size,
+    int   max_blocks_per_seq,
+    int   num_blocks_total,
+    cudaStream_t stream
+) {
+    return fa3_sm90_paged_decode_impl(
+        q_fp8_ptr, k_cache_fp8_ptr, v_cache_fp8_ptr, o_f16_ptr,
+        block_tables_ptr, context_lens_ptr,
+        cu_seqlens_q_ptr, max_seqlen_q, total_q,
+        workspace_ptr,
+        scale, batch_size, num_heads, num_kv_heads, head_dim,
+        block_size, max_blocks_per_seq, num_blocks_total,
+        /*is_fp8=*/true, /*is_causal_prefill=*/true,
+        q_descale_ptr, k_descale_ptr, v_descale_ptr,
         stream);
 }
 
