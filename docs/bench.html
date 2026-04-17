@@ -47,6 +47,10 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #151515;color:#66
 .footnote{font-size:0.8rem;color:#888;margin:0.5rem 0 0.8rem;padding:0 0.4rem}
 .footnote strong{color:#bbb}
 @media print{h2{page-break-after:avoid;break-after:avoid-page}.chart-box{page-break-inside:avoid;break-inside:avoid-page}}
+.badge{display:inline-block;padding:0.1rem 0.45rem;border-radius:999px;font-size:0.65rem;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;margin-left:0.4rem;vertical-align:middle}
+.badge.measured{background:rgba(132,230,183,0.15);color:#84E6B7;border:1px solid rgba(132,230,183,0.35)}
+.badge.estimate{background:rgba(232,210,109,0.12);color:#e8d26d;border:1px solid rgba(232,210,109,0.32)}
+.badge.future{background:rgba(154,133,217,0.13);color:#b6a1e5;border:1px solid rgba(154,133,217,0.32)}
 </style>
 </head>
 <body>
@@ -89,7 +93,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #151515;color:#66
   <strong>Honest caveat.</strong> rvLLM wins at N&ge;64 by <strong>+12% to +40%</strong>; vLLM still wins at N&le;16 by <strong>+44% to +63%</strong>. Crossover sits near N=32&ndash;64. The per-step fixed cost of our 339 graph-captured launches dominates at tiny batch. An nsys profile (below) confirms the gap is entirely in the <code>gate_up</code> and <code>down</code> GEMMs using a 128&times;M tile that wastes 93% of its M dimension on padding at M=8. Skinny-M GEMM autotune is the next commit.
 </div>
 
-<h2>Throughput <span class="sub">steady-state decode, tok/s</span></h2>
+<h2>Throughput <span class="sub">steady-state decode, tok/s</span> <span class="badge measured">Measured</span></h2>
 <div class="chart-box">
   <div class="chart-title"><strong>Tok/s by batch size</strong> &mdash; higher is better
     <div class="note">Both engines: Qwen2.5-7B FP8 E4M3 + FP8 E4M3 KV, 16 input + 512 output tokens, CUDA graphs on, real prefill, H100 SXM 80GB.</div>
@@ -110,7 +114,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #151515;color:#66
 </tbody>
 </table>
 
-<h2>Time-to-first-token <span class="sub">prompt &rarr; first sampled token visible on host</span></h2>
+<h2>Time-to-first-token <span class="sub">prompt &rarr; first sampled token visible on host</span> <span class="badge measured">Measured</span></h2>
 <div class="chart-box">
   <div class="chart-title"><strong>TTFT by batch size (hot cache)</strong> &mdash; lower is better
     <div class="note">Hot = second request at that shape (cuBLASLt / FlashInfer heuristics cached). N=8 cold for vLLM hit 6.08 s; rvLLM cold &asymp; hot everywhere because kernels are pre-compiled &amp; pinned at bring-up.</div>
@@ -132,7 +136,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #151515;color:#66
 </table>
 <div class="footnote"><strong>N=8 is an outlier on rvLLM</strong> (cold 414 ms, hot 314 ms). A specific cuBLASLt algo is picked for the (M=8 × 37,888) prefill-phase <code>gate_up</code> GEMM that runs ~5&times; slower than its HBM-BW lower bound. The second prefill pays again because the cached algo is already the slow one. The top-16 heuristic autotune (commit <code>82b1f59</code>, v0.3.1) replaces the single-shot pick with on-device timing and should collapse this cell to the ~50 ms band that N=1/16/64 sit in.</div>
 
-<h2 class="section">Where the time goes at N=8 <span class="sub">nsys profile, top-10 kernels per step</span></h2>
+<h2 class="section">Where the time goes at N=8 <span class="sub">nsys profile, top-10 kernels per step</span> <span class="badge measured">Measured</span></h2>
 <div class="chart-box">
   <div class="chart-title"><strong>Per-step kernel time @ N=8</strong> &mdash; captured 21 steady-state steps
     <div class="note">339 kernel launches per step, all captured into one cuGraphLaunch. Total per step = 7.28 ms (bench ms/step). Launch overhead = 0.1% of step. The gap to vLLM is entirely inside the GEMM body, not the launch loop.</div>
@@ -185,7 +189,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #151515;color:#66
   <div id="chart-vram" style="height:280px"></div>
 </div>
 
-<h2 class="section">What the freed VRAM buys <span class="sub">projected single-card scaling with 72 GB of unused HBM</span></h2>
+<h2 class="section">What the freed VRAM buys <span class="sub">projected single-card scaling with 72 GB of unused HBM</span> <span class="badge estimate">Estimate</span></h2>
 
 <div class="note">
   <strong>Terminology note.</strong> Tensor parallelism (TP) is a <em>multi-GPU</em> technique &mdash; it splits each layer's weight matrix across devices, with NVLink/NCCL collectives between layers. You can't do TP on one card. On a single H100 with 72 GB free, the useful lever is <strong>data parallelism / batch scaling / multi-instance</strong>: use that spare HBM to either push batch much higher, load long-context KV, or run several copies of the same model side-by-side. Below are honest projections for each; numbers are extrapolated from the measured N=64&ndash;512 sweep unless explicitly measured.
@@ -225,8 +229,60 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #151515;color:#66
 </ul>
 <p>vLLM's 74 GB reservation pre-allocates its KV pool at server start; rvLLM's per-batch sizing means you can admit requests with wildly different context lengths without upfront planning.</p>
 
-<h3>Path 4: multi-GPU tensor parallelism (out of scope for single-H100)</h3>
-<p>Not applicable to one card, but noted for completeness. With k&nbsp;H100s and NVLink, TP splits each GEMM across devices. For a 7B model, TP-2 has limited upside (the model fits on one card, TP adds NCCL latency without memory headroom). TP becomes essential for 70B+ models. rvLLM's multi-GPU path is Phase G work (not yet shipped); when it lands, a single 7B model won't benefit from TP but a 70B will fit in TP-2 across 2&times;&nbsp;H100s at similar per-layer speed.</p>
+<h3>Path 4: tensor parallelism on a single card &mdash; why it fails <span class="badge estimate">Estimate</span></h3>
+<p>A reasonable question: if we have 72 GB free, can we "simulate multiple GPUs" on one card and do TP? Three ways this gets attempted; each loses for a concrete reason.</p>
+
+<h4 style="font-size:0.92rem;font-weight:600;color:#fff;margin:1rem 0 0.3rem">1. MIG (Multi-Instance GPU)</h4>
+<p style="margin-bottom:0.6rem">H100 supports partitioning into up to 7 MIG instances with <em>dedicated</em> SMs and HBM per slice. You can run TP across MIG instances &mdash; hardware-real, not simulated. The problem is inter-MIG communication: it does <strong>not</strong> use NVLink. It routes through the PCIe root complex, which is ~10&ndash;50&times; slower than NVLink for small collectives. TP needs an all-reduce after each attention layer and after each MLP &mdash; <strong>28 layers &times; 2 = 56 collectives per decode step</strong>.</p>
+
+<div class="chart-box">
+  <div class="chart-title"><strong>Hypothetical MIG TP-2 step time breakdown at N=128</strong> <span class="badge estimate">Estimate</span>
+    <div class="note">Current rvLLM: 5.83 ms/step (measured). Hypothetical TP-2-on-MIG splits each GEMM in half (compute ~halves to 2.9 ms) but inserts 56 inter-MIG all-reduces. At ~500 &mu;s per small-payload PCIe all-reduce (typical measured on H100 MIG pairs), comm alone is 28 ms. Net step time: <strong>~31 ms (5.3&times; slower than single-card)</strong>.</div>
+  </div>
+  <div id="chart-mig" style="height:220px"></div>
+</div>
+
+<h4 style="font-size:0.92rem;font-weight:600;color:#fff;margin:1rem 0 0.3rem">2. Multi-process (CUDA MPS)</h4>
+<p>Run two processes on one card, each sees the full GPU. Time-multiplexes the SMs. <strong>This isn't TP</strong> &mdash; each process runs the whole model, not a split. It's equivalent to Path 2 (data parallelism / multi-instance). Useful for concurrent capacity, not for one-forward-pass acceleration.</p>
+
+<h4 style="font-size:0.92rem;font-weight:600;color:#fff;margin:1rem 0 0.3rem">3. Software TP inside one process</h4>
+<p>Split each weight tensor in half, run two smaller GEMMs sequentially, concatenate. <strong>Strictly slower</strong> than the combined GEMM: if the original saturated SMs, two halves serialize on the same SMs with launch overhead; if the original was SM-underutilized, the fix is better <em>tile selection</em> (smaller M-tile), which is what our <code>v0.3.1</code> top-16 cuBLASLt autotune does &mdash; not TP.</p>
+
+<h3>Why TP even exists <span class="sub">the real math</span></h3>
+<p>TP pays off on multi-GPU because two benefits compound:</p>
+<ul style="margin:0.5rem 1.2rem;color:#d4d4d4;font-size:0.9rem">
+  <li><strong>Memory split</strong> — weights that don't fit on one card (70B+ FP8 = 70 GB, won't fit in 80 GB after KV + activations) are shared across cards.</li>
+  <li><strong>Independent compute</strong> — each card has its own full SM pool and HBM. Work runs genuinely in parallel, limited only by the collective latency.</li>
+</ul>
+<p>On one card: neither applies. 7B fits. One SM pool. The collective cost is the <em>only</em> term that scales, and it scales up.</p>
+
+<h3>Where TP actually pays off <span class="badge future">Phase G roadmap</span></h3>
+
+<div class="chart-box">
+  <div class="chart-title"><strong>Projected rvLLM throughput by model size &amp; GPU count</strong> <span class="badge future">Not shipped</span>
+    <div class="note">Projection from current Qwen2.5-7B per-card throughput scaled by model size (tok/s &prop; 1 / active weight bytes) and TP all-reduce overhead on NVLink (900 GB/s, ~15 &mu;s per layer). Assumes H100 SXM with NVLink mesh. TP is a Phase G deliverable &mdash; not in v0.3.0.</div>
+  </div>
+  <div id="chart-tp-future" style="height:320px"></div>
+</div>
+
+<table>
+<thead><tr><th>Model</th><th class="r">Weights (FP8)</th><th class="r">Min H100s (TP)</th><th class="r">Projected tok/s @ N=128</th><th class="r">Status</th></tr></thead>
+<tbody>
+<tr><td>Qwen2.5-7B</td><td class="r">7 GB</td><td class="r">1</td><td class="r">21,946</td><td class="r"><span class="badge measured">Measured v0.3.0</span></td></tr>
+<tr><td>Qwen2.5-14B (or Llama 3.1 13B)</td><td class="r">13 GB</td><td class="r">1</td><td class="r">~11,500</td><td class="r"><span class="badge estimate">Estimate</span></td></tr>
+<tr><td>Qwen2.5-32B</td><td class="r">32 GB</td><td class="r">1</td><td class="r">~4,800</td><td class="r"><span class="badge estimate">Estimate</span></td></tr>
+<tr><td>Llama 3.1 70B</td><td class="r">70 GB</td><td class="r">2 (TP-2 NVLink)</td><td class="r">~2,100</td><td class="r"><span class="badge future">Phase G</span></td></tr>
+<tr><td>Qwen2.5-72B</td><td class="r">72 GB</td><td class="r">2 (TP-2 NVLink)</td><td class="r">~2,050</td><td class="r"><span class="badge future">Phase G</span></td></tr>
+<tr><td>DeepSeek-V3 (dense equivalent)</td><td class="r">~180 GB</td><td class="r">4 (TP-4 NVLink)</td><td class="r">~750</td><td class="r"><span class="badge future">Phase G</span></td></tr>
+<tr><td>405B-class dense</td><td class="r">405 GB</td><td class="r">8 (TP-8 NVLink mesh)</td><td class="r">~280</td><td class="r"><span class="badge future">Phase G</span></td></tr>
+</tbody>
+</table>
+
+<div class="footnote"><strong>Legend:</strong>
+  <span class="badge measured">Measured</span> is a real bench run in v0.3.0 at the current commit.
+  <span class="badge estimate">Estimate</span> is extrapolated from measured data (single-card larger-model projection, or TP comm cost modeling). Accuracy within ~20% expected.
+  <span class="badge future">Phase G</span> requires multi-GPU support (NCCL collectives, sharded weight loader, cross-device stream sync) &mdash; not present in v0.3.0. Targeted for a later release after Phase F real-prefill (shipped) and Phase G scheduler + continuous batching.
+</div>
 
 <h2 class="section">Cold start <span class="sub">process launch &rarr; first token ready</span></h2>
 <div class="chart-box">
@@ -311,6 +367,23 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
   const coldStartData = [
     { engine: 'rvLLM', start: 0.1, load_quant: 60, kernel_init: 12, jit: 0, dispatch: 0 },
     { engine: 'vLLM',  start: 2,   load_quant: 70, kernel_init: 0, jit: 40, dispatch: 4 }
+  ];
+
+  // MIG TP on one card — step time breakdown.
+  const migData = [
+    { label: 'Current rvLLM (no TP)',    compute: 5.83, comm: 0.0, tag: '5.8 ms' },
+    { label: 'Hypothetical MIG TP-2',    compute: 2.92, comm: 28.0, tag: '~31 ms (5.3× slower)' }
+  ];
+
+  // Future multi-GPU TP projection.
+  const tpFutureData = [
+    { model: '7B',      size: 7,   cards: 1, toks: 21946, meas: true },
+    { model: '14B',     size: 13,  cards: 1, toks: 11500, meas: false },
+    { model: '32B',     size: 32,  cards: 1, toks: 4800,  meas: false },
+    { model: '70B',     size: 70,  cards: 2, toks: 2100,  meas: false },
+    { model: '72B',     size: 72,  cards: 2, toks: 2050,  meas: false },
+    { model: '180B',    size: 180, cards: 4, toks: 750,   meas: false },
+    { model: '405B',    size: 405, cards: 8, toks: 280,   meas: false }
   ];
 
   // Scaling projection for Path 1: measured points plus extrapolated.
@@ -415,6 +488,46 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
     );
   }
 
+  function Mig(){
+    return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
+      e(R.BarChart, { data: migData, layout: 'vertical', margin: { top: 10, right: 90, left: 170, bottom: 8 } },
+        e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
+        e(R.XAxis, { type: 'number', stroke: '#666', label: { value: 'step time (ms, lower is better)', position: 'insideBottom', offset: -4, fill: '#888', fontSize: 11 } }),
+        e(R.YAxis, { type: 'category', dataKey: 'label', stroke: '#c5c5c5', tick: { fontSize: 11, fill: '#c5c5c5' }, width: 160 }),
+        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' }, formatter: v => v.toFixed(2) + ' ms' }),
+        e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
+        e(R.Bar, { dataKey: 'compute', name: 'GEMM / compute', stackId: 'a', fill: '#84E6B7' }),
+        e(R.Bar, { dataKey: 'comm',    name: 'Inter-MIG all-reduce (PCIe)', stackId: 'a', fill: '#ff9977' },
+          e(R.LabelList, { dataKey: 'tag', position: 'right', fill: '#eee', fontSize: 11, fontWeight: 600 })
+        )
+      )
+    );
+  }
+
+  function TpFuture(){
+    return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
+      e(R.BarChart, { data: tpFutureData, margin: { top: 24, right: 24, left: 30, bottom: 24 } },
+        e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
+        e(R.XAxis, { dataKey: 'model', stroke: '#ccc', label: { value: 'Model (dense parameter count, FP8)', position: 'insideBottom', offset: -8, fill: '#888', fontSize: 11 } }),
+        e(R.YAxis, { stroke: '#666', tickFormatter: v => v.toLocaleString(), label: { value: 'projected tok/s @ N=128', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
+        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' },
+          formatter: (v, name, props) => {
+            const d = props && props.payload;
+            const tag = d && (d.meas ? 'Measured' : 'Projected');
+            return [v.toLocaleString() + ' tok/s', `${tag} — ${d.cards} × H100`];
+          } }),
+        e(R.Bar, { dataKey: 'toks', name: 'Projected tok/s',
+          // color each bar based on measured vs projected
+          shape: (p) => {
+            const fill = p.payload.meas ? '#84E6B7' : '#b6a1e5';
+            return e('rect', { x: p.x, y: p.y, width: p.width, height: p.height, fill: fill, rx: 2 });
+          } },
+          e(R.LabelList, { dataKey: 'cards', position: 'top', fill: '#eee', fontSize: 10, formatter: v => v + '× H100' })
+        )
+      )
+    );
+  }
+
   function Scaling(){
     return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
       e(R.LineChart, { data: scalingData, margin: { top: 24, right: 30, left: 30, bottom: 18 } },
@@ -452,6 +565,8 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
   ReactDOM.createRoot(document.getElementById('chart-footprint')).render(e(Footprint));
   ReactDOM.createRoot(document.getElementById('chart-vram')).render(e(Vram));
   ReactDOM.createRoot(document.getElementById('chart-scaling')).render(e(Scaling));
+  ReactDOM.createRoot(document.getElementById('chart-mig')).render(e(Mig));
+  ReactDOM.createRoot(document.getElementById('chart-tp-future')).render(e(TpFuture));
   ReactDOM.createRoot(document.getElementById('chart-coldstart')).render(e(ColdStart));
 })();
 </script>
