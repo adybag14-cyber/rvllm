@@ -269,7 +269,8 @@ impl FusedSiluMulFp8QuantLaunch {
         Ok(())
     }
 
-    /// Kernel sig: `(out_fp8, scale, gate_up_f16, num_tokens, intermediate)`.
+    /// Kernel sig (v2 layout): `(out_fp8, scale, gate_up_f16, intermediate)`.
+    /// Grid.x is num_tokens; kernel reads blockIdx.x as row.
     ///
     /// # Safety
     /// Caller owns pointers for the call's duration.
@@ -285,13 +286,11 @@ impl FusedSiluMulFp8QuantLaunch {
         let mut out_fp8 = out_fp8;
         let mut scale = scale;
         let mut gate_up = gate_up;
-        let mut num_tokens = self.num_tokens as i32;
         let mut intermediate = self.intermediate as i32;
         let args = [
             (&mut out_fp8) as *mut u64 as *mut core::ffi::c_void,
             (&mut scale) as *mut u64 as *mut core::ffi::c_void,
             (&mut gate_up) as *mut u64 as *mut core::ffi::c_void,
-            (&mut num_tokens) as *mut i32 as *mut core::ffi::c_void,
             (&mut intermediate) as *mut i32 as *mut core::ffi::c_void,
         ];
         const SMEM: u32 = 32 * 4;
@@ -353,8 +352,8 @@ impl ArgmaxLaunch {
 
 pub struct FusedRopeKvWriteLaunch {
     pub num_tokens: u32,
-    pub q_dim: u32,
-    pub kv_dim: u32,
+    pub num_heads: u32,
+    pub num_kv_heads: u32,
     pub head_dim: u32,
 }
 
@@ -363,18 +362,19 @@ impl FusedRopeKvWriteLaunch {
         if self.head_dim != 128 {
             return Err(invalid("head_dim", "v3 FA3 path requires head_dim == 128"));
         }
-        if self.q_dim % self.head_dim != 0 || self.kv_dim % self.head_dim != 0 {
+        if self.num_kv_heads == 0 || self.num_heads % self.num_kv_heads != 0 {
             return Err(invalid(
-                "q_dim/kv_dim",
-                "must be a multiple of head_dim",
+                "num_heads/num_kv_heads",
+                "num_heads must be a multiple of num_kv_heads",
             ));
         }
         Ok(())
     }
 
-    /// Kernel sig:
-    /// `(qkv, k_cache, v_cache, positions, cos, sin, slot_mapping,
-    ///   q_dim, kv_dim, num_tokens)`.
+    /// Kernel sig (v2 `fused_rope_cache_f16_kernel`):
+    /// `(q, k, v, key_cache, value_cache, cos, sin, positions,
+    ///   slot_mapping, num_tokens, num_heads, num_kv_heads, head_dim)`.
+    /// q and k are modified in place (RoPE applied); v is read-only.
     ///
     /// # Safety
     /// Caller owns pointers for the call's duration.
@@ -382,40 +382,50 @@ impl FusedRopeKvWriteLaunch {
     pub unsafe fn launch(
         &self,
         kernel: KernelFn,
-        qkv: u64,
+        q: u64,
+        k: u64,
+        v: u64,
         k_cache: u64,
         v_cache: u64,
-        positions: u64,
         cos: u64,
         sin: u64,
+        positions: u64,
         slot_mapping: u64,
         stream: u64,
     ) -> Result<()> {
         self.validate()?;
-        let mut qkv = qkv;
+        let mut q = q;
+        let mut k = k;
+        let mut v = v;
         let mut k_cache = k_cache;
         let mut v_cache = v_cache;
-        let mut positions = positions;
         let mut cos = cos;
         let mut sin = sin;
+        let mut positions = positions;
         let mut slot_mapping = slot_mapping;
-        let mut q_dim = self.q_dim as i32;
-        let mut kv_dim = self.kv_dim as i32;
         let mut num_tokens = self.num_tokens as i32;
+        let mut num_heads = self.num_heads as i32;
+        let mut num_kv_heads = self.num_kv_heads as i32;
+        let mut head_dim = self.head_dim as i32;
         let args = [
-            (&mut qkv) as *mut u64 as *mut core::ffi::c_void,
+            (&mut q) as *mut u64 as *mut core::ffi::c_void,
+            (&mut k) as *mut u64 as *mut core::ffi::c_void,
+            (&mut v) as *mut u64 as *mut core::ffi::c_void,
             (&mut k_cache) as *mut u64 as *mut core::ffi::c_void,
             (&mut v_cache) as *mut u64 as *mut core::ffi::c_void,
-            (&mut positions) as *mut u64 as *mut core::ffi::c_void,
             (&mut cos) as *mut u64 as *mut core::ffi::c_void,
             (&mut sin) as *mut u64 as *mut core::ffi::c_void,
+            (&mut positions) as *mut u64 as *mut core::ffi::c_void,
             (&mut slot_mapping) as *mut u64 as *mut core::ffi::c_void,
-            (&mut q_dim) as *mut i32 as *mut core::ffi::c_void,
-            (&mut kv_dim) as *mut i32 as *mut core::ffi::c_void,
             (&mut num_tokens) as *mut i32 as *mut core::ffi::c_void,
+            (&mut num_heads) as *mut i32 as *mut core::ffi::c_void,
+            (&mut num_kv_heads) as *mut i32 as *mut core::ffi::c_void,
+            (&mut head_dim) as *mut i32 as *mut core::ffi::c_void,
         ];
-        let block = (512, 1, 1);
-        let grid = (self.num_tokens, 1, 1);
+        // Grid: (num_tokens, num_heads_max) — kernel uses (blockIdx.x, blockIdx.y).
+        let max_heads = self.num_heads.max(self.num_kv_heads);
+        let grid = (self.num_tokens, max_heads, 1);
+        let block = ((self.head_dim / 2).max(32), 1, 1);
         launch_raw(kernel, grid, block, 0, stream, &args)
     }
 }
@@ -488,8 +498,8 @@ mod tests {
     fn rope_requires_head_dim_128() {
         let l = FusedRopeKvWriteLaunch {
             num_tokens: 1,
-            q_dim: 64,
-            kv_dim: 64,
+            num_heads: 28,
+            num_kv_heads: 4,
             head_dim: 64,
         };
         assert!(l.validate().is_err());

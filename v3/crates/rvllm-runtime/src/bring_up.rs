@@ -40,18 +40,20 @@ pub struct Bringup {
     pub fused_modules: FusedModules,
 }
 
-/// Loaded CUDA modules + resolved kernel handles for the nine fused
-/// kernels a layer uses.
+/// Loaded CUDA modules + resolved kernel handles. One PTX file per
+/// logical group; `fused_rmsnorm_fp8_quant.ptx` holds three kernels
+/// (rmsnorm-only, add-rmsnorm, per-token quantize) so one module is
+/// reused for three handles.
 pub struct FusedModules {
-    pub add_rmsnorm: LoadedModule,
-    pub rope_kv_write: LoadedModule,
-    pub silu_mul: LoadedModule,
-    pub quantize: LoadedModule,
-    pub argmax: LoadedModule,
+    pub rmsnorm_mod: LoadedModule,
+    pub rope_mod: LoadedModule,
+    pub silu_mod: LoadedModule,
+    pub argmax_mod: LoadedModule,
+    pub fn_rmsnorm: KernelFn,
     pub fn_add_rmsnorm: KernelFn,
-    pub fn_rope_kv_write: KernelFn,
-    pub fn_silu_mul: KernelFn,
     pub fn_quantize: KernelFn,
+    pub fn_rope_cache: KernelFn,
+    pub fn_silu_mul: KernelFn,
     pub fn_argmax: KernelFn,
 }
 
@@ -160,7 +162,10 @@ impl Bringup {
         let arena = &self.arena;
         let hidden_fp8 = arena.region("hidden_fp8", (num_seqs * hidden) as usize, 16)?;
         let hidden_scale = arena.region("hidden_scale", (num_seqs * 4) as usize, 16)?;
-        let qkv_out = arena.region("qkv_out", (num_seqs * qkv_rows * 2) as usize, 16)?;
+        let q_out = arena.region("q_out", (num_seqs * q_dim * 2) as usize, 16)?;
+        let k_out = arena.region("k_out", (num_seqs * kv_dim * 2) as usize, 16)?;
+        let v_out = arena.region("v_out", (num_seqs * kv_dim * 2) as usize, 16)?;
+        let _ = qkv_rows; // shape only needed for the old packed-QKV path
         let attn_out = arena.region("attn_out", (num_seqs * q_dim * 2) as usize, 16)?;
         let attn_out_fp8 = arena.region("attn_out_fp8", (num_seqs * q_dim) as usize, 16)?;
         let attn_out_scale = arena.region("attn_out_scale", (num_seqs * 4) as usize, 16)?;
@@ -198,11 +203,26 @@ impl Bringup {
             16,
         )?;
 
-        // Plans (from policy) for this specific bucket.
-        let plan_qkv = Fp8GemmPlan::from_policy(
+        // Plans (from policy) for this specific bucket. Q, K, V each get
+        // their own plan since they have different N dimensions.
+        let plan_q = Fp8GemmPlan::from_policy(
             &self.policy,
             num_seqs,
-            qkv_rows,
+            q_dim,
+            hidden,
+            rvllm_core::DType::Fp8E4M3,
+        )?;
+        let plan_k = Fp8GemmPlan::from_policy(
+            &self.policy,
+            num_seqs,
+            kv_dim,
+            hidden,
+            rvllm_core::DType::Fp8E4M3,
+        )?;
+        let plan_v = Fp8GemmPlan::from_policy(
+            &self.policy,
+            num_seqs,
+            kv_dim,
             hidden,
             rvllm_core::DType::Fp8E4M3,
         )?;
@@ -243,12 +263,14 @@ impl Bringup {
         };
         let kernels = layer_exec::LayerKernels {
             fused_add_rmsnorm: self.fused_modules.fn_add_rmsnorm,
-            fused_rope_kv_write: self.fused_modules.fn_rope_kv_write,
+            fused_rope_cache: self.fused_modules.fn_rope_cache,
             fused_silu_mul: self.fused_modules.fn_silu_mul,
             quantize_fp8_per_token: self.fused_modules.fn_quantize,
         };
         let plans = layer_exec::LayerGemmPlans {
-            qkv: plan_qkv,
+            q: plan_q,
+            k: plan_k,
+            v: plan_v,
             o: plan_o,
             gate_up: plan_gate_up,
             down: plan_down,
@@ -274,7 +296,9 @@ impl Bringup {
                 let scratch = layer_exec::LayerScratch {
                     hidden_fp8: hidden_fp8.device_ptr(),
                     hidden_scale: hidden_scale.device_ptr(),
-                    qkv_out: qkv_out.device_ptr(),
+                    q_out: q_out.device_ptr(),
+                    k_out: k_out.device_ptr(),
+                    v_out: v_out.device_ptr(),
                     k_cache: kv_cache.device_ptr(),
                     v_cache: kv_cache.device_ptr() + (kv_per_layer / 2) as u64,
                     attn_out: attn_out.device_ptr(),
@@ -353,28 +377,28 @@ pub struct BenchResult {
 }
 
 fn load_fused(loader: &KernelLoader) -> Result<FusedModules> {
-    let add_rmsnorm = loader.load_ptx("fused_add_rmsnorm_fp8_quant")?;
-    let rope_kv_write = loader.load_ptx("fused_rope_kv_write")?;
-    let silu_mul = loader.load_ptx("fused_silu_mul_fp8_quant")?;
-    let quantize = loader.load_ptx("quantize_fp8_per_token")?;
-    let argmax = loader.load_ptx("argmax")?;
+    let rmsnorm_mod = loader.load_ptx("fused_rmsnorm_fp8_quant")?;
+    let rope_mod = loader.load_ptx("fused_rope_cache")?;
+    let silu_mod = loader.load_ptx("fused_silu_fp8_quant")?;
+    let argmax_mod = loader.load_ptx("argmax")?;
 
-    let fn_add_rmsnorm = add_rmsnorm.get_function("fused_add_rmsnorm_fp8_quant_kernel")?;
-    let fn_rope_kv_write = rope_kv_write.get_function("fused_rope_kv_write_kernel")?;
-    let fn_silu_mul = silu_mul.get_function("fused_silu_mul_fp8_quant_kernel")?;
-    let fn_quantize = quantize.get_function("quantize_fp8_per_token_kernel")?;
-    let fn_argmax = argmax.get_function("argmax_kernel")?;
+    let fn_rmsnorm = rmsnorm_mod.get_function("fused_rmsnorm_fp8_quant_kernel")?;
+    let fn_add_rmsnorm = rmsnorm_mod.get_function("fused_add_rmsnorm_fp8_quant_kernel")?;
+    let fn_quantize = rmsnorm_mod.get_function("quantize_fp8_per_token_kernel")?;
+    let fn_rope_cache = rope_mod.get_function("fused_rope_cache_f16_kernel")?;
+    let fn_silu_mul = silu_mod.get_function("fused_silu_mul_fp8_quant_kernel")?;
+    let fn_argmax = argmax_mod.get_function("argmax_kernel")?;
 
     Ok(FusedModules {
-        add_rmsnorm,
-        rope_kv_write,
-        silu_mul,
-        quantize,
-        argmax,
+        rmsnorm_mod,
+        rope_mod,
+        silu_mod,
+        argmax_mod,
+        fn_rmsnorm,
         fn_add_rmsnorm,
-        fn_rope_kv_write,
-        fn_silu_mul,
         fn_quantize,
+        fn_rope_cache,
+        fn_silu_mul,
         fn_argmax,
     })
 }

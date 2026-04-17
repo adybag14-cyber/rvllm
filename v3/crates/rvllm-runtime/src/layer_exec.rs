@@ -1,21 +1,19 @@
 //! Layer forward as a pure function per spec 09.
 //!
 //! The kernel sequence for one Llama-style decoder layer (GQA + FP8 W +
-//! fused residual add + rmsnorm + silu-mul):
+//! fused residual add + rmsnorm + silu-mul), using v2's kernel APIs:
 //!   1. fused_add_rmsnorm_fp8_quant   (attn_norm)
-//!   2. fp8_gemm                      (QKV fused proj)
-//!   3. fused_rope_kv_write           (apply RoPE + write K/V pages)
-//!   4. paged_decode                  (FA3 SM90)
-//!   5. fp8_gemm_residual             (O proj, epilogue adds residual)
-//!   6. fused_add_rmsnorm_fp8_quant   (mlp_norm)
-//!   7. fp8_gemm                      (gate||up fused proj)
-//!   8. fused_silu_mul_fp8_quant      (SiLU(gate) * up, quantize)
-//!   9. fp8_gemm_residual             (Down proj, epilogue adds residual)
+//!   2..4. fp8_gemm x3                (Q, K, V projections separately)
+//!   5. fused_rope_cache_f16          (RoPE q/k + write KV pages)
+//!   6. paged_decode                  (FA3 SM90)
+//!   7. quantize_fp8_per_token        (attn_out -> fp8)
+//!   8. fp8_gemm_residual             (O proj, epilogue += residual)
+//!   9. fused_add_rmsnorm_fp8_quant   (mlp_norm)
+//!  10. fp8_gemm                      (gate||up fused proj)
+//!  11. fused_silu_mul_fp8_quant      (SiLU(gate)*up, quantize)
+//!  12. fp8_gemm_residual             (Down proj, epilogue += residual)
 //!
-//! That is nine kernel launches per layer in the fused path. Split-QKV
-//! grows this to eleven; keep the fused variant as the default.
-//!
-//! No hidden mutable state — every buffer is passed by ptr.
+//! 12 launches per layer.
 
 use rvllm_core::Result;
 use rvllm_cutlass::{CutlassLib, Fp8GemmPlan};
@@ -42,7 +40,8 @@ pub struct LayerDims {
     pub rms_eps: f32,
 }
 
-/// Per-layer device pointers: weights + fused norm gammas.
+/// Per-layer device pointers. `qkv_fp8` is a packed (q_rows + 2*kv_rows)
+/// x hidden weight matrix; we issue 3 sub-GEMMs over it.
 #[derive(Copy, Clone, Debug)]
 pub struct LayerWeights {
     pub attn_norm_gamma: u64,
@@ -57,12 +56,13 @@ pub struct LayerWeights {
     pub down_scale: u64,
 }
 
-/// Per-step scratch device pointers (shared across layers).
 #[derive(Copy, Clone, Debug)]
 pub struct LayerScratch {
     pub hidden_fp8: u64,
     pub hidden_scale: u64,
-    pub qkv_out: u64,
+    pub q_out: u64,
+    pub k_out: u64,
+    pub v_out: u64,
     pub k_cache: u64,
     pub v_cache: u64,
     pub attn_out: u64,
@@ -78,9 +78,6 @@ pub struct LayerScratch {
     pub fa3_workspace: u64,
 }
 
-/// Metadata device pointers: positions, slot_mapping, cos, sin, block
-/// tables, context_lens. These are filled once per step by metadata
-/// upload and stay stable through graph replay.
 #[derive(Copy, Clone, Debug)]
 pub struct MetadataPtrs {
     pub positions: u64,
@@ -91,30 +88,24 @@ pub struct MetadataPtrs {
     pub context_lens: u64,
 }
 
-/// Kernel handles (pre-resolved at engine init from the kernel loader).
 #[derive(Copy, Clone, Debug)]
 pub struct LayerKernels {
     pub fused_add_rmsnorm: KernelFn,
-    pub fused_rope_kv_write: KernelFn,
+    pub fused_rope_cache: KernelFn,
     pub fused_silu_mul: KernelFn,
     pub quantize_fp8_per_token: KernelFn,
 }
 
-/// Plans for the four GEMMs in a layer (resolved once per bucket from
-/// the autotune policy).
 #[derive(Clone, Debug)]
 pub struct LayerGemmPlans {
-    pub qkv: Fp8GemmPlan,       // non-residual
-    pub o: Fp8GemmPlan,         // residual-fused
-    pub gate_up: Fp8GemmPlan,   // non-residual
-    pub down: Fp8GemmPlan,      // residual-fused
+    pub q: Fp8GemmPlan,
+    pub k: Fp8GemmPlan,
+    pub v: Fp8GemmPlan,
+    pub o: Fp8GemmPlan,        // residual-fused
+    pub gate_up: Fp8GemmPlan,
+    pub down: Fp8GemmPlan,     // residual-fused
 }
 
-/// One decoder layer forward. `residual` is read and written in place.
-///
-/// # Safety
-/// Caller owns every pointer. No internal bounds checks on the scratch
-/// pointers — they must be sized per `LayerDims`.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn forward(
     dims: LayerDims,
@@ -128,8 +119,12 @@ pub unsafe fn forward(
     residual: u64,
     stream: u64,
 ) -> Result<()> {
-    // 1. hidden_fp8 = fp8_quant(rmsnorm(residual + 0)) with eps; write
-    //    residual <- residual (no prior add on layer 0 caller's responsibility).
+    let q_dim = dims.num_heads * dims.head_dim;
+    let kv_dim = dims.num_kv_heads * dims.head_dim;
+    let q_weight_bytes = (q_dim * dims.hidden) as u64;
+    let kv_weight_bytes = (kv_dim * dims.hidden) as u64;
+
+    // 1. rmsnorm(residual) + fp8 quant, residual updated in-place.
     FusedAddRmsnormFp8QuantLaunch {
         num_tokens: dims.num_tokens,
         hidden: dims.hidden,
@@ -139,49 +134,73 @@ pub unsafe fn forward(
         kernels.fused_add_rmsnorm,
         scratch.hidden_fp8,
         scratch.hidden_scale,
-        residual,                 // residual_out (in-place)
-        residual,                 // in_hidden == residual
-        residual,                 // residual_in == residual (op is idempotent here)
+        residual,
+        residual,
+        residual,
         weights.attn_norm_gamma,
         stream,
     )?;
 
-    // 2. QKV fused proj: hidden_fp8 @ qkv_fp8 -> qkv_out (f16).
+    // 2-4. Q, K, V projections (3 separate FP8 GEMMs over slices of qkv_fp8).
     #[cfg(feature = "cuda")]
-    cutlass.launch_fp8_gemm(
-        &plans.qkv,
-        scratch.qkv_out,
-        scratch.hidden_fp8,
-        weights.qkv_fp8,
-        scratch.hidden_scale,
-        weights.qkv_scale,
-        scratch.cutlass_workspace,
-        scratch.cutlass_workspace_bytes,
-        stream,
-    )?;
+    {
+        cutlass.launch_fp8_gemm(
+            &plans.q,
+            scratch.q_out,
+            scratch.hidden_fp8,
+            weights.qkv_fp8,
+            scratch.hidden_scale,
+            weights.qkv_scale,
+            scratch.cutlass_workspace,
+            scratch.cutlass_workspace_bytes,
+            stream,
+        )?;
+        cutlass.launch_fp8_gemm(
+            &plans.k,
+            scratch.k_out,
+            scratch.hidden_fp8,
+            weights.qkv_fp8 + q_weight_bytes,
+            scratch.hidden_scale,
+            weights.qkv_scale,
+            scratch.cutlass_workspace,
+            scratch.cutlass_workspace_bytes,
+            stream,
+        )?;
+        cutlass.launch_fp8_gemm(
+            &plans.v,
+            scratch.v_out,
+            scratch.hidden_fp8,
+            weights.qkv_fp8 + q_weight_bytes + kv_weight_bytes,
+            scratch.hidden_scale,
+            weights.qkv_scale,
+            scratch.cutlass_workspace,
+            scratch.cutlass_workspace_bytes,
+            stream,
+        )?;
+    }
 
-    // 3. RoPE + write K/V into paged cache.
-    let q_dim = dims.num_heads * dims.head_dim;
-    let kv_dim = dims.num_kv_heads * dims.head_dim;
+    // 5. RoPE q/k in place, write k/v into paged cache.
     FusedRopeKvWriteLaunch {
         num_tokens: dims.num_tokens,
-        q_dim,
-        kv_dim,
+        num_heads: dims.num_heads,
+        num_kv_heads: dims.num_kv_heads,
         head_dim: dims.head_dim,
     }
     .launch(
-        kernels.fused_rope_kv_write,
-        scratch.qkv_out,
+        kernels.fused_rope_cache,
+        scratch.q_out,
+        scratch.k_out,
+        scratch.v_out,
         scratch.k_cache,
         scratch.v_cache,
-        meta.positions,
         meta.cos,
         meta.sin,
+        meta.positions,
         meta.slot_mapping,
         stream,
     )?;
 
-    // 4. FA3 paged decode.
+    // 6. FA3 paged decode.
     let decode = PagedDecodeLauncher::new(fa3);
     let decode_params = PagedDecodeParams {
         num_seqs: dims.num_tokens,
@@ -196,7 +215,7 @@ pub unsafe fn forward(
     decode.launch(
         decode_params,
         scratch.attn_out,
-        scratch.qkv_out,    // Q view into QKV packed
+        scratch.q_out,
         scratch.k_cache,
         scratch.v_cache,
         meta.block_tables,
@@ -205,8 +224,7 @@ pub unsafe fn forward(
         stream,
     )?;
 
-    // 5. O proj with residual-fused epilogue: residual += o_proj(attn_out).
-    //    First quantize attn_out to fp8 (per-token), then GEMM_residual.
+    // 7. quantize attn_out -> fp8 (per-token).
     rvllm_fused::QuantizeFp8PerTokenLaunch {
         num_tokens: dims.num_tokens,
         dim: q_dim,
@@ -218,6 +236,8 @@ pub unsafe fn forward(
         scratch.attn_out,
         stream,
     )?;
+
+    // 8. O proj residual epilogue.
     #[cfg(feature = "cuda")]
     cutlass.launch_fp8_gemm_residual(
         &plans.o,
@@ -232,7 +252,7 @@ pub unsafe fn forward(
         stream,
     )?;
 
-    // 6. pre-MLP norm + fp8 quant.
+    // 9. pre-MLP norm + fp8 quant.
     FusedAddRmsnormFp8QuantLaunch {
         num_tokens: dims.num_tokens,
         hidden: dims.hidden,
@@ -249,7 +269,7 @@ pub unsafe fn forward(
         stream,
     )?;
 
-    // 7. gate||up fused proj.
+    // 10. gate||up proj.
     #[cfg(feature = "cuda")]
     cutlass.launch_fp8_gemm(
         &plans.gate_up,
@@ -263,7 +283,7 @@ pub unsafe fn forward(
         stream,
     )?;
 
-    // 8. silu(gate) * up -> mlp_out_fp8.
+    // 11. silu*mul -> fp8.
     FusedSiluMulFp8QuantLaunch {
         num_tokens: dims.num_tokens,
         intermediate: dims.intermediate,
@@ -276,7 +296,7 @@ pub unsafe fn forward(
         stream,
     )?;
 
-    // 9. Down proj with residual epilogue.
+    // 12. Down proj residual epilogue.
     #[cfg(feature = "cuda")]
     cutlass.launch_fp8_gemm_residual(
         &plans.down,
@@ -291,18 +311,13 @@ pub unsafe fn forward(
         stream,
     )?;
 
-    // Suppress unused under no-cuda (cutlass/fa3 dispatch is cuda-gated).
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (cutlass, plans, stream);
+        let _ = (cutlass, plans, stream, kv_dim, q_weight_bytes, kv_weight_bytes);
     }
     Ok(())
 }
 
-/// Sampling tail (post-LM-head). Given logits, argmax into an i32 slot.
-///
-/// # Safety
-/// Caller owns pointers.
 pub unsafe fn argmax_sample(
     num_tokens: u32,
     vocab: u32,
