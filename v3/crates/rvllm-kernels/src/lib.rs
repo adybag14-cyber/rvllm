@@ -6,8 +6,10 @@
 
 pub mod loader;
 pub mod manifest;
+pub mod module;
 pub mod sigs;
 
 pub use loader::{KernelLoader, PtxBytes};
 pub use manifest::{ArtifactEntry, KernelManifest, VerifiedManifest};
+pub use module::{KernelFn, LoadedModule};
 pub use sigs::{ArgKind, KernelSig, FUSED_KERNELS};

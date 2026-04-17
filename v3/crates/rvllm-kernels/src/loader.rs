@@ -48,11 +48,18 @@ impl KernelLoader {
         })
     }
 
-    /// Load a PTX module by logical name. Host stub without `cuda`
-    /// feature just reads the file and returns a handle containing its
-    /// bytes (useful for tests without a GPU).
-    #[cfg(not(feature = "cuda"))]
-    pub fn load_ptx(&self, logical_name: &str) -> Result<PtxBytes> {
+    /// Load a PTX module by logical name into a `LoadedModule`. Under
+    /// feature `cuda` this is `cuModuleLoad` on the file. Under no-cuda
+    /// it verifies the file is readable and returns a stub module so
+    /// type-level tests compose.
+    pub fn load_ptx(&self, logical_name: &str) -> Result<crate::module::LoadedModule> {
+        let path = self.path(logical_name)?;
+        crate::module::LoadedModule::load_from_file(path)
+    }
+
+    /// Convenience: raw PTX bytes for a logical name (for host-side
+    /// inspection, not the compute path).
+    pub fn read_ptx_bytes(&self, logical_name: &str) -> Result<PtxBytes> {
         let path = self.path(logical_name)?;
         let bytes = std::fs::read(&path).map_err(|source| RvllmError::Io {
             err: rvllm_core::IoError::from(&source),
@@ -60,16 +67,6 @@ impl KernelLoader {
             source,
         })?;
         Ok(PtxBytes { bytes })
-    }
-
-    /// CUDA impl: cuModuleLoad. Pending wiring.
-    #[cfg(feature = "cuda")]
-    pub fn load_ptx(&self, _logical_name: &str) -> Result<PtxBytes> {
-        Err(RvllmError::cuda(
-            "KernelLoader::load_ptx",
-            rvllm_core::CudaErrorKind::ModuleLoadFailed,
-            rvllm_core::CudaCtx::setup(),
-        ))
     }
 
     /// Return path for dlopen (caller wraps with libloading under
@@ -147,8 +144,9 @@ mod tests {
         let tmp = tempdir();
         let vm = verified(&tmp, b"HELLO PTX", "argmax");
         let loader = KernelLoader::new(vm);
-        let m = loader.load_ptx("argmax").unwrap();
-        assert_eq!(m.bytes, b"HELLO PTX");
+        let _m = loader.load_ptx("argmax").unwrap(); // LoadedModule (stub under no-cuda)
+        let bytes = loader.read_ptx_bytes("argmax").unwrap();
+        assert_eq!(bytes.bytes, b"HELLO PTX");
     }
 
     #[test]
