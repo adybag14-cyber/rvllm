@@ -114,7 +114,7 @@ impl<'a> PendingStep<'a> {
         let pending = self.pending.take().expect("PendingStep already collected");
         self.engine
             .inner
-            .step_collect(pending)
+            .step_collect(Some(pending))
             .map_err(map_engine_err)
     }
 }
@@ -125,7 +125,7 @@ impl<'a> Drop for PendingStep<'a> {
         // DtoH event or the next launch will see stale argmax output.
         // The v2 step_collect handles this idempotently.
         if let Some(p) = self.pending.take() {
-            let _ = self.engine.inner.step_collect(p);
+            let _ = self.engine.inner.step_collect(Some(p));
         }
     }
 }
