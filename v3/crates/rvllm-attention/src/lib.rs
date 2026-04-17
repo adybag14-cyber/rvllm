@@ -22,14 +22,44 @@ use rvllm_core::{AttentionError, AttnCtx, Result, RvllmError};
 /// refuses to exist if the .so is missing or its manifest-verified
 /// exports don't include the entry points. Callers obtain launchers
 /// from the wrapper.
+/// Function pointer types for FA3 .so exports.
+#[cfg(feature = "cuda")]
+pub(crate) type WorkspaceSizeFn = unsafe extern "C" fn(
+    batch_size: i32,
+    num_heads: i32,
+    max_num_splits: i32,
+) -> i32;
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::type_complexity)]
+pub(crate) type PagedDecodeFn = unsafe extern "C" fn(
+    q_ptr: *mut std::ffi::c_void,
+    k_cache_ptr: *mut std::ffi::c_void,
+    v_cache_ptr: *mut std::ffi::c_void,
+    o_ptr: *mut std::ffi::c_void,
+    block_tables_ptr: *mut std::ffi::c_void,
+    context_lens_ptr: *mut std::ffi::c_void,
+    workspace_ptr: *mut std::ffi::c_void,
+    scale: f32,
+    batch_size: i32,
+    num_heads: i32,
+    num_kv_heads: i32,
+    head_dim: i32,
+    block_size: i32,
+    max_blocks_per_seq: i32,
+    num_blocks_total: i32,
+    stream: *mut std::ffi::c_void,
+) -> i32;
+
 #[derive(Debug)]
 pub struct Fa3Kernels {
-    /// Path to the .so (diagnostics only).
     pub so_path: std::path::PathBuf,
-    // Under `feature = "cuda"`, this holds the dlopen handle and fn
-    // pointers. Under no-cuda, it's unit so the crate tests compile.
     #[cfg(feature = "cuda")]
     _lib: libloading::Library,
+    #[cfg(feature = "cuda")]
+    pub(crate) fn_workspace_size: WorkspaceSizeFn,
+    #[cfg(feature = "cuda")]
+    pub(crate) fn_paged_decode: PagedDecodeFn,
 }
 
 impl Fa3Kernels {
@@ -66,26 +96,76 @@ impl Fa3Kernels {
         }
 
         #[cfg(feature = "cuda")]
-        let _lib = unsafe {
-            libloading::Library::new(&path).map_err(|e| RvllmError::Attention {
-                err: AttentionError::Fa3SoMissing { path: path.clone() },
-                ctx: AttnCtx {
-                    op: "dlopen",
-                    stream: 0,
-                    num_seqs: 0,
-                    head_dim,
-                },
-                bt: std::backtrace::Backtrace::capture(),
-            })?
-        };
+        {
+            unsafe {
+                let _lib = libloading::Library::new(&path).map_err(|_e| RvllmError::Attention {
+                    err: AttentionError::Fa3SoMissing { path: path.clone() },
+                    ctx: AttnCtx {
+                        op: "dlopen",
+                        stream: 0,
+                        num_seqs: 0,
+                        head_dim,
+                    },
+                    bt: std::backtrace::Backtrace::capture(),
+                })?;
+                let ws_sym: libloading::Symbol<WorkspaceSizeFn> = _lib
+                    .get(b"fa3_sm90_workspace_size\0")
+                    .map_err(|_e| RvllmError::Attention {
+                        err: AttentionError::Fa3SoMissing { path: path.clone() },
+                        ctx: AttnCtx {
+                            op: "dlsym:fa3_sm90_workspace_size",
+                            stream: 0,
+                            num_seqs: 0,
+                            head_dim,
+                        },
+                        bt: std::backtrace::Backtrace::capture(),
+                    })?;
+                let dec_sym: libloading::Symbol<PagedDecodeFn> = _lib
+                    .get(b"fa3_sm90_paged_decode\0")
+                    .map_err(|_e| RvllmError::Attention {
+                        err: AttentionError::Fa3SoMissing { path: path.clone() },
+                        ctx: AttnCtx {
+                            op: "dlsym:fa3_sm90_paged_decode",
+                            stream: 0,
+                            num_seqs: 0,
+                            head_dim,
+                        },
+                        bt: std::backtrace::Backtrace::capture(),
+                    })?;
+                let fn_workspace_size = *ws_sym;
+                let fn_paged_decode = *dec_sym;
+                return Ok(Self {
+                    so_path: path,
+                    _lib,
+                    fn_workspace_size,
+                    fn_paged_decode,
+                });
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        Ok(Self { so_path: path })
+    }
 
-        Ok(Self {
-            so_path: path,
-            #[cfg(feature = "cuda")]
-            _lib,
-        })
+    /// Minimum workspace size in bytes for the given batch + heads.
+    pub fn workspace_size(&self, batch_size: i32, num_heads: i32) -> usize {
+        #[cfg(feature = "cuda")]
+        unsafe {
+            let s = (self.fn_workspace_size)(batch_size, num_heads, 128);
+            return s as usize;
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (batch_size, num_heads);
+            0
+        }
     }
 }
+
+// libloading::Library holds an unowned dlopen handle; safe to send per v2.
+#[cfg(feature = "cuda")]
+unsafe impl Send for Fa3Kernels {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for Fa3Kernels {}
 
 #[cfg(test)]
 mod tests {
