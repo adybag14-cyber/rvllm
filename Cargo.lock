@@ -3230,6 +3230,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvllm-v3"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "cudarc",
+ "half",
+ "rvllm-attention",
+ "rvllm-autotune",
+ "rvllm-core",
+ "rvllm-gpu",
+ "rvllm-model-loader",
+ "rvllm-tokenizer",
+ "rvllm-v2",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "rvllm-worker"
 version = "0.1.0"
 dependencies = [
