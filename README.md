@@ -20,15 +20,15 @@ vLLM numbers are the `Avg generation throughput` engine log line (steady-state d
 
 Decode-kernel throughput under steady-state; same model weights, same FP8 quant type, same GPU, CUDA graphs enabled in both. All three of these were our initial caveats vs vLLM; v3's bench has been updated to address each:
 
-1. **vLLM does real prefill** (16 input tokens × 128 prompts = 2,048 tokens of real prompt processing before decode starts). Our bench skips prefill. However, vLLM's `Avg generation throughput` metric is measured only during the decode phase, so this is mostly accounted for. v3's bench runs 16 eager decode steps before the timed window to populate KV pages with real forward-pass activations — a "faux-prefill" that matches the KV state vLLM has at the start of its decode measurement.
+1. **vLLM does real prefill** (16 input tokens × 128 prompts = 2,048 tokens of real prompt processing before decode starts). v3 now does the same under `RVLLM_REAL_PREFILL=1` — one multi-query causal FP8 attention call via FA3 paged-prefill over the whole concatenated prompt. vLLM's `Avg generation throughput` metric is measured only during the decode phase, so steady-state throughput is measured under identical KV-populated state on both sides. A 16-step eager "faux-prefill" is also still available as a fallback.
 2. **vLLM runs its scheduler every step.** Even at steady-state batch=128, it checks for request state, completions, block table management. v3's bench re-uploads `positions`, `slot_mapping`, and `context_lens` every iteration inside the timed loop (not once before capture), so v3 pays the same per-step HtoD cost that vLLM's scheduler pays for metadata management.
-3. **vLLM's KV cache has real content from real prompts.** Ours had post-warmup garbage. v3's bench advances positions/slot_mapping/context_lens across the 16-step faux-prefill + 512-iter decode window, so the paged KV fills up step by step with real activations.
+3. **vLLM's KV cache has real content from real prompts.** Ours previously had post-warmup garbage. v3's bench now runs real FA3 paged-prefill before the timed window, so paged KV is populated with legitimate rope+quant activations (matching the condition vLLM measures under). Metadata (`positions`, `slot_mapping`, `context_lens`) continues to advance across the decode window.
 
-Net impact of the three fairness fixes on the N=128 number: −0.3%. The per-step metadata upload + faux-prefill is cheap against the 28-layer forward + LM head compute, so the +7.4% edge at N=128 — and the much larger capacity-unlock edge at N=256/512 — are genuine.
+Net impact of the three fairness fixes on the N=128 number: −0.3%. The per-step metadata upload is cheap against the 28-layer forward + LM head compute, so the +7.4% edge at N=128 — and the much larger capacity-unlock edge at N=256/512 — are genuine.
 
 ## v3 throughput by batch size (FP8 KV, ITERS=512)
 
-H100 SXM 80GB, Qwen2.5-7B-Instruct, FP8 E4M3 weights + FP8 E4M3 KV, graph-captured, full decode + final RMSnorm + LM head + argmax, metadata re-upload per step, 16-step faux-prefill, 5 warmup iters:
+H100 SXM 80GB, Qwen2.5-7B-Instruct, FP8 E4M3 weights + FP8 E4M3 KV, graph-captured, full decode + final RMSnorm + LM head + argmax, metadata re-upload per step, real FA3 paged-prefill warmup, 5 warmup iters:
 
 | N | tok/s | ms/step | vLLM same N | v3 Δ |
 |---:|---:|---:|---:|---:|
@@ -38,15 +38,15 @@ H100 SXM 80GB, Qwen2.5-7B-Instruct, FP8 E4M3 weights + FP8 E4M3 KV, graph-captur
 
 ## Time-to-first-token (TTFT)
 
-v3 current measurements with `RVLLM_TTFT=1` use a 16-step eager-decode faux-prefill as the prompt-ingest stand-in. **Phase F (real FA3 paged-prefill kernel) will replace that with one multi-query attention call and drop TTFT ~15–30×** — eager dispatch overhead is the dominant cost today.
+Phase F shipped real FA3 paged-prefill. `RVLLM_REAL_PREFILL=1` runs one multi-query causal FP8 attention call over the concatenated prompt (`total_q = N × prompt_len`) via varlen `cu_seqlens_q`, replacing the 16-step faux-prefill stand-in.
 
-| N | TTFT (ms), faux-prefill | projected after Phase F |
-|---:|---:|---:|
-| 128 | 763 | ~25–40 |
-| 256 | 833 | ~35–55 |
-| 512 | 855 | ~45–70 |
+| N | TTFT (ms), real prefill | TTFT (ms), faux-prefill | Δ |
+|---:|---:|---:|---:|
+| 128 | **63.8** | 763 | **12.0×** |
+| 256 | **117.7** | 833 | **7.1×** |
+| 512 | **131.7** | 855 | **6.5×** |
 
-TTFT measures: `t₀ = right before prompt ingest` → `t₁ = first sampled token visible in pinned host memory` (includes one decode step after prefill + DtoH + stream fence).
+Measured with `RVLLM_PREFILL_LEN=16` (16 prompt tokens/seq). `t₀ = right before prompt ingest` → `t₁ = first sampled token visible in pinned host memory` (includes one decode step after prefill + DtoH + stream fence).
 
 ## Why v3 is fast (structural wins)
 

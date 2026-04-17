@@ -506,16 +506,6 @@ impl Bringup {
                     stream,
                     phase,
                 )?;
-                // Debug: trap exactly which layer the CUDA error appears after.
-                // Triggered via RVLLM_DEBUG_LAYERS=1.
-                if std::env::var("RVLLM_DEBUG_LAYERS").ok().as_deref() == Some("1") {
-                    use cudarc::driver::sys::{cuStreamSynchronize, CUresult};
-                    let sync = unsafe { cuStreamSynchronize(stream as *mut _) };
-                    eprintln!("DBG layer {layer_idx} phase={phase:?} sync={sync:?}");
-                    if sync != CUresult::CUDA_SUCCESS {
-                        panic!("layer {layer_idx} failed with {sync:?}");
-                    }
-                }
             }
             // Skip LM head during prefill — we only care about first-token
             // sampling after the LAST token of each seq, which is a

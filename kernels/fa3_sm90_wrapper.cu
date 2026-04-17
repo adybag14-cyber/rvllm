@@ -109,19 +109,6 @@ static int fa3_sm90_paged_decode_impl(
         return -1;
     }
 
-    // CRITICAL: if a prior kernel left an error on the context, the
-    // next <<<>>> launch will fail with that error. Surface it now so
-    // we know WHICH prior kernel is the culprit, not just that FA3
-    // "crashed".
-    {
-        cudaError_t pre = cudaGetLastError();
-        if (pre != cudaSuccess) {
-            fprintf(stderr, "fa3: ENTRY cudaGetLastError=%s(%d) -- a PRIOR kernel failed, not FA3\n",
-                    cudaGetErrorString(pre), (int)pre);
-            return -2;
-        }
-    }
-
     // Get device properties
     int device;
     cudaGetDevice(&device);
@@ -281,19 +268,6 @@ static int fa3_sm90_paged_decode_impl(
     params.num_splits = ns;
     bool use_split = ns > 1;
 
-    static int fa3_call_n = 0;
-    int call_n = fa3_call_n++;
-    if (getenv("FA3_DEBUG")) {
-        fprintf(stderr, "fa3[%d]: b=%d h=%d h_k=%d d=%d seqlen_q=%d seqlen_k=%d total_q=%d "
-                "causal=%d varlen_q=%d fp8=%d split=%d ns=%d num_m=%d num_n=%d tot_mb=%d "
-                "cu_q=%p ctx=%p k=%p v=%p o=%p ws=%p\n",
-                call_n, params.b, params.h, params.h_k, params.d,
-                params.seqlen_q, params.seqlen_k, params.total_q,
-                (int)params.is_causal, cu_seqlens_q_ptr != nullptr ? 1 : 0,
-                (int)is_fp8, (int)use_split, ns, num_m_blocks, num_n_blocks, total_mblocks,
-                (void*)cu_seqlens_q_ptr, (void*)context_lens_ptr,
-                k_cache_ptr, v_cache_ptr, o_ptr, workspace_ptr);
-    }
 
     // Scheduler metadata setup — matches upstream hopper/flash_api.cpp:
     //   varlen_sort_batches = !is_local
@@ -354,13 +328,6 @@ static int fa3_sm90_paged_decode_impl(
         } else {
             run_mha_fwd_<90, cutlass::half_t, 128, 128, false, true, false, true>(params, stream);
         }
-    }
-    if (getenv("FA3_DEBUG")) {
-        cudaError_t post = cudaStreamSynchronize(stream);
-        cudaError_t last = cudaGetLastError();
-        fprintf(stderr, "fa3[%d]: post-launch sync=%s(%d) last=%s(%d)\n",
-                call_n, cudaGetErrorString(post), (int)post,
-                cudaGetErrorString(last), (int)last);
     }
 
     return 0;
