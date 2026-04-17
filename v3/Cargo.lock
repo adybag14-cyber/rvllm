@@ -248,6 +248,7 @@ dependencies = [
 name = "rvllm-cutlass"
 version = "0.1.0"
 dependencies = [
+ "libloading 0.8.9",
  "rvllm-core",
  "rvllm-kernels",
  "rvllm-mem",
