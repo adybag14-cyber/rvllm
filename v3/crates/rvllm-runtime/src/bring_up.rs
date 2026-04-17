@@ -460,17 +460,23 @@ impl Bringup {
                 )?;
             }
             if !skip_lm_head {
-                // LM head: quantize residual -> fp8, GEMM -> logits (f16),
-                // argmax over vocab -> sampled_tokens[i32].
-                rvllm_fused::QuantizeFp8PerTokenLaunch {
+                // LM head tail: fused_rmsnorm_fp8_quant applies the
+                // model.norm weight AND produces FP8 hidden in one kernel.
+                // Same kernel count as the previous quantize-only step,
+                // but includes the final RMSnorm that Qwen2.5 requires —
+                // fixes a correctness bug where we previously fed raw
+                // residual to lm_head.
+                rvllm_fused::FusedRmsnormFp8QuantLaunch {
                     num_tokens: num_seqs,
-                    dim: hidden,
+                    hidden,
+                    eps: 1e-6,
                 }
                 .launch(
-                    self.fused_modules.fn_quantize,
+                    self.fused_modules.fn_rmsnorm,
                     hidden_fp8.device_ptr(),
                     hidden_scale.device_ptr(),
                     residual_ptr,
+                    self.model.final_norm.offset_bytes,
                     stream,
                 )?;
                 #[cfg(feature = "cuda")]
