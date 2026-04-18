@@ -753,24 +753,36 @@ impl Bringup {
             (None, None)
         };
 
-        // Capture one decode step into a CUDA graph then replay for the bench.
         let mut one_step = one_step;
-        let graph = rvllm_graph::CapturedGraph::capture(
-            num_seqs,
-            max_blocks_per_seq,
-            rvllm_metadata::MetadataLayout::compute(num_seqs, max_blocks_per_seq).hash(),
-            rvllm_graph::GraphFingerprint([0u8; 32]),
-            stream,
-            || one_step(layer_exec::LayerPhase::Decode),
-        )?;
+        let no_graph = std::env::var("RVLLM_NO_GRAPH").ok().as_deref() == Some("1");
 
-        let t0 = std::time::Instant::now();
-        for iter in 0..iters as i32 {
-            set_step_meta(FAUX_PREFILL_STEPS + iter)?;
-            graph.replay(stream)?;
-        }
-        self.stream.fence()?;
-        let elapsed = t0.elapsed();
+        let elapsed = if no_graph {
+            self.stream.fence()?;
+            let t0 = std::time::Instant::now();
+            for iter in 0..iters as i32 {
+                set_step_meta(FAUX_PREFILL_STEPS + iter)?;
+                one_step(layer_exec::LayerPhase::Decode)?;
+            }
+            self.stream.fence()?;
+            t0.elapsed()
+        } else {
+            let graph = rvllm_graph::CapturedGraph::capture(
+                num_seqs,
+                max_blocks_per_seq,
+                rvllm_metadata::MetadataLayout::compute(num_seqs, max_blocks_per_seq).hash(),
+                rvllm_graph::GraphFingerprint([0u8; 32]),
+                stream,
+                || one_step(layer_exec::LayerPhase::Decode),
+            )?;
+            self.stream.fence()?;
+            let t0 = std::time::Instant::now();
+            for iter in 0..iters as i32 {
+                set_step_meta(FAUX_PREFILL_STEPS + iter)?;
+                graph.replay(stream)?;
+            }
+            self.stream.fence()?;
+            t0.elapsed()
+        };
 
         // Debug: dump sampled token IDs to stderr for quality sanity check.
         if std::env::var("RVLLM_DUMP_TOKENS").ok().as_deref() == Some("1") {
