@@ -124,10 +124,32 @@ pub fn load_gemma4_model(
     };
 
     let embed_name = format!("{prefix}.embed_tokens.weight");
-    let embedding = upload_f16("embedding", &embed_name)?;
+    // Gemma models scale embeddings by sqrt(hidden_size) after lookup.
+    // Pre-scale at load time so the embedding_gather kernel doesn't need modification.
+    let embedding = {
+        let (si, e) = must_get(&embed_name)?;
+        let mut buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
+        let scale = (arch.hidden_size as f32).sqrt();
+        eprintln!("[loader] Gemma embedding scale: sqrt({}) = {:.2}", arch.hidden_size, scale);
+        let n = buf.len() / 2;
+        for i in 0..n {
+            let bits = u16::from_le_bytes([buf[2*i], buf[2*i+1]]);
+            let v = f16::from_bits(bits);
+            let scaled = f16::from_f32(v.to_f32() * scale);
+            let out = scaled.to_le_bytes();
+            buf[2*i] = out[0];
+            buf[2*i+1] = out[1];
+        }
+        let region = arena.region("embedding", buf.len(), 16)?;
+        unsafe { region.copy_from_host(&buf)? };
+        F16Weight {
+            offset_bytes: region.device_ptr(),
+            shape: e.shape.clone(),
+        }
+    };
 
     let norm_name = format!("{prefix}.norm.weight");
-    let final_norm = upload_f16("final_norm", &norm_name)?;
+    let final_norm = upload_f16_gemma_norm("final_norm", &norm_name)?;
 
     // Detect pre-quantized FP8 weights (e.g. RedHatAI/gemma-4-31B-it-FP8-Dynamic).
     // These have F8_E4M3 linear weights + per-channel BF16 weight_scale tensors.
