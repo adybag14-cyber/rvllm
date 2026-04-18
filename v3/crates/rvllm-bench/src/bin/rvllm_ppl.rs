@@ -16,12 +16,23 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use rvllm_core::{ModelArch as HfModelArch, ModelConfig};
 use rvllm_runtime::{Bringup, EnginePaths};
+use rvllm_runtime::gemma4_bring_up::{Gemma4Bringup, Gemma4EnginePaths};
 
 fn env_path(k: &str) -> Result<PathBuf, String> {
     std::env::var(k)
         .map_err(|_| format!("missing env var: {k}"))
         .map(PathBuf::from)
+}
+
+fn is_gemma4_model_dir(model_dir: &std::path::Path) -> Result<bool, String> {
+    Ok(matches!(
+        ModelConfig::load_hf(model_dir)
+            .map_err(|e| format!("config parse {}: {e}", model_dir.display()))?
+            .architecture,
+        HfModelArch::Gemma4
+    ))
 }
 
 fn main() {
@@ -83,6 +94,22 @@ fn run() -> Result<(), String> {
         .unwrap_or(32);
     let arena_bytes: usize = arena_gb * 1024 * 1024 * 1024;
     let t0 = Instant::now();
+
+    if is_gemma4_model_dir(&model_dir)? {
+        let g4_paths = Gemma4EnginePaths {
+            model_dir: paths.model_dir,
+            kernels_dir: paths.kernels_dir,
+            cutlass_so: paths.cutlass_so,
+            fa3_so: paths.fa3_so,
+            policy_json: paths.policy_json,
+        };
+        let _g4 = Gemma4Bringup::load(g4_paths, arena_bytes)
+            .map_err(|e| format!("gemma4 bringup: {e}"))?;
+        return Err(
+            "Gemma 4 perplexity still needs the Gemma4 forward/logits path; this binary no longer falls back to the generic engine".into(),
+        );
+    }
+
     let br = Bringup::load(paths, arena_bytes).map_err(|e| format!("bringup: {e}"))?;
     eprintln!("bringup: {:.2}s", t0.elapsed().as_secs_f64());
 

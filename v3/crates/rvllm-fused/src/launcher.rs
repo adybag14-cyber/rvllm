@@ -355,8 +355,8 @@ pub struct FusedRopeKvWriteLaunch {
 
 impl FusedRopeKvWriteLaunch {
     pub fn validate(&self) -> Result<()> {
-        if self.head_dim != 128 {
-            return Err(invalid("head_dim", "v3 FA3 path requires head_dim == 128"));
+        if !matches!(self.head_dim, 128 | 256 | 512) {
+            return Err(invalid("head_dim", "v3 FA3 path requires head_dim in {128, 256, 512}"));
         }
         if self.num_kv_heads == 0 || self.num_heads % self.num_kv_heads != 0 {
             return Err(invalid(
@@ -481,8 +481,8 @@ pub struct FusedRopeCacheFp8KvLaunch {
 
 impl FusedRopeCacheFp8KvLaunch {
     pub fn validate(&self) -> Result<()> {
-        if self.head_dim != 128 {
-            return Err(invalid("head_dim", "v3 FA3 path requires head_dim == 128"));
+        if !matches!(self.head_dim, 128 | 256 | 512) {
+            return Err(invalid("head_dim", "v3 FA3 path requires head_dim in {128, 256, 512}"));
         }
         if self.num_kv_heads == 0 || self.num_heads % self.num_kv_heads != 0 {
             return Err(invalid(

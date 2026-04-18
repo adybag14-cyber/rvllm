@@ -13,6 +13,7 @@ NAME_TO_FILE = {
     "fused_rope_cache": "fused_rope_cache.ptx",
     "fused_rope_cache_f16tbl": "fused_rope_cache_f16tbl.ptx",
     "fused_rope_cache_fp8kv": "fused_rope_cache_fp8kv.ptx",
+    "fused_rope_partial_fp8kv": "fused_rope_partial_fp8kv.ptx",
     "add_bias_f16": "add_bias_f16.ptx",
     "fused_silu_fp8_quant": "fused_silu_fp8_quant.ptx",
     "fused_gelu_mul_fp8_quant": "fused_gelu_mul_fp8_quant.ptx",
@@ -22,6 +23,9 @@ NAME_TO_FILE = {
     "embedding_gather": "embedding_gather.ptx",
     "embedding_gather_f16": "embedding_gather_f16.ptx",
     "fp8_rescale": "fp8_rescale.ptx",
+    "fused_qk_rmsnorm": "fused_qk_rmsnorm.ptx",
+    "logit_softcap": "logit_softcap.ptx",
+    "residual_scale_f16": "residual_scale_f16.ptx",
 }
 
 

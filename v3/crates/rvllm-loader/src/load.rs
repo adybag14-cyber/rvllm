@@ -373,20 +373,55 @@ pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Resul
     for l in 0..arch.num_hidden_layers {
         let ln = |s: &str| format!("{wprefix}.layers.{l}.{s}");
 
-        let qkv_rows = (arch.num_attention_heads + 2 * arch.num_key_value_heads) * arch.head_dim;
+        // Per-layer head geometry: global layers may have different dims
+        // and attention_k_eq_v (no separate v_proj).
+        let is_global = arch.layer_types[l] == LayerAttnType::Full
+            && arch.global_head_dim.is_some();
+        let layer_head_dim = if is_global {
+            arch.global_head_dim.unwrap_or(arch.head_dim)
+        } else {
+            arch.head_dim
+        };
+        let layer_kv_heads = if is_global {
+            arch.num_global_key_value_heads.unwrap_or(arch.num_key_value_heads)
+        } else {
+            arch.num_key_value_heads
+        };
+        let layer_q_dim = arch.num_attention_heads * layer_head_dim;
+        let layer_kv_dim = layer_kv_heads * layer_head_dim;
+        let has_v_proj = get_tensor(&ln("self_attn.v_proj.weight")).is_some();
+
+        let q_entry = must_get(&ln("self_attn.q_proj.weight"))?;
+        let k_entry = must_get(&ln("self_attn.k_proj.weight"))?;
+        let (qkv_parts, qkv_scales, qkv_rows) = if has_v_proj {
+            let v_entry = must_get(&ln("self_attn.v_proj.weight"))?;
+            (
+                vec![q_entry, k_entry.clone(), v_entry],
+                vec![
+                    get_tensor(&ln("self_attn.q_proj.weight_scale")),
+                    get_tensor(&ln("self_attn.k_proj.weight_scale")),
+                    get_tensor(&ln("self_attn.v_proj.weight_scale")),
+                ],
+                layer_q_dim + 2 * layer_kv_dim,
+            )
+        } else {
+            // attention_k_eq_v: V uses the same weight as K
+            (
+                vec![q_entry, k_entry.clone(), k_entry],
+                vec![
+                    get_tensor(&ln("self_attn.q_proj.weight_scale")),
+                    get_tensor(&ln("self_attn.k_proj.weight_scale")),
+                    get_tensor(&ln("self_attn.k_proj.weight_scale")),
+                ],
+                layer_q_dim + 2 * layer_kv_dim,
+            )
+        };
+
         let qkv_cols = arch.hidden_size;
         let qkv = upload_fp8_fused_direct(
             arena, "qkv",
-            &[
-                must_get(&ln("self_attn.q_proj.weight"))?,
-                must_get(&ln("self_attn.k_proj.weight"))?,
-                must_get(&ln("self_attn.v_proj.weight"))?,
-            ],
-            &[
-                get_tensor(&ln("self_attn.q_proj.weight_scale")),
-                get_tensor(&ln("self_attn.k_proj.weight_scale")),
-                get_tensor(&ln("self_attn.v_proj.weight_scale")),
-            ],
+            &qkv_parts,
+            &qkv_scales,
             &shards,
             &[qkv_rows, qkv_cols],
         )?;

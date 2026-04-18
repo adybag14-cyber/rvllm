@@ -151,7 +151,7 @@ pub enum CutlassError {
 #[derive(Debug)]
 pub enum AttentionError {
     Fa3SoMissing { path: PathBuf },
-    UnsupportedHeadDim { got: u32, required: u32 },
+    UnsupportedHeadDim { got: u32, supported: &'static [u32] },
     GqaRatioInvalid { num_heads: u32, num_kv_heads: u32 },
     ContextExceedsBucket { context: u32, max: u32 },
     KernelLaunchFailed { cuda: CudaErrorKind },

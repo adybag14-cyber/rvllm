@@ -173,25 +173,39 @@ pub fn load_gemma4_model(
     let rope_cos_global = upload_rope(arena, "rope_cos_global", &cos_g)?;
     let rope_sin_global = upload_rope(arena, "rope_sin_global", &sin_g)?;
 
-    // All layers have IDENTICAL weight shapes (uniform). The sliding vs
-    // global distinction is a runtime reshape: 32x256 -> 16x512 for Q, etc.
-    // q_proj: [8192, 5376], k_proj: [4096, 5376], v_proj: [4096, 5376]
-    let q_dim = 8192; // num_heads(32) * head_dim_sliding(256)
-    let kv_dim = 4096; // kv_heads_sliding(16) * head_dim_sliding(256)
+    // Per-layer weight shapes differ between sliding and global layers:
+    //   Sliding: q=[8192,5376] k=[4096,5376] v=[4096,5376] o=[5376,8192]
+    //   Global:  q=[16384,5376] k=[2048,5376] NO v_proj    o=[5376,16384]
+    // Global layers have attention_k_eq_v=true: K weight serves as both K and V.
 
     let mut layers = Vec::with_capacity(arch.num_hidden_layers);
     for l in 0..arch.num_hidden_layers {
         let ln = |s: &str| format!("{prefix}.layers.{l}.{s}");
 
+        let is_global = arch.layer_types[l] == crate::gemma4_arch::Gemma4LayerType::GlobalAttention;
+        let layer_hd = arch.head_dim_for_layer(l);
+        let layer_nkvh = arch.num_kv_heads_for_layer(l);
+        let layer_q_dim = arch.num_attention_heads * layer_hd;
+        let layer_kv_dim = layer_nkvh * layer_hd;
+
         let q_tensor = must_get(&ln("self_attn.q_proj.weight"))?;
         let k_tensor = must_get(&ln("self_attn.k_proj.weight"))?;
-        let v_tensor = must_get(&ln("self_attn.v_proj.weight"))?;
-        let qkv_rows = q_dim + 2 * kv_dim; // 8192 + 2*4096 = 16384
+        let has_v = get_tensor(&ln("self_attn.v_proj.weight")).is_some();
+        let v_tensor = if has_v {
+            must_get(&ln("self_attn.v_proj.weight"))?
+        } else {
+            k_tensor.clone()
+        };
+        let qkv_rows = layer_q_dim + 2 * layer_kv_dim;
 
         let (qkv, o_proj, gate_up, down_proj) = if fp8_prequant {
             let q_scale = get_tensor(&ln("self_attn.q_proj.weight_scale"));
             let k_scale = get_tensor(&ln("self_attn.k_proj.weight_scale"));
-            let v_scale = get_tensor(&ln("self_attn.v_proj.weight_scale"));
+            let v_scale = if has_v {
+                get_tensor(&ln("self_attn.v_proj.weight_scale"))
+            } else {
+                k_scale.clone()
+            };
             let qkv = fuse_fp8_direct_channelscale(
                 arena, "qkv",
                 &[&q_tensor, &k_tensor, &v_tensor],

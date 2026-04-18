@@ -1,18 +1,29 @@
 //! Gemma 4 weight structures.
 //!
-//! All layers have IDENTICAL weight shapes regardless of sliding/global type.
-//! The dual head_dim (256 sliding vs 512 global) is a runtime reshape.
+//! Sliding and global layers do NOT share identical attention weight shapes.
+//! Sliding layers use `(q, k, v, o) = (8192, 4096, 4096, 8192)` over the
+//! head axis, while global layers use `(16384, 2048, no v_proj, 16384)`.
+//! Global attention has `attention_k_eq_v=true`, so the K projection is
+//! reused for V when building the fused QKV weight.
 //!
 //! Per-layer extras vs Llama/Qwen:
 //!   - 4 norms (input, post_attn, pre_ff, post_ff)
 //!   - QK-norm gammas (q_norm [256], k_norm [256])
 //!   - layer_scalar [1] (per-layer residual multiplier)
 //!
-//! Weight shapes (google/gemma-4-31B-it):
+//! Sliding layer shapes:
 //!   q_proj:        [8192, 5376]
 //!   k_proj:        [4096, 5376]
 //!   v_proj:        [4096, 5376]
 //!   o_proj:        [5376, 8192]
+//!
+//! Global layer shapes:
+//!   q_proj:        [16384, 5376]
+//!   k_proj:        [2048, 5376]
+//!   v_proj:        absent, reuse `k_proj`
+//!   o_proj:        [5376, 16384]
+//!
+//! Shared MLP / norm shapes:
 //!   gate_proj:     [21504, 5376]
 //!   up_proj:       [21504, 5376]
 //!   down_proj:     [5376, 21504]

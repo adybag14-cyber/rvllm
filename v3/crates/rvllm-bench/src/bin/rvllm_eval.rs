@@ -14,13 +14,23 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use rvllm_core::DType;
+use rvllm_core::{ModelArch as HfModelArch, ModelConfig};
 use rvllm_runtime::{Bringup, EnginePaths};
+use rvllm_runtime::gemma4_bring_up::{Gemma4Bringup, Gemma4EnginePaths};
 
 fn env_path(k: &str) -> Result<PathBuf, String> {
     std::env::var(k)
         .map_err(|_| format!("missing env var: {k}"))
         .map(PathBuf::from)
+}
+
+fn is_gemma4_model_dir(model_dir: &std::path::Path) -> Result<bool, String> {
+    Ok(matches!(
+        ModelConfig::load_hf(model_dir)
+            .map_err(|e| format!("config parse {}: {e}", model_dir.display()))?
+            .architecture,
+        HfModelArch::Gemma4
+    ))
 }
 
 fn main() {
@@ -77,6 +87,22 @@ fn run() -> Result<(), String> {
     };
     let arena_bytes: usize = 32 * 1024 * 1024 * 1024;
     let t0 = Instant::now();
+
+    if is_gemma4_model_dir(&model_dir)? {
+        let g4_paths = Gemma4EnginePaths {
+            model_dir: paths.model_dir,
+            kernels_dir: paths.kernels_dir,
+            cutlass_so: paths.cutlass_so,
+            fa3_so: paths.fa3_so,
+            policy_json: paths.policy_json,
+        };
+        let _g4 = Gemma4Bringup::load(g4_paths, arena_bytes)
+            .map_err(|e| format!("gemma4 bringup: {e}"))?;
+        return Err(
+            "Gemma 4 eval still needs the Gemma4 forward/generation path; this binary no longer falls back to the generic engine".into(),
+        );
+    }
+
     let br = Bringup::load(paths, arena_bytes).map_err(|e| format!("bringup: {e}"))?;
     eprintln!("bringup: {:.2}s", t0.elapsed().as_secs_f64());
 
@@ -257,6 +283,10 @@ unsafe fn generate(
         fused_add_rmsnorm: br.fused_modules.fn_add_rmsnorm,
         fused_rope_cache_fp8kv: br.fused_modules.fn_rope_cache_fp8kv,
         fused_silu_mul: br.fused_modules.fn_silu_mul,
+        fused_gelu_mul: br.fused_modules.fn_gelu_mul,
+        mlp_activation: layer_exec::MlpActivation::from_config_str(
+            br.arch.hidden_activation.as_deref(),
+        ),
         quantize_fp8_per_token: br.fused_modules.fn_quantize,
         add_bias_f16: br.fused_modules.fn_add_bias_f16,
     };

@@ -25,22 +25,34 @@ Architecture: `Gemma4ForConditionalGeneration` (multimodal, text decoder only)
 | tie_word_embeddings | true |
 | attention_k_eq_v | true (global layers) |
 
-## Critical finding: weight shapes are UNIFORM across layers
+## CORRECTED: weight shapes DIFFER between sliding and global layers
 
-Both sliding (layer 0) and global (layer 5) have identical tensor shapes:
+Verified from actual google/gemma-4-31B-it safetensors (2026-04-18):
+
+Sliding layers (0,1,2,3,4, 6,7,8,9,10, ...):
 ```
-q_proj:    [8192, 5376]   = 32*256 = 16*512
-k_proj:    [4096, 5376]   = 16*256 = 8*512
-v_proj:    [4096, 5376]   = 16*256 = 8*512
+q_proj:    [8192, 5376]   = 32 heads * 256 dim
+k_proj:    [4096, 5376]   = 16 KV heads * 256 dim
+v_proj:    [4096, 5376]   = 16 KV heads * 256 dim
 o_proj:    [5376, 8192]
 q_norm:    [256]
 k_norm:    [256]
-layer_scalar: [1]          (per-layer residual multiplier)
+layer_scalar: [1]
 ```
 
-The dual head_dim (256 vs 512) is a RUNTIME RESHAPE, not a weight
-difference. Global layers reinterpret the same weight matrices as
-fewer, wider heads: 32x256 -> 16x512 for Q, 16x256 -> 8x512 for KV.
+Global layers (5, 11, 17, 23, ...):
+```
+q_proj:    [16384, 5376]  = 32 heads * 512 dim
+k_proj:    [2048, 5376]   = 4 KV heads * 512 dim
+v_proj:    DOES NOT EXIST  (attention_k_eq_v: V = K)
+o_proj:    [5376, 16384]
+q_norm:    [512]
+k_norm:    [512]
+layer_scalar: [1]
+```
+
+FFN weights (gate_proj, up_proj, down_proj) are identical across all layers.
+Cannot use a single scan body -- must separate sliding and global paths.
 
 ## Architecture delta vs Llama/Qwen baseline
 

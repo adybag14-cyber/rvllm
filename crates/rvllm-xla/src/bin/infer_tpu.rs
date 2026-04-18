@@ -369,8 +369,8 @@ mod tpu_main {
         };
 
         // RoPE cos/sin [max_pos, head_dim/2] f32
-        let rope_cos = precompute_rope_cos(client, 10000.0);
-        let rope_sin = precompute_rope_sin(client, 10000.0);
+        let rope_cos = precompute_rope_cos(client, 500000.0);
+        let rope_sin = precompute_rope_sin(client, 500000.0);
 
         // Stack per-layer weights into [NUM_LAYERS, ...] tensors for scan
         let qkv_dim = NUM_HEADS * HEAD_DIM + 2 * NUM_KV_HEADS * HEAD_DIM;

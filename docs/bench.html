@@ -67,8 +67,8 @@ td.pending{color:#b6a1e5;font-style:italic}
 <div class="wrap">
 
 <header>
-  <h1>rvLLM 0.3.0 &mdash; benchmark results</h1>
-  <div class="sub">Multi-model FP8 inference on H100 SXM 80GB. rvLLM 0.3.0 (Rust) vs vLLM 0.19 V1 (Python). Models: OPT-1.3B, Mistral-7B, Qwen3-8B, Qwen2.5-7B &mdash; all FP8 dynamic quant, 16 in / 512 out tokens.</div>
+  <h1>rvLLM 0.3.1 &mdash; benchmark results</h1>
+  <div class="sub">FP8 inference engine in Rust+CUDA. Single H100 SXM 80GB. Now running <strong>Gemma 4 31B</strong> (60 layers, hybrid sliding/global attention, GELU, QK-norm, dual RoPE, logit softcap) alongside Qwen3-8B, Mistral-7B, and Llama 3.1 8B.</div>
   <div class="meta">
     <a href="index.html">site</a>
     <a href="https://github.com/m0at/rvllm">github</a>
@@ -78,9 +78,14 @@ td.pending{color:#b6a1e5;font-style:italic}
 
 <div class="pill-row">
   <div class="pill">
-    <div class="label">peak tok/s (N=512)</div>
-    <strong>43,780</strong>
-    <div class="caption">rvLLM 0.3.1 &mdash; +39% vs vLLM 0.19</div>
+    <div class="label">Gemma 4 31B FP8</div>
+    <strong>11.2 tok/s</strong>
+    <div class="caption">31B params, single H100, batch=1</div>
+  </div>
+  <div class="pill">
+    <div class="label">Mistral-7B peak (N=512)</div>
+    <strong>33,904</strong>
+    <div class="caption">+20% vs vLLM 0.19</div>
   </div>
   <div class="pill">
     <div class="label">hot TTFT @ N=128</div>

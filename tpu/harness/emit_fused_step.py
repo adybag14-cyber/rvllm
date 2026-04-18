@@ -34,11 +34,12 @@ def rms_norm(x, g, eps=1e-6):
 
 
 def rope(x, cos, sin):
-    x0, x1 = x[..., 0::2], x[..., 1::2]
-    return jnp.stack([
+    half = x.shape[-1] // 2
+    x0, x1 = x[..., :half], x[..., half:]
+    return jnp.concatenate([
         x0 * cos.astype(x.dtype) - x1 * sin.astype(x.dtype),
         x0 * sin.astype(x.dtype) + x1 * cos.astype(x.dtype),
-    ], axis=-1).reshape(x.shape)
+    ], axis=-1)
 
 
 def one_layer(carry, layer_params):
