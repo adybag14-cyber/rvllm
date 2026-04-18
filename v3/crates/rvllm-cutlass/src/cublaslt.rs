@@ -88,7 +88,26 @@ impl CublasLt {
         b_scale: u64,
         stream: u64,
     ) -> Result<()> {
-        self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_f16, m, n, k, a_scale, b_scale, stream, false)
+        self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_f16, m, n, k, a_scale, b_scale, stream, false, false)
+    }
+
+    /// Plain FP8 E4M3 matmul with bf16 output: D_bf16 = A * B^T.
+    /// Avoids f16 overflow for large K dimensions.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fp8_gemm_bf16(
+        &self,
+        a_fp8: u64,
+        b_fp8: u64,
+        d_bf16: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        a_scale: u64,
+        b_scale: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_bf16, m, n, k, a_scale, b_scale, stream, false, true)
     }
 
     /// FP8 matmul with row-broadcast f16 bias epilogue.
@@ -108,7 +127,7 @@ impl CublasLt {
         stream: u64,
     ) -> Result<()> {
         self.fp8_gemm_inner(
-            a_fp8, b_fp8, bias_f16, 0, d_f16, m, n, k, a_scale, b_scale, stream, false,
+            a_fp8, b_fp8, bias_f16, 0, d_f16, m, n, k, a_scale, b_scale, stream, false, false,
         )
     }
 
@@ -130,7 +149,7 @@ impl CublasLt {
         stream: u64,
     ) -> Result<()> {
         self.fp8_gemm_inner(
-            a_fp8, b_fp8, 0, residual_f16, d_f16, m, n, k, a_scale, b_scale, stream, true,
+            a_fp8, b_fp8, 0, residual_f16, d_f16, m, n, k, a_scale, b_scale, stream, true, false,
         )
     }
 
@@ -153,6 +172,7 @@ impl CublasLt {
         b_scale: u64,
         stream: u64,
         beta_one: bool,
+        d_bf16: bool,
     ) -> Result<()> {
         let mut desc: lt::cublasLtMatmulDesc_t = std::ptr::null_mut();
         let rc = lt::cublasLtMatmulDescCreate(
@@ -232,9 +252,14 @@ impl CublasLt {
         if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
             return Err(cublaslt_err("layout B"));
         }
+        let d_type = if d_bf16 {
+            lt::cudaDataType_t::CUDA_R_16BF
+        } else {
+            lt::cudaDataType_t::CUDA_R_16F
+        };
         let r = lt::cublasLtMatrixLayoutCreate(
             &mut layout_d,
-            lt::cudaDataType_t::CUDA_R_16F,
+            d_type,
             n as u64,
             m as u64,
             n as i64,
@@ -252,12 +277,12 @@ impl CublasLt {
             m,
             n,
             k,
-            kind: if bias_f16 != 0 {
-                1
-            } else if beta_one {
-                2
-            } else {
-                0
+            kind: match (bias_f16 != 0, beta_one, d_bf16) {
+                (true, _, _) => 1,
+                (_, true, false) => 2,
+                (_, true, true) => 5,
+                (_, _, true) => 4,
+                _ => 0,
             },
         };
         let cached_algo = self

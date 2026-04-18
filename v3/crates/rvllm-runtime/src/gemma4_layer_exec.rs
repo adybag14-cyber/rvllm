@@ -133,6 +133,7 @@ pub struct Gemma4LayerKernels {
     pub residual_scale_f16: KernelFn,
     pub vnorm_f16: KernelFn,
     pub vector_add_f16: KernelFn,
+    pub bf16_to_f16_sat: KernelFn,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -347,9 +348,9 @@ pub unsafe fn gemma4_forward(
         stream,
     )?;
 
-    // 7. O proj -> delta buffer (NOT residual)
+    // 7. O proj -> delta buffer (bf16 output, then convert to f16 with saturation)
     #[cfg(feature = "cuda")]
-    cublaslt.fp8_gemm(
+    cublaslt.fp8_gemm_bf16(
         scratch.attn_out_fp8,
         weights.o_fp8,
         scratch.delta_f16,
@@ -360,6 +361,9 @@ pub unsafe fn gemma4_forward(
         weights.o_scale,
         stream,
     )?;
+    #[cfg(feature = "cuda")]
+    gemma4_launcher::Bf16ToF16SatLaunch { n: dims.num_tokens * dims.hidden }
+        .launch(kernels.bf16_to_f16_sat, scratch.delta_f16, scratch.delta_f16, stream)?;
 
     // 8. post_attention_layernorm on the DELTA (not residual).
     // HF: hidden_states = post_attn_norm(attn_output); residual += hidden_states
@@ -437,9 +441,9 @@ pub unsafe fn gemma4_forward(
     #[cfg(feature = "cuda")]
     probe_f32!("step11_mlp_out_scale", scratch.mlp_out_scale);
 
-    // 12. Down proj -> delta buffer (NOT residual)
+    // 12. Down proj -> delta buffer (bf16 output, then convert to f16 with saturation)
     #[cfg(feature = "cuda")]
-    cublaslt.fp8_gemm(
+    cublaslt.fp8_gemm_bf16(
         scratch.mlp_out_fp8,
         weights.down_fp8,
         scratch.delta_f16,
@@ -450,6 +454,9 @@ pub unsafe fn gemma4_forward(
         weights.down_scale,
         stream,
     )?;
+    #[cfg(feature = "cuda")]
+    gemma4_launcher::Bf16ToF16SatLaunch { n: dims.num_tokens * dims.hidden }
+        .launch(kernels.bf16_to_f16_sat, scratch.delta_f16, scratch.delta_f16, stream)?;
 
     #[cfg(feature = "cuda")]
     probe!("step12_delta_f16", scratch.delta_f16, dims.hidden);

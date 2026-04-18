@@ -423,6 +423,36 @@ impl VectorAddF16Launch {
 }
 
 // ---------------------------------------------------------------------------
+// bf16_to_f16_sat (bf16 -> f16 with saturation clamp)
+// ---------------------------------------------------------------------------
+
+pub struct Bf16ToF16SatLaunch {
+    pub n: u32,
+}
+
+impl Bf16ToF16SatLaunch {
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        dst: u64,
+        src: u64,
+        stream: u64,
+    ) -> Result<()> {
+        let mut dst = dst;
+        let mut src = src;
+        let mut n = self.n as i32;
+        let args = [
+            (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+            (&mut src) as *mut u64 as *mut core::ffi::c_void,
+            (&mut n) as *mut i32 as *mut core::ffi::c_void,
+        ];
+        let block = (256u32, 1, 1);
+        let grid = ((self.n + 255) / 256, 1, 1);
+        launch_raw(kernel, grid, block, 0, stream, &args)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // logit_softcap
 // ---------------------------------------------------------------------------
 

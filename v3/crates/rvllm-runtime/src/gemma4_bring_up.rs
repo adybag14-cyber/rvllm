@@ -40,6 +40,7 @@ pub struct Gemma4FusedModules {
     pub residual_scale_mod: LoadedModule,
     pub vnorm_mod: LoadedModule,
     pub vector_add_mod: LoadedModule,
+    pub bf16_to_f16_sat_mod: LoadedModule,
     pub fn_rmsnorm: KernelFn,
     pub fn_rmsnorm_fp8_quant: KernelFn,
     pub fn_quantize: KernelFn,
@@ -51,6 +52,7 @@ pub struct Gemma4FusedModules {
     pub fn_residual_scale: KernelFn,
     pub fn_vnorm: KernelFn,
     pub fn_vector_add: KernelFn,
+    pub fn_bf16_to_f16_sat: KernelFn,
 }
 
 pub struct Gemma4Bringup {
@@ -789,6 +791,7 @@ impl Gemma4Bringup {
             residual_scale_f16: self.fused.fn_residual_scale,
             vnorm_f16: self.fused.fn_vnorm,
             vector_add_f16: self.fused.fn_vector_add,
+            bf16_to_f16_sat: self.fused.fn_bf16_to_f16_sat,
         }
     }
 }
@@ -807,6 +810,7 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
     let residual_scale_mod = loader.load_ptx("residual_scale_f16")?;
     let vnorm_mod = loader.load_ptx("vnorm_f16")?;
     let vector_add_mod = loader.load_ptx("vector_add_f16")?;
+    let bf16_to_f16_sat_mod = loader.load_ptx("bf16_to_f16_sat")?;
 
     let rmsnorm_inplace_mod = loader.load_ptx("rmsnorm_inplace_f16")?;
     let fn_rmsnorm = rmsnorm_inplace_mod.get_function("rmsnorm_inplace_f16_kernel")?;
@@ -824,6 +828,7 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
         residual_scale_mod.get_function("residual_scale_f16_kernel")?;
     let fn_vnorm = vnorm_mod.get_function("vnorm_f16_kernel")?;
     let fn_vector_add = vector_add_mod.get_function("vector_add_f16_kernel")?;
+    let fn_bf16_to_f16_sat = bf16_to_f16_sat_mod.get_function("bf16_to_f16_sat_kernel")?;
 
     Ok(Gemma4FusedModules {
         rmsnorm_mod,
@@ -836,6 +841,7 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
         residual_scale_mod,
         vnorm_mod,
         vector_add_mod,
+        bf16_to_f16_sat_mod,
         fn_rmsnorm,
         fn_rmsnorm_fp8_quant,
         fn_quantize,
@@ -847,5 +853,6 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
         fn_residual_scale,
         fn_vnorm,
         fn_vector_add,
+        fn_bf16_to_f16_sat,
     })
 }
