@@ -27,8 +27,14 @@ libloading = { version = "0.8", optional = true }
 clap.workspace = true
 rand.workspace = true
 serde_json.workspace = true
+memmap2 = "0.9"
 
 [[bin]]
 name = "bench-pjrt"
 path = "src/bin/bench_pjrt.rs"
+required-features = ["tpu"]
+
+[[bin]]
+name = "infer-tpu"
+path = "src/bin/infer_tpu.rs"
 required-features = ["tpu"]

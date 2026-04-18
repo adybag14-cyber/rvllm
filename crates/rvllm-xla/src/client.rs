@@ -248,17 +248,13 @@ impl PjrtClientHandle {
                 _layout: ptr::null_mut(),
                 done_with_host_buffer: ptr::null_mut(),
             };
-            eprintln!("    PJRT_BufferFromHost: struct_size={}, data_len={}, dtype={:?}, ndims={}, device={:?}",
-                args.struct_size, data.len(), dtype, shape.len(), args.device);
             let err = (self.inner.fns.client_buffer_from_host)(&mut args);
-            eprintln!("    PJRT_BufferFromHost returned, err={:?}", err);
             if !err.is_null() {
                 let msg = extract_error_message(&self.inner.fns, err);
                 return Err(LLMError::GpuError(format!(
                     "PJRT_Client_BufferFromHostBuffer failed: {msg}"
                 )));
             }
-            eprintln!("    buffer={:?} event={:?}", args.buffer, args.done_with_host_buffer);
             if args.buffer.is_null() {
                 return Err(LLMError::GpuError(
                     "PJRT_Client_BufferFromHostBuffer returned null buffer".into(),
@@ -296,13 +292,21 @@ impl PjrtClientHandle {
         let exec_options = PJRT_ExecuteOptions {
             struct_size: std::mem::size_of::<PJRT_ExecuteOptions>(),
             extension_start: ptr::null_mut(),
+            send_callbacks: ptr::null(),
+            recv_callbacks: ptr::null(),
+            num_send_ops: 0,
+            num_recv_ops: 0,
             launch_id: 0,
             non_donatable_input_indices: ptr::null(),
             num_non_donatable_input_indices: 0,
+            context: ptr::null(),
+            call_location: ptr::null(),
+            num_tasks: 0,
+            task_ids: ptr::null(),
+            incarnation_ids: ptr::null(),
         };
 
-        let num_outputs = unsafe {
-            let mut output_size: usize = 0;
+        unsafe {
             let mut args = PJRT_LoadedExecutable_Execute_Args {
                 struct_size: std::mem::size_of::<PJRT_LoadedExecutable_Execute_Args>(),
                 extension_start: ptr::null_mut(),
@@ -312,22 +316,20 @@ impl PjrtClientHandle {
                 num_devices: 1,
                 num_args: input_ptrs.len(),
                 output_lists: &mut output_list as *const *mut *mut PjrtBuffer,
-                output_sizes: &mut output_size,
                 device_complete_events: ptr::null_mut(),
                 execute_device: ptr::null_mut(),
             };
-            eprintln!("    Execute: struct_size={}, exe={:?}, num_args={}, num_devices={}",
-                args.struct_size, exe.raw, input_ptrs.len(), args.num_devices);
             let err = (self.inner.fns.loaded_executable_execute)(&mut args);
-            eprintln!("    Execute returned, err={:?}", err);
             if !err.is_null() {
                 let msg = extract_error_message(&self.inner.fns, err);
                 return Err(LLMError::GpuError(format!(
                     "PJRT_LoadedExecutable_Execute failed: {msg}"
                 )));
             }
-            output_size
         };
+
+        // Count non-null output buffers (output_sizes removed in newer API)
+        let num_outputs = output_ptrs.iter().take_while(|p| !p.is_null()).count();
 
         let results: Vec<PjrtBufferHandle> = output_ptrs[..num_outputs]
             .iter()

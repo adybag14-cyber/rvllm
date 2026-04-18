@@ -3262,6 +3262,7 @@ dependencies = [
  "clap",
  "half",
  "libloading 0.8.9",
+ "memmap2",
  "rand 0.8.5",
  "rvllm-core",
  "serde_json",

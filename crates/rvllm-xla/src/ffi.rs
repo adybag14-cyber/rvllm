@@ -9,6 +9,7 @@ pub type PjrtEvent = c_void;
 pub type PjrtDevice = c_void;
 pub type PjrtError = c_void;
 
+// Values must match PJRT_Buffer_Type in pjrt_c_api.h (PJRT API v0.103+)
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PjrtElementType {
@@ -25,11 +26,11 @@ pub enum PjrtElementType {
     F16 = 10,
     F32 = 11,
     F64 = 12,
-    BF16 = 16,
-    C64 = 15,
-    C128 = 18,
-    F8E5M2 = 19,
-    F8E4M3FN = 20,
+    BF16 = 13,
+    C64 = 14,
+    C128 = 15,
+    F8E5M2 = 16,
+    F8E4M3FN = 17,
 }
 
 #[repr(C)]
@@ -128,12 +129,13 @@ pub struct PJRT_Client_BufferFromHostBuffer_Args {
     pub device: *mut PjrtDevice,
     pub memory: *mut c_void,
     pub _layout: *mut c_void,
-    pub buffer: *mut PjrtBuffer,
     pub done_with_host_buffer: *mut PjrtEvent,
+    pub buffer: *mut PjrtBuffer,
 }
 
 // --- PJRT_LoadedExecutable_Execute ---
 
+// Layout matches pjrt_c_api.h PJRT_LoadedExecutable_Execute_Args
 #[repr(C)]
 pub struct PJRT_LoadedExecutable_Execute_Args {
     pub struct_size: usize,
@@ -144,18 +146,29 @@ pub struct PJRT_LoadedExecutable_Execute_Args {
     pub num_devices: usize,
     pub num_args: usize,
     pub output_lists: *const *mut *mut PjrtBuffer,
-    pub output_sizes: *mut usize,
     pub device_complete_events: *mut *mut PjrtEvent,
     pub execute_device: *mut PjrtDevice,
 }
 
+// Layout matches pjrt_c_api.h PJRT_ExecuteOptions (PJRT API v0.103)
+// All fields are 8-byte aligned; total must be exactly 112 bytes (14 * 8).
 #[repr(C)]
 pub struct PJRT_ExecuteOptions {
-    pub struct_size: usize,
-    pub extension_start: *mut c_void,
-    pub launch_id: i32,
-    pub non_donatable_input_indices: *const i64,
-    pub num_non_donatable_input_indices: usize,
+    pub struct_size: usize,                     // 0
+    pub extension_start: *mut c_void,           // 8
+    pub send_callbacks: *const c_void,          // 16  PJRT_SendCallbackInfo**
+    pub recv_callbacks: *const c_void,          // 24  PJRT_RecvCallbackInfo**
+    pub num_send_ops: usize,                    // 32
+    pub num_recv_ops: usize,                    // 40
+    pub launch_id: i64,                         // 48  widened to i64 for alignment
+    pub non_donatable_input_indices: *const i64, // 56
+    pub num_non_donatable_input_indices: usize, // 64
+    pub context: *const c_void,                 // 72  PJRT_ExecuteContext*
+    pub call_location: *const u8,               // 80  const char*
+    pub num_tasks: usize,                       // 88
+    pub task_ids: *const i32,                   // 96
+    pub incarnation_ids: *const i64,            // 104
+    // total = 112
 }
 
 // --- PJRT_Buffer_ToHostBuffer ---

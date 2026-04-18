@@ -1,0 +1,385 @@
+//! Gemma 4 layer forward -- 16 kernel launches per layer.
+//!
+//! Differs from the Llama/Qwen path (layer_exec.rs) in:
+//!   - 4 norms per layer (input, post_attn, pre_ff, post_ff)
+//!   - QK-norm (RMSNorm on Q and K heads before RoPE)
+//!   - GELU(tanh) activation instead of SiLU
+//!   - Partial RoPE (only rotate first rotary_dim dims per head)
+//!   - Per-layer KV head count (sliding vs global)
+//!   - head_dim = 256 (requires FA3 .so compiled for 256)
+//!   - Post-feedforward residual scaling (no learnable scalar yet,
+//!     but the norm structure matches Gemma 3/4)
+//!
+//! Launch sequence:
+//!   1.  fused_rmsnorm_fp8_quant          input_layernorm
+//!   2.  fp8_gemm (cuBLASLt)             Q||K||V projection
+//!   3.  fused_qk_rmsnorm                QK-norm on Q and K heads
+//!   4.  fused_rope_partial_fp8kv        partial RoPE + FP8 Q + paged KV
+//!   5.  paged_decode / paged_prefill    FA3 attention (head_dim=256)
+//!   6.  quantize_fp8_per_token          attn_out -> fp8
+//!   7.  fp8_gemm_residual (cuBLASLt)    O proj += residual
+//!   8.  fused_rmsnorm                   post_attention_layernorm (norm only)
+//!   9.  fused_rmsnorm_fp8_quant         pre_feedforward_layernorm
+//!  10.  fp8_gemm (cuBLASLt)             gate||up projection
+//!  11.  fused_gelu_mul_fp8_quant        GELU(tanh)(gate) * up -> FP8
+//!  12.  fp8_gemm_residual (cuBLASLt)    down proj += residual
+//!  13.  fused_rmsnorm                   post_feedforward_layernorm (norm only)
+
+use rvllm_core::Result;
+use rvllm_cutlass::CublasLt;
+use rvllm_fused::FusedRmsnormFp8QuantLaunch;
+use rvllm_fused::gemma4_launcher;
+use rvllm_kernels::KernelFn;
+
+use rvllm_attention::{
+    Fa3Kernels, PagedDecodeFp8Launcher, PagedDecodeParams,
+};
+
+use rvllm_loader::gemma4_arch::Gemma4LayerType;
+
+#[derive(Copy, Clone, Debug)]
+pub struct Gemma4LayerDims {
+    pub num_tokens: u32,
+    pub hidden: u32,
+    pub num_heads: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub rotary_dim: u32,
+    pub intermediate: u32,
+    pub block_size: u32,
+    pub max_blocks_per_seq: u32,
+    pub num_blocks_total: u32,
+    pub attn_scale: f32,
+    pub rms_eps: f32,
+    pub layer_type: Gemma4LayerType,
+    pub sliding_window: u32,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct Gemma4LayerWeightPtrs {
+    pub attn_norm_gamma: u64,
+    pub post_attn_norm_gamma: u64,
+    pub pre_ff_norm_gamma: u64,
+    pub post_ff_norm_gamma: u64,
+    pub q_norm_gamma: u64,
+    pub k_norm_gamma: u64,
+    pub qkv_fp8: u64,
+    pub qkv_scale: u64,
+    pub o_fp8: u64,
+    pub o_scale: u64,
+    pub gate_up_fp8: u64,
+    pub gate_up_scale: u64,
+    pub down_fp8: u64,
+    pub down_scale: u64,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct Gemma4LayerScratch {
+    pub hidden_fp8: u64,
+    pub hidden_scale: u64,
+    pub q_out: u64,
+    pub k_out: u64,
+    pub v_out: u64,
+    pub q_normed: u64,
+    pub k_normed: u64,
+    pub q_fp8: u64,
+    pub k_cache: u64,
+    pub v_cache: u64,
+    pub q_scale_ptr: u64,
+    pub kv_scale_ptr: u64,
+    pub attn_out: u64,
+    pub attn_out_fp8: u64,
+    pub attn_out_scale: u64,
+    pub post_attn_normed: u64,
+    pub gate_up_out: u64,
+    pub gate_up_fp8: u64,
+    pub gate_up_scale: u64,
+    pub mlp_out_fp8: u64,
+    pub mlp_out_scale: u64,
+    pub fa3_workspace: u64,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct Gemma4MetadataPtrs {
+    pub positions: u64,
+    pub slot_mapping: u64,
+    pub cos: u64,
+    pub sin: u64,
+    pub block_tables: u64,
+    pub context_lens: u64,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct Gemma4LayerKernels {
+    pub fused_rmsnorm: KernelFn,
+    pub fused_rmsnorm_fp8_quant: KernelFn,
+    pub fused_qk_rmsnorm: KernelFn,
+    pub fused_rope_partial_fp8kv: KernelFn,
+    pub fused_gelu_mul: KernelFn,
+    pub quantize_fp8_per_token: KernelFn,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemma4_forward(
+    dims: Gemma4LayerDims,
+    kernels: &Gemma4LayerKernels,
+    weights: &Gemma4LayerWeightPtrs,
+    scratch: &Gemma4LayerScratch,
+    meta: &Gemma4MetadataPtrs,
+    cublaslt: &CublasLt,
+    fa3: &Fa3Kernels,
+    residual: u64,
+    stream: u64,
+) -> Result<()> {
+    let q_dim = dims.num_heads * dims.head_dim;
+    let kv_dim = dims.num_kv_heads * dims.head_dim;
+    let qkv_rows = (dims.num_heads + 2 * dims.num_kv_heads) * dims.head_dim;
+
+    // 1. input_layernorm -> FP8 quant
+    FusedRmsnormFp8QuantLaunch {
+        num_tokens: dims.num_tokens,
+        hidden: dims.hidden,
+        eps: dims.rms_eps,
+    }
+    .launch(
+        kernels.fused_rmsnorm_fp8_quant,
+        scratch.hidden_fp8,
+        scratch.hidden_scale,
+        residual,
+        weights.attn_norm_gamma,
+        stream,
+    )?;
+
+    // 2. Q||K||V projection (cuBLASLt FP8 GEMM)
+    #[cfg(feature = "cuda")]
+    cublaslt.fp8_gemm(
+        scratch.hidden_fp8,
+        weights.qkv_fp8,
+        scratch.q_out,
+        dims.num_tokens as i32,
+        qkv_rows as i32,
+        dims.hidden as i32,
+        scratch.hidden_scale,
+        weights.qkv_scale,
+        stream,
+    )?;
+
+    // 3. QK-norm: RMSNorm on each Q head and each K head independently.
+    // Input: q_out [num_tokens, num_heads, head_dim], k_out [num_tokens, num_kv_heads, head_dim]
+    // q_norm_gamma, k_norm_gamma are [head_dim] vectors.
+    // Output: q_normed, k_normed (f16, same shape)
+    gemma4_launcher::FusedQkRmsnormLaunch {
+        num_tokens: dims.num_tokens,
+        num_heads: dims.num_heads,
+        num_kv_heads: dims.num_kv_heads,
+        head_dim: dims.head_dim,
+        eps: dims.rms_eps,
+    }
+    .launch(
+        kernels.fused_qk_rmsnorm,
+        scratch.q_out,
+        scratch.k_out,
+        scratch.q_normed,
+        scratch.k_normed,
+        weights.q_norm_gamma,
+        weights.k_norm_gamma,
+        stream,
+    )?;
+
+    // 4. Partial RoPE + FP8 quantize Q + paged KV cache write
+    // Only the first `rotary_dim` elements of each head get rotation;
+    // the rest pass through unchanged.
+    gemma4_launcher::FusedRopePartialFp8KvLaunch {
+        num_tokens: dims.num_tokens,
+        num_heads: dims.num_heads,
+        num_kv_heads: dims.num_kv_heads,
+        head_dim: dims.head_dim,
+        rotary_dim: dims.rotary_dim,
+    }
+    .launch(
+        kernels.fused_rope_partial_fp8kv,
+        scratch.q_normed,
+        scratch.k_normed,
+        scratch.v_out,
+        scratch.q_fp8,
+        scratch.k_cache,
+        scratch.v_cache,
+        meta.cos,
+        meta.sin,
+        meta.positions,
+        meta.slot_mapping,
+        scratch.q_scale_ptr,
+        scratch.kv_scale_ptr,
+        stream,
+    )?;
+
+    // 5. FA3 attention (head_dim=256)
+    // For sliding layers: context_lens should be clamped to
+    // min(real_ctx, sliding_window) by the scheduler before this call.
+    let decode = PagedDecodeFp8Launcher::new(fa3);
+    let decode_params = PagedDecodeParams {
+        num_seqs: dims.num_tokens,
+        num_heads: dims.num_heads,
+        num_kv_heads: dims.num_kv_heads,
+        head_dim: dims.head_dim,
+        block_size: dims.block_size,
+        max_blocks_per_seq: dims.max_blocks_per_seq,
+        num_blocks_total: dims.num_blocks_total,
+        scale: dims.attn_scale,
+    };
+    decode.launch(
+        decode_params,
+        scratch.attn_out,
+        scratch.q_fp8,
+        scratch.k_cache,
+        scratch.v_cache,
+        meta.block_tables,
+        meta.context_lens,
+        scratch.fa3_workspace,
+        scratch.q_scale_ptr,
+        scratch.kv_scale_ptr,
+        scratch.kv_scale_ptr,
+        stream,
+    )?;
+
+    // 6. quantize attn_out -> fp8 per-token
+    rvllm_fused::QuantizeFp8PerTokenLaunch {
+        num_tokens: dims.num_tokens,
+        dim: q_dim,
+    }
+    .launch(
+        kernels.quantize_fp8_per_token,
+        scratch.attn_out_fp8,
+        scratch.attn_out_scale,
+        scratch.attn_out,
+        stream,
+    )?;
+
+    // 7. O proj with residual epilogue
+    #[cfg(feature = "cuda")]
+    cublaslt.fp8_gemm_residual(
+        scratch.attn_out_fp8,
+        weights.o_fp8,
+        residual,
+        residual,
+        dims.num_tokens as i32,
+        dims.hidden as i32,
+        q_dim as i32,
+        scratch.attn_out_scale,
+        weights.o_scale,
+        stream,
+    )?;
+
+    // 8. post_attention_layernorm (norm-only, applied to residual in-place
+    //    for Gemma's pre-post norm structure). This is a norm without FP8
+    //    quant -- it feeds into the pre_feedforward_layernorm which does quant.
+    // For Gemma 3/4, the post-attention and post-feedforward norms are
+    // applied to the residual as: residual = post_norm(residual) before
+    // the next sub-block's pre-norm. We implement this as:
+    //   normed = rmsnorm(residual, post_attn_gamma)
+    //   then the pre_ff norm quantizes it to FP8.
+    // The "normed" intermediate is stored in post_attn_normed scratch.
+    gemma4_launcher::RmsnormInplaceLaunch {
+        num_tokens: dims.num_tokens,
+        hidden: dims.hidden,
+        eps: dims.rms_eps,
+    }
+    .launch(
+        kernels.fused_rmsnorm,
+        residual,
+        weights.post_attn_norm_gamma,
+        stream,
+    )?;
+
+    // 9. pre_feedforward_layernorm -> FP8 quant
+    FusedRmsnormFp8QuantLaunch {
+        num_tokens: dims.num_tokens,
+        hidden: dims.hidden,
+        eps: dims.rms_eps,
+    }
+    .launch(
+        kernels.fused_rmsnorm_fp8_quant,
+        scratch.hidden_fp8,
+        scratch.hidden_scale,
+        residual,
+        weights.pre_ff_norm_gamma,
+        stream,
+    )?;
+
+    // 10. gate||up projection
+    #[cfg(feature = "cuda")]
+    cublaslt.fp8_gemm(
+        scratch.hidden_fp8,
+        weights.gate_up_fp8,
+        scratch.gate_up_out,
+        dims.num_tokens as i32,
+        (2 * dims.intermediate) as i32,
+        dims.hidden as i32,
+        scratch.hidden_scale,
+        weights.gate_up_scale,
+        stream,
+    )?;
+
+    // 11. GELU(tanh)(gate) * up -> FP8
+    gemma4_launcher::FusedGeluMulFp8QuantLaunch {
+        num_tokens: dims.num_tokens,
+        intermediate: dims.intermediate,
+    }
+    .launch(
+        kernels.fused_gelu_mul,
+        scratch.mlp_out_fp8,
+        scratch.mlp_out_scale,
+        scratch.gate_up_out,
+        stream,
+    )?;
+
+    // 12. Down proj with residual epilogue
+    #[cfg(feature = "cuda")]
+    cublaslt.fp8_gemm_residual(
+        scratch.mlp_out_fp8,
+        weights.down_fp8,
+        residual,
+        residual,
+        dims.num_tokens as i32,
+        dims.hidden as i32,
+        dims.intermediate as i32,
+        scratch.mlp_out_scale,
+        weights.down_scale,
+        stream,
+    )?;
+
+    // 13. post_feedforward_layernorm (norm-only, in-place on residual)
+    gemma4_launcher::RmsnormInplaceLaunch {
+        num_tokens: dims.num_tokens,
+        hidden: dims.hidden,
+        eps: dims.rms_eps,
+    }
+    .launch(
+        kernels.fused_rmsnorm,
+        residual,
+        weights.post_ff_norm_gamma,
+        stream,
+    )?;
+
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (cublaslt, qkv_rows, kv_dim);
+    }
+    Ok(())
+}
+
+pub unsafe fn logit_softcap(
+    kernel: KernelFn,
+    logits_ptr: u64,
+    num_tokens: u32,
+    vocab: u32,
+    cap: f32,
+    stream: u64,
+) -> Result<()> {
+    gemma4_launcher::LogitSoftcapLaunch {
+        num_tokens,
+        vocab,
+        cap,
+    }
+    .launch(kernel, logits_ptr, stream)
+}

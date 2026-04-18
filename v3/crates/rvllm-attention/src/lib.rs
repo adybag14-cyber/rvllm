@@ -172,45 +172,32 @@ impl Fa3Kernels {
                     },
                     bt: std::backtrace::Backtrace::capture(),
                 })?;
+                // Try SM90 (FA3 Hopper) symbols first, then SM89 (Ada).
+                let is_sm89 = _lib.get::<WorkspaceSizeFn>(b"fa3_sm90_workspace_size\0").is_err()
+                    && _lib.get::<WorkspaceSizeFn>(b"fa_sm89_workspace_size\0").is_ok();
+                if is_sm89 {
+                    eprintln!("[rvllm-attention] using SM89 (Ada) attention backend");
+                }
+                let (ws_name, dec_name, fp8_name, prefill_name): (&[u8], &[u8], &[u8], &[u8]) = if is_sm89 {
+                    (b"fa_sm89_workspace_size\0", b"fa_sm89_paged_decode\0",
+                     b"fa_sm89_paged_decode_fp8\0", b"fa_sm89_paged_prefill_fp8\0")
+                } else {
+                    (b"fa3_sm90_workspace_size\0", b"fa3_sm90_paged_decode\0",
+                     b"fa3_sm90_paged_decode_fp8\0", b"fa3_sm90_paged_prefill_fp8\0")
+                };
+                let sym_err = |name: &'static str| RvllmError::Attention {
+                    err: AttentionError::Fa3SoMissing { path: path.clone() },
+                    ctx: AttnCtx { op: name, stream: 0, num_seqs: 0, head_dim },
+                    bt: std::backtrace::Backtrace::capture(),
+                };
                 let ws_sym: libloading::Symbol<WorkspaceSizeFn> = _lib
-                    .get(b"fa3_sm90_workspace_size\0")
-                    .map_err(|_e| RvllmError::Attention {
-                        err: AttentionError::Fa3SoMissing { path: path.clone() },
-                        ctx: AttnCtx {
-                            op: "dlsym:fa3_sm90_workspace_size",
-                            stream: 0,
-                            num_seqs: 0,
-                            head_dim,
-                        },
-                        bt: std::backtrace::Backtrace::capture(),
-                    })?;
+                    .get(ws_name).map_err(|_| sym_err("dlsym:workspace_size"))?;
                 let dec_sym: libloading::Symbol<PagedDecodeFn> = _lib
-                    .get(b"fa3_sm90_paged_decode\0")
-                    .map_err(|_e| RvllmError::Attention {
-                        err: AttentionError::Fa3SoMissing { path: path.clone() },
-                        ctx: AttnCtx {
-                            op: "dlsym:fa3_sm90_paged_decode",
-                            stream: 0,
-                            num_seqs: 0,
-                            head_dim,
-                        },
-                        bt: std::backtrace::Backtrace::capture(),
-                    })?;
+                    .get(dec_name).map_err(|_| sym_err("dlsym:paged_decode"))?;
                 let dec_fp8_sym: libloading::Symbol<PagedDecodeFp8Fn> = _lib
-                    .get(b"fa3_sm90_paged_decode_fp8\0")
-                    .map_err(|_e| RvllmError::Attention {
-                        err: AttentionError::Fa3SoMissing { path: path.clone() },
-                        ctx: AttnCtx {
-                            op: "dlsym:fa3_sm90_paged_decode_fp8",
-                            stream: 0,
-                            num_seqs: 0,
-                            head_dim,
-                        },
-                        bt: std::backtrace::Backtrace::capture(),
-                    })?;
-                // Optional: old .so builds may not export this symbol.
+                    .get(fp8_name).map_err(|_| sym_err("dlsym:paged_decode_fp8"))?;
                 let fn_paged_prefill_fp8: Option<PagedPrefillFp8Fn> = _lib
-                    .get::<PagedPrefillFp8Fn>(b"fa3_sm90_paged_prefill_fp8\0")
+                    .get::<PagedPrefillFp8Fn>(prefill_name)
                     .ok()
                     .map(|s| *s);
                 let fn_workspace_size = *ws_sym;

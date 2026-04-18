@@ -1,0 +1,436 @@
+//! Gemma 4 weight loader.
+//!
+//! Handles: different weight prefixes (model.language_model.layers.*),
+//! tied embeddings (lm_head = embed_tokens), 4 norms per layer,
+//! QK-norm weights, and per-layer KV head variation.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use half::f16;
+use rvllm_core::{DType, LoaderCtx, LoaderError, Result, RvllmError};
+use rvllm_mem::HbmArena;
+
+use crate::fp8_quant::{check_clamp_gate, quantize_per_tensor_ref, FP8_E4M3_MAX};
+use crate::gemma4_arch::Gemma4Arch;
+use crate::gemma4_weights::{Gemma4LayerWeights, Gemma4LoadedModel};
+use crate::safetensors::{ShardHeader, ShardIndex, TensorEntry};
+use crate::weights::{F16Weight, Fp8Weight};
+
+struct ShardMap {
+    _mmap: memmap2::Mmap,
+    header: ShardHeader,
+}
+
+impl ShardMap {
+    fn open(path: &Path) -> Result<Self> {
+        let f = std::fs::File::open(path).map_err(|source| RvllmError::Io {
+            err: rvllm_core::IoError::from(&source),
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let mmap = unsafe { memmap2::Mmap::map(&f) }.map_err(|source| RvllmError::Io {
+            err: rvllm_core::IoError::from(&source),
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let header = ShardHeader::parse(path, &mmap)?;
+        Ok(Self {
+            _mmap: mmap,
+            header,
+        })
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self._mmap
+    }
+}
+
+pub fn load_gemma4_model(
+    model_dir: &Path,
+    arena: &HbmArena,
+    arch: &Gemma4Arch,
+) -> Result<Gemma4LoadedModel> {
+    let idx = ShardIndex::resolve(model_dir)?;
+    let mut shards = Vec::with_capacity(idx.shards.len());
+    for p in &idx.shards {
+        shards.push(ShardMap::open(p)?);
+    }
+    let mut tensors: BTreeMap<String, (usize, TensorEntry)> = BTreeMap::new();
+    for (si, sm) in shards.iter().enumerate() {
+        for (name, entry) in &sm.header.tensors {
+            tensors.insert(name.clone(), (si, entry.clone()));
+        }
+    }
+
+    let bytes_of = |si: usize, e: &TensorEntry| -> &[u8] {
+        let s = shards[si].bytes();
+        let start = e.file_offset as usize;
+        &s[start..start + e.nbytes as usize]
+    };
+
+    let prefix = &arch.weight_prefix;
+
+    let get_tensor = |name: &str| -> Option<(usize, TensorEntry)> {
+        tensors.get(name).cloned()
+    };
+
+    let must_get = |name: &str| -> Result<(usize, TensorEntry)> {
+        get_tensor(name).ok_or_else(|| RvllmError::Loader {
+            err: LoaderError::MissingTensor {
+                name: name.to_string(),
+            },
+            ctx: LoaderCtx {
+                path: model_dir.to_path_buf(),
+                tensor: Some(name.to_string()),
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        })
+    };
+
+    let upload_f16 = |name: &'static str, hf_name: &str| -> Result<F16Weight> {
+        let (si, e) = must_get(hf_name)?;
+        let buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
+        let region = arena.region(name, buf.len(), 16)?;
+        unsafe { region.copy_from_host(&buf)? };
+        Ok(F16Weight {
+            offset_bytes: region.device_ptr(),
+            shape: e.shape.clone(),
+        })
+    };
+
+    let embed_name = format!("{prefix}.embed_tokens.weight");
+    let embedding = upload_f16("embedding", &embed_name)?;
+
+    let norm_name = format!("{prefix}.norm.weight");
+    let final_norm = upload_f16("final_norm", &norm_name)?;
+
+    let lm_head_fp8 = if let Some((si, e)) = get_tensor("lm_head.weight") {
+        upload_fp8(
+            arena,
+            "lm_head",
+            &tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?,
+            &e.shape,
+            "lm_head.weight",
+            model_dir,
+        )?
+    } else {
+        let (si, e) = must_get(&embed_name)?;
+        let buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
+        upload_fp8(
+            arena,
+            "lm_head",
+            &buf,
+            &e.shape,
+            "lm_head(tied_embed)",
+            model_dir,
+        )?
+    };
+
+    // Sliding RoPE: theta=10000, full rotation of head_dim_sliding (256)
+    let sliding_rotary_dim = arch.head_dim_sliding;
+    let (cos_s, sin_s) = rope_cos_sin_bytes(
+        arch.head_dim_sliding,
+        arch.max_position_embeddings,
+        arch.rope_theta_sliding,
+        sliding_rotary_dim,
+    );
+    // Global RoPE: theta=1M, partial rotation (0.25 * head_dim_global = 128 of 512)
+    let global_rotary_dim = arch.rotary_dim_for_layer(
+        arch.layer_types.iter().position(|t| *t == crate::gemma4_arch::Gemma4LayerType::GlobalAttention).unwrap_or(0)
+    );
+    let (cos_g, sin_g) = rope_cos_sin_bytes(
+        arch.head_dim_global,
+        arch.max_position_embeddings,
+        arch.rope_theta_global,
+        global_rotary_dim,
+    );
+
+    let rope_cos_sliding = upload_rope(arena, "rope_cos_sliding", &cos_s)?;
+    let rope_sin_sliding = upload_rope(arena, "rope_sin_sliding", &sin_s)?;
+    let rope_cos_global = upload_rope(arena, "rope_cos_global", &cos_g)?;
+    let rope_sin_global = upload_rope(arena, "rope_sin_global", &sin_g)?;
+
+    // All layers have IDENTICAL weight shapes (uniform). The sliding vs
+    // global distinction is a runtime reshape: 32x256 -> 16x512 for Q, etc.
+    // q_proj: [8192, 5376], k_proj: [4096, 5376], v_proj: [4096, 5376]
+    let q_dim = 8192; // num_heads(32) * head_dim_sliding(256)
+    let kv_dim = 4096; // kv_heads_sliding(16) * head_dim_sliding(256)
+
+    let mut layers = Vec::with_capacity(arch.num_hidden_layers);
+    for l in 0..arch.num_hidden_layers {
+        let ln = |s: &str| format!("{prefix}.layers.{l}.{s}");
+
+        let q_tensor = must_get(&ln("self_attn.q_proj.weight"))?;
+        let k_tensor = must_get(&ln("self_attn.k_proj.weight"))?;
+        let v_tensor = must_get(&ln("self_attn.v_proj.weight"))?;
+
+        let qkv_f16 = concat_tensors(
+            &[&q_tensor, &k_tensor, &v_tensor],
+            &shards,
+            model_dir,
+        )?;
+        let qkv_rows = q_dim + 2 * kv_dim; // 8192 + 2*4096 = 16384
+        let qkv = upload_fp8(
+            arena,
+            "qkv",
+            &qkv_f16,
+            &[qkv_rows, arch.hidden_size],
+            &ln("self_attn.qkv.weight"),
+            model_dir,
+        )?;
+
+        let o_proj = upload_fp8_from(
+            arena,
+            "o_proj",
+            &must_get(&ln("self_attn.o_proj.weight"))?,
+            &shards,
+            model_dir,
+        )?;
+
+        let gate_up_f16 = concat_tensors(
+            &[
+                &must_get(&ln("mlp.gate_proj.weight"))?,
+                &must_get(&ln("mlp.up_proj.weight"))?,
+            ],
+            &shards,
+            model_dir,
+        )?;
+        let gate_up = upload_fp8(
+            arena,
+            "gate_up",
+            &gate_up_f16,
+            &[2 * arch.intermediate_size, arch.hidden_size],
+            &ln("mlp.gate_up.weight"),
+            model_dir,
+        )?;
+
+        let down_proj = upload_fp8_from(
+            arena,
+            "down_proj",
+            &must_get(&ln("mlp.down_proj.weight"))?,
+            &shards,
+            model_dir,
+        )?;
+
+        let input_layernorm =
+            upload_f16("input_ln", &ln("input_layernorm.weight"))?;
+        let post_attention_layernorm =
+            upload_f16("post_attn_ln", &ln("post_attention_layernorm.weight"))?;
+        let pre_feedforward_layernorm =
+            upload_f16("pre_ff_ln", &ln("pre_feedforward_layernorm.weight"))?;
+        let post_feedforward_layernorm =
+            upload_f16("post_ff_ln", &ln("post_feedforward_layernorm.weight"))?;
+
+        let q_norm = upload_f16("q_norm", &ln("self_attn.q_norm.weight"))?;
+        let k_norm = upload_f16("k_norm", &ln("self_attn.k_norm.weight"))?;
+
+        let layer_scalar = upload_f16("layer_scalar", &ln("layer_scalar"))?;
+
+        layers.push(Gemma4LayerWeights {
+            qkv,
+            o_proj,
+            gate_up,
+            down_proj,
+            input_layernorm,
+            post_attention_layernorm,
+            pre_feedforward_layernorm,
+            post_feedforward_layernorm,
+            q_norm,
+            k_norm,
+            layer_scalar,
+        });
+    }
+
+    Ok(Gemma4LoadedModel {
+        embedding,
+        lm_head_fp8,
+        final_norm,
+        rope_cos_sliding,
+        rope_sin_sliding,
+        rope_cos_global,
+        rope_sin_global,
+        layers,
+    })
+}
+
+fn upload_rope(arena: &HbmArena, name: &'static str, data: &[u8]) -> Result<F16Weight> {
+    let r = arena.region(name, data.len(), 16)?;
+    unsafe { r.copy_from_host(data)? };
+    Ok(F16Weight {
+        offset_bytes: r.device_ptr(),
+        shape: vec![data.len() / 2],
+    })
+}
+
+fn rope_cos_sin_bytes(
+    head_dim: usize,
+    max_pos: usize,
+    theta: f32,
+    rotary_dim: usize,
+) -> (Vec<u8>, Vec<u8>) {
+    let half = rotary_dim / 2;
+    let mut cos = Vec::with_capacity(max_pos * half * 2);
+    let mut sin = Vec::with_capacity(max_pos * half * 2);
+    let inv_theta: Vec<f32> = (0..half)
+        .map(|i| 1.0 / theta.powf(2.0 * i as f32 / rotary_dim as f32))
+        .collect();
+    let _ = head_dim;
+    for pos in 0..max_pos {
+        for &freq in &inv_theta {
+            let angle = pos as f32 * freq;
+            cos.extend_from_slice(&f16::from_f32(angle.cos()).to_le_bytes());
+            sin.extend_from_slice(&f16::from_f32(angle.sin()).to_le_bytes());
+        }
+    }
+    (cos, sin)
+}
+
+fn tensor_to_f16_bytes(e: &TensorEntry, raw: &[u8], model_dir: &Path) -> Result<Vec<u8>> {
+    match e.dtype {
+        DType::F16 => Ok(raw.to_vec()),
+        DType::Bf16 => Ok(bf16_to_f16(raw)),
+        DType::F32 => Ok(f32_to_f16(raw)),
+        _ => Err(RvllmError::Loader {
+            err: LoaderError::DtypeMismatch {
+                tensor: e.name.clone(),
+                expected: DType::F16,
+                got: e.dtype,
+            },
+            ctx: LoaderCtx {
+                path: model_dir.to_path_buf(),
+                tensor: Some(e.name.clone()),
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        }),
+    }
+}
+
+fn bf16_to_f16(raw: &[u8]) -> Vec<u8> {
+    let n = raw.len() / 2;
+    let mut out = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let as_f32 = f32::from_bits(u32::from_le_bytes([0, 0, raw[2 * i], raw[2 * i + 1]]));
+        out.extend_from_slice(&f16::from_f32(as_f32).to_le_bytes());
+    }
+    out
+}
+
+fn f32_to_f16(raw: &[u8]) -> Vec<u8> {
+    let n = raw.len() / 4;
+    let mut out = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let v = f32::from_le_bytes(raw[4 * i..4 * i + 4].try_into().unwrap());
+        out.extend_from_slice(&f16::from_f32(v).to_le_bytes());
+    }
+    out
+}
+
+fn f16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
+    let n = bytes.len() / 2;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let v = f16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]);
+        out.push(v.to_f32());
+    }
+    out
+}
+
+fn concat_tensors(
+    entries: &[&(usize, TensorEntry)],
+    shards: &[ShardMap],
+    model_dir: &Path,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for &&(si, ref e) in entries {
+        let raw = &shards[si].bytes()[e.file_offset as usize..(e.file_offset + e.nbytes) as usize];
+        let buf = tensor_to_f16_bytes(e, raw, model_dir)?;
+        out.extend_from_slice(&buf);
+    }
+    Ok(out)
+}
+
+fn upload_fp8(
+    arena: &HbmArena,
+    region_name: &'static str,
+    f16_bytes: &[u8],
+    shape: &[usize],
+    tensor_name: &str,
+    model_dir: &Path,
+) -> Result<Fp8Weight> {
+    let f32_vals = f16_bytes_to_f32(f16_bytes);
+    let q = quantize_per_tensor_ref(&f32_vals);
+    check_clamp_gate(tensor_name, q.clamp_ppm, model_dir)?;
+    let fp8 = quantize_to_fp8_bytes(&f32_vals, q.scale);
+    let region = arena.region(region_name, fp8.len(), 16)?;
+    unsafe { region.copy_from_host(&fp8)? };
+    let scale_region = arena.region("fp8_scale", 4, 4)?;
+    unsafe { scale_region.copy_from_host(&q.scale.to_le_bytes())? };
+    Ok(Fp8Weight {
+        offset_bytes: region.device_ptr(),
+        scale_ptr: scale_region.device_ptr(),
+        shape: shape.to_vec(),
+        scale: q.scale,
+        clamp_ppm: q.clamp_ppm,
+        dtype: DType::Fp8E4M3,
+    })
+}
+
+fn upload_fp8_from(
+    arena: &HbmArena,
+    region_name: &'static str,
+    (si, entry): &(usize, TensorEntry),
+    shards: &[ShardMap],
+    model_dir: &Path,
+) -> Result<Fp8Weight> {
+    let raw = {
+        let s = shards[*si].bytes();
+        let start = entry.file_offset as usize;
+        &s[start..start + entry.nbytes as usize]
+    };
+    let f16_bytes = tensor_to_f16_bytes(entry, raw, model_dir)?;
+    upload_fp8(
+        arena,
+        region_name,
+        &f16_bytes,
+        &entry.shape,
+        &entry.name,
+        model_dir,
+    )
+}
+
+fn quantize_to_fp8_bytes(f32_vals: &[f32], scale: f32) -> Vec<u8> {
+    let inv = 1.0 / scale;
+    f32_vals
+        .iter()
+        .map(|v| fp8_e4m3_encode((*v * inv).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)))
+        .collect()
+}
+
+fn fp8_e4m3_encode(v: f32) -> u8 {
+    if v.is_nan() {
+        return 0x7f;
+    }
+    let s: u8 = if v < 0.0 { 0x80 } else { 0 };
+    let a = v.abs();
+    if a == 0.0 {
+        return s;
+    }
+    if a > FP8_E4M3_MAX {
+        return s | 0x7e;
+    }
+    let bits = a.to_bits();
+    let exp32 = ((bits >> 23) & 0xff) as i32 - 127;
+    let mant32 = bits & 0x7f_ffff;
+    let exp8 = exp32 + 7;
+    if exp8 <= 0 {
+        let shift = 1 - exp8;
+        let m = (mant32 | (1 << 23)) >> (21 + shift);
+        return s | (m as u8 & 0x07);
+    }
+    if exp8 >= 0xf {
+        return s | 0x7e;
+    }
+    let m = (mant32 >> 20) as u8 & 0x07;
+    s | ((exp8 as u8 & 0x0f) << 3) | m
+}
