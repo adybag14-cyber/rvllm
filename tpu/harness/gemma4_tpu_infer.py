@@ -186,6 +186,58 @@ def forward(token_id, pos, ctx, embed, final_norm, weights, caches, cos_s, sin_s
     new_caches = {'kc': scan_out['kc'], 'vc': scan_out['vc']}
     return jnp.argmax(logits, axis=-1).astype(jnp.int32), log_probs, new_caches
 
+def forward_step(token_id, pos, ctx, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g):
+    x = embed[token_id].reshape(B, H) * jnp.sqrt(jnp.float32(H))
+    init = (x, pos, ctx, cos_s, sin_s, cos_g, sin_g)
+    layer_xs = {**weights, 'kc': caches['kc'], 'vc': caches['vc']}
+    final, scan_out = jax.lax.scan(one_layer, init, layer_xs)
+    x = final[0]
+    x = rms_norm(x, final_norm)
+    logits = x.astype(jnp.float32) @ embed.astype(jnp.float32).T
+    logits = SOFTCAP_VAL * jnp.tanh(logits / SOFTCAP_VAL)
+    new_caches = {'kc': scan_out['kc'], 'vc': scan_out['vc']}
+    return jnp.argmax(logits, axis=-1).astype(jnp.int32), new_caches
+
+def make_decode_loop(num_prompt, total):
+    def decode_loop(prompt_ids, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g):
+        generated = jnp.zeros(total, dtype=jnp.int32)
+
+        init_tok = prompt_ids[0:1]
+        init_state = (jnp.int32(0), init_tok, caches, generated)
+
+        def prompt_body(state):
+            i, tok, caches, gen = state
+            _, new_caches = forward_step(
+                tok, i, i + 1, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g)
+            next_tok = jax.lax.dynamic_slice(prompt_ids, [i + 1], [1])
+            next_tok = jnp.where(i + 1 < num_prompt, next_tok, tok)
+            return (i + 1, next_tok, new_caches, gen)
+
+        def prompt_cond(state):
+            return state[0] < num_prompt
+
+        state = jax.lax.while_loop(prompt_cond, prompt_body, init_state)
+
+        i, tok, caches, gen = state
+        first_tok, caches = forward_step(
+            tok, i, i + 1, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g)
+        gen = gen.at[i].set(first_tok[0])
+        decode_state = (i + 1, first_tok, caches, gen)
+
+        def decode_body(state):
+            i, tok, caches, gen = state
+            next_tok, new_caches = forward_step(
+                tok, i, i + 1, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g)
+            gen = gen.at[i].set(next_tok[0])
+            return (i + 1, next_tok, new_caches, gen)
+
+        def decode_cond(state):
+            return state[0] < total
+
+        final_state = jax.lax.while_loop(decode_cond, decode_body, decode_state)
+        return final_state[3]
+    return decode_loop
+
 # ── safetensors reader ──
 
 def read_safetensors(path):
@@ -418,6 +470,50 @@ def run_perplexity(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s,
     print(f"perplexity: {ppl:.2f}", file=sys.stderr)
     print(f"time:       {elapsed:.1f}s ({n_tokens/elapsed:.1f} tok/s)", file=sys.stderr)
 
+def run_fused(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g):
+    prompt_ids = [int(x.strip()) for x in args.prompt.split(',')]
+    num_prompt = len(prompt_ids)
+    num_decode = args.max_tokens
+    total = num_prompt + num_decode
+    print(f"fused decode: {num_prompt} prompt + {num_decode} decode = {total} steps", file=sys.stderr)
+
+    prompt_arr = jnp.array(prompt_ids + [0] * (total - num_prompt), dtype=jnp.int32)
+
+    loop_fn = make_decode_loop(num_prompt, total)
+    fused_jit = jax.jit(loop_fn, donate_argnums=(4,))
+
+    print("compiling fused loop...", file=sys.stderr, flush=True)
+    t0 = time.time()
+    gen = fused_jit(prompt_arr, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g)
+    gen.block_until_ready()
+    compile_time = time.time() - t0
+    print(f"compiled + ran in {compile_time:.1f}s", file=sys.stderr)
+
+    tokens = np.array(gen)
+    decode_tokens = tokens[num_prompt:total]
+    print(f"\n=== Fused Decode ===", file=sys.stderr)
+    print(f"compile+run:  {compile_time:.2f}s", file=sys.stderr)
+    print(f"total steps:  {total}", file=sys.stderr)
+    if compile_time > 0:
+        print(f"tok/s (incl compile): {total/compile_time:.1f}", file=sys.stderr)
+    wall_per_tok = compile_time / total * 1000
+    print(f"ms/token (incl compile): {wall_per_tok:.1f}", file=sys.stderr)
+    print(f"generated: {decode_tokens[:20].tolist()}", file=sys.stderr)
+
+    print("\nre-running (cached compile)...", file=sys.stderr, flush=True)
+    kv_sh = NamedSharding(mesh, P(None, None, 'tp'))
+    caches2 = {
+        'kc': jax.device_put(jnp.zeros((NL, args.max_ctx, MAX_KV), dtype=jnp.bfloat16), kv_sh),
+        'vc': jax.device_put(jnp.zeros((NL, args.max_ctx, MAX_KV), dtype=jnp.bfloat16), kv_sh),
+    }
+    t0 = time.time()
+    gen2 = fused_jit(prompt_arr, embed, final_norm, weights, caches2, cos_s, sin_s, cos_g, sin_g)
+    gen2.block_until_ready()
+    pure_time = time.time() - t0
+    print(f"pure run:     {pure_time:.3f}s", file=sys.stderr)
+    print(f"tok/s:        {total/pure_time:.1f}", file=sys.stderr)
+    print(f"ms/token:     {pure_time/total*1000:.2f}", file=sys.stderr)
+
 def run_generate(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g):
     prompt_ids = [int(x.strip()) for x in args.prompt.split(',')]
     print(f"prompt: {len(prompt_ids)} tokens {prompt_ids[:10]}", file=sys.stderr)
@@ -484,6 +580,7 @@ def main():
     parser.add_argument('--prompt', default='2')
     parser.add_argument('--perplexity', action='store_true')
     parser.add_argument('--ppl-file', default=None)
+    parser.add_argument('--fused', action='store_true', help='On-chip decode loop (zero host overhead)')
     args = parser.parse_args()
 
     mesh = make_mesh()
@@ -501,6 +598,8 @@ def main():
 
     if args.perplexity:
         run_perplexity(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g)
+    elif args.fused:
+        run_fused(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g)
     else:
         run_generate(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g)
 
