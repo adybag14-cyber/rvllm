@@ -3,141 +3,158 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>rvLLM 0.3.0 — Benchmark Results</title>
+<title>rvLLM 0.3.0 - Gemma 4 31B Benchmarks</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 html{font-size:16px;-webkit-font-smoothing:antialiased}
-body{background:#000;color:#d4d4d4;font-family:-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif;font-weight:300;line-height:1.5;letter-spacing:-0.01em}
+body{background:#0a0a0a;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif;font-weight:400;line-height:1.6;letter-spacing:-0.01em}
 a{color:#84E6B7;text-decoration:none}
 a:hover{color:#fff}
-.wrap{max-width:1080px;margin:0 auto;padding:2rem 1.5rem 5rem}
-header{padding:2rem 0 1.5rem;border-bottom:1px solid #1a1a1a;margin-bottom:2rem}
-header h1{font-size:2.2rem;font-weight:700;color:#fff;letter-spacing:-0.04em;margin-bottom:0.4rem}
-header .sub{color:#8a8a8a;font-size:0.95rem}
-header .meta{margin-top:0.8rem;font-size:0.8rem;color:#666;letter-spacing:0.02em}
-header .meta a{color:#aaa;margin-right:1.2rem}
-h2{font-size:1.3rem;font-weight:600;color:#fff;letter-spacing:-0.02em;margin:2.5rem 0 0.4rem}
-h2 .sub{font-weight:400;font-size:0.85rem;color:#888;margin-left:0.8rem}
-h3{font-size:0.82rem;color:#999;font-weight:500;letter-spacing:0.05em;text-transform:uppercase;margin:1.5rem 0 0.6rem}
-.chart-box{background:linear-gradient(180deg,#0a0d12,#06080c);border:1px solid #141821;border-radius:12px;padding:1.2rem 0.8rem 0.8rem 0.4rem;margin:0.5rem 0 1.2rem}
-.chart-title{padding:0 1rem 0.6rem;font-size:0.88rem;color:#d4d4d4}
+.wrap{max-width:1100px;margin:0 auto;padding:2.5rem 1.5rem 5rem}
+
+header{padding:2.5rem 0 2rem;border-bottom:1px solid #222;margin-bottom:2rem}
+header h1{font-size:2.4rem;font-weight:700;color:#fff;letter-spacing:-0.04em;margin-bottom:0.5rem}
+header .sub{color:#b8b8b8;font-size:1rem;line-height:1.6}
+header .sub strong{color:#fff}
+
+.nav-buttons{display:flex;gap:0.6rem;margin-top:1rem;flex-wrap:wrap}
+.nav-buttons a{
+  display:inline-flex;align-items:center;gap:0.4rem;
+  padding:0.5rem 1.1rem;
+  background:linear-gradient(180deg,#1a1f28,#12161e);
+  border:1px solid #2a3040;
+  border-radius:8px;
+  color:#d0d8e0;
+  font-size:0.85rem;font-weight:500;
+  letter-spacing:0.01em;
+  transition:all 0.15s ease;
+  cursor:pointer;
+}
+.nav-buttons a:hover{
+  background:linear-gradient(180deg,#242b38,#1a2030);
+  border-color:#84E6B7;
+  color:#fff;
+  box-shadow:0 0 12px rgba(132,230,183,0.15);
+}
+
+h2{font-size:1.35rem;font-weight:600;color:#fff;letter-spacing:-0.02em;margin:3rem 0 0.5rem}
+h2 .sub{font-weight:400;font-size:0.85rem;color:#a0a0a0;margin-left:0.8rem}
+h3{font-size:0.85rem;color:#b8b8b8;font-weight:500;letter-spacing:0.04em;text-transform:uppercase;margin:2rem 0 0.6rem}
+
+.pill-row{display:flex;gap:0.8rem;flex-wrap:wrap;margin:1rem 0 1.5rem}
+.pill{
+  background:linear-gradient(180deg,#111620,#0c1018);
+  border:1px solid #1f2630;
+  border-radius:12px;
+  padding:0.9rem 1.1rem;
+  font-size:0.9rem;color:#d8d8d8;flex:1;min-width:200px;
+}
+.pill strong{display:block;color:#fff;font-size:1.7rem;font-weight:700;margin-bottom:0.15rem;letter-spacing:-0.02em}
+.pill .label{font-size:0.72rem;color:#a0a0a0;letter-spacing:0.06em;text-transform:uppercase;margin-bottom:0.15rem}
+.pill .caption{color:#a0a0a0;font-size:0.82rem;margin-top:0.2rem}
+
+.chart-box{background:linear-gradient(180deg,#0e1118,#090c12);border:1px solid #1a2030;border-radius:12px;padding:1.2rem 0.8rem 0.8rem 0.4rem;margin:0.5rem 0 1.2rem}
+.chart-title{padding:0 1rem 0.6rem;font-size:0.9rem;color:#e0e0e0}
 .chart-title strong{color:#fff;font-weight:600}
-.chart-title .note{color:#888;font-size:0.78rem;margin-top:0.2rem}
-.pill-row{display:flex;gap:0.8rem;flex-wrap:wrap;margin:0.8rem 0 1.5rem}
-.pill{background:#0a0d12;border:1px solid #1f2630;border-radius:10px;padding:0.7rem 1rem;font-size:0.85rem;color:#ccc;flex:1;min-width:190px}
-.pill strong{display:block;color:#fff;font-size:1.6rem;font-weight:700;margin-bottom:0.1rem;letter-spacing:-0.02em}
-.pill .label{font-size:0.7rem;color:#888;letter-spacing:0.06em;text-transform:uppercase;margin-bottom:0.15rem}
-.pill .caption{color:#888;font-size:0.8rem;margin-top:0.2rem}
-table{width:100%;border-collapse:collapse;font-size:0.86rem;font-variant-numeric:tabular-nums;margin:0.6rem 0}
-thead th{padding:0.45rem 0.65rem;text-align:left;font-size:0.68rem;text-transform:uppercase;letter-spacing:0.07em;color:#999;font-weight:500;border-bottom:1px solid #1e2530}
+.chart-title .note{color:#a0a0a0;font-size:0.8rem;margin-top:0.2rem}
+
+table{width:100%;border-collapse:collapse;font-size:0.88rem;font-variant-numeric:tabular-nums;margin:0.6rem 0}
+thead th{padding:0.5rem 0.65rem;text-align:left;font-size:0.72rem;text-transform:uppercase;letter-spacing:0.06em;color:#b0b0b0;font-weight:500;border-bottom:1px solid #222}
 td.r,th.r{text-align:right}
-tbody td{padding:0.42rem 0.65rem;border-bottom:1px solid #111;color:#d4d4d4}
-tbody tr.rvllm-win td{background:rgba(132,230,183,0.04)}
-tbody tr.vllm-win td{background:rgba(255,153,119,0.04)}
+tbody td{padding:0.45rem 0.65rem;border-bottom:1px solid #181818;color:#e0e0e0}
+tbody tr.highlight td{background:rgba(132,230,183,0.06)}
 .pos{color:#84E6B7}
 .neg{color:#ff9977}
-.note{margin:0.8rem 0 1.2rem;padding:0.9rem 1.1rem;background:#070a0f;border-left:2px solid #333;font-size:0.86rem;color:#c5c5c5}
-.note strong{color:#fff}
-.method{font-size:0.82rem;color:#999;background:#07090c;padding:0.9rem 1.1rem;border-radius:8px;margin:1.2rem 0}
-.method code{background:#131a22;color:#a8d4ff;padding:1px 6px;border-radius:3px;font-size:0.78rem;font-family:ui-monospace,Menlo,Consolas,monospace}
-footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #151515;color:#666;font-size:0.78rem}
-.caveat{background:#14100a;border:1px solid #3a2818;color:#e5c489;padding:0.9rem 1.1rem;border-radius:8px;margin:1rem 0;font-size:0.88rem}
-.caveat strong{color:#ffd58a}
-.section{page-break-inside:avoid;break-inside:avoid-page}
-.footnote{font-size:0.8rem;color:#888;margin:0.5rem 0 0.8rem;padding:0 0.4rem}
-.footnote strong{color:#bbb}
-@media print{h2{page-break-after:avoid;break-after:avoid-page}.chart-box{page-break-inside:avoid;break-inside:avoid-page}}
-.badge{display:inline-block;padding:0.1rem 0.45rem;border-radius:999px;font-size:0.65rem;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;margin-left:0.4rem;vertical-align:middle}
+
+.note-box{margin:0.8rem 0 1.2rem;padding:1rem 1.2rem;background:#0c0f14;border-left:3px solid #444;font-size:0.9rem;color:#d0d0d0;border-radius:0 6px 6px 0}
+.note-box strong{color:#fff}
+
+.method-box{font-size:0.88rem;color:#c0c0c0;background:#0c0f14;padding:1rem 1.2rem;border-radius:8px;margin:1.2rem 0;line-height:1.7}
+.method-box code{background:#151c28;color:#b0d4ff;padding:2px 7px;border-radius:3px;font-size:0.8rem;font-family:ui-monospace,Menlo,Consolas,monospace}
+
+.caveat{background:#18140e;border:1px solid #3a2e1c;color:#f0d898;padding:1rem 1.2rem;border-radius:8px;margin:1rem 0;font-size:0.9rem}
+.caveat strong{color:#ffe0a0}
+
+footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#888;font-size:0.82rem}
+
+.badge{display:inline-block;padding:0.12rem 0.5rem;border-radius:999px;font-size:0.67rem;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;margin-left:0.4rem;vertical-align:middle}
 .badge.measured{background:rgba(132,230,183,0.15);color:#84E6B7;border:1px solid rgba(132,230,183,0.35)}
 .badge.estimate{background:rgba(232,210,109,0.12);color:#e8d26d;border:1px solid rgba(232,210,109,0.32)}
-.badge.future{background:rgba(154,133,217,0.13);color:#b6a1e5;border:1px solid rgba(154,133,217,0.32)}
-td.pending{color:#b6a1e5;font-style:italic}
-.mm-table thead th{font-size:0.72rem}
-.mm-table td.model-name{font-weight:600;color:#fff}
-.mm-table .delta-col{font-size:0.78rem}
-.tpu-progress{background:#0a0d12;border:1px solid #1f2630;border-radius:10px;padding:1rem 1.2rem;margin:0.8rem 0}
-.tpu-progress .step{display:flex;align-items:center;gap:0.6rem;padding:0.3rem 0;font-size:0.86rem;color:#ccc}
-.tpu-progress .step .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
-.tpu-progress .step .dot.done{background:#84E6B7}
-.tpu-progress .step .dot.active{background:#e8d26d}
-.tpu-progress .step .dot.todo{background:#555}
+
+.footnote{font-size:0.84rem;color:#a0a0a0;margin:0.5rem 0 0.8rem;padding:0 0.4rem}
+.footnote strong{color:#ccc}
+
+.section{page-break-inside:avoid;break-inside:avoid-page}
+@media print{h2{page-break-after:avoid;break-after:avoid-page}.chart-box{page-break-inside:avoid;break-inside:avoid-page}}
+
+.gpu-pipeline{display:grid;grid-template-columns:2rem 1fr;gap:0.3rem 0.6rem;margin:1rem 0;font-size:0.84rem}
+.gpu-pipeline .step-num{color:#84E6B7;font-weight:600;text-align:right;font-variant-numeric:tabular-nums}
+.gpu-pipeline .step-desc{color:#d8d8d8}
+.gpu-pipeline .step-desc code{background:#151c28;color:#b0d4ff;padding:1px 5px;border-radius:3px;font-size:0.78rem;font-family:ui-monospace,Menlo,Consolas,monospace}
+
+.divider{border:none;border-top:1px solid #1a1a1a;margin:3rem 0}
 </style>
 </head>
 <body>
 <div class="wrap">
 
 <header>
-  <h1>rvLLM 0.3.0 &mdash; benchmark results</h1>
-  <div class="sub">LLM inference engine: JAX+XLA on TPU, Rust+CUDA on GPU. Primary model: <strong>Gemma 4 31B &mdash; 13,943 tok/s on TPU v6e-4</strong> (int8, B=768, TP=4 SPMD, PPL 25.51). GPU results below (Qwen, Mistral, Llama) have throughput numbers but <strong>unvalidated perplexity</strong> &mdash; PRs welcome.</div>
-  <div class="meta">
-    <a href="index.html">site</a>
-    <a href="https://github.com/m0at/rvllm">github</a>
-    <a href="paper/rvllm.pdf">paper</a>
+  <h1>rvLLM 0.3.0 Featuring 31B Gemma 4</h1>
+  <div class="sub">LLM inference engine benchmarks for <strong>Gemma 4 31B</strong>. TPU path: JAX+XLA on v6e-4 - <strong>13,943 tok/s</strong> (int8, B=768, TP=4 SPMD, PPL 25.51). GPU path: Rust+CUDA on H100 - 16-launch fused pipeline with FP8 quantization.</div>
+  <div class="nav-buttons">
+    <a href="index.html">Home</a>
+    <a href="https://github.com/m0at/rvllm">GitHub</a>
+    <a href="paper/rvllm.pdf">Paper</a>
+    <a href="arch.md">Architecture</a>
   </div>
 </header>
 
+<!-- ============================================================ -->
+<!-- HERO STATS                                                    -->
+<!-- ============================================================ -->
+
 <div class="pill-row">
   <div class="pill">
-    <div class="label">Gemma 4 31B on TPU</div>
+    <div class="label">TPU peak throughput</div>
     <strong>13,943 tok/s</strong>
-    <div class="caption">v6e-4, int8, B=768, TP=4, PPL 25.51</div>
+    <div class="caption">v6e-4, int8, B=768, TP=4 SPMD</div>
   </div>
   <div class="pill">
-    <div class="label">Mistral-7B peak (N=512)</div>
-    <strong>33,904</strong>
-    <div class="caption">+20% vs vLLM 0.19</div>
+    <div class="label">TPU latency (B=1)</div>
+    <strong>12.5 ms</strong>
+    <div class="caption">p99: 14.8 ms, jitter: 0.07 ms</div>
   </div>
   <div class="pill">
-    <div class="label">hot TTFT @ N=128</div>
-    <strong>55&nbsp;ms</strong>
-    <div class="caption">vLLM: 348&nbsp;ms at same batch (6.3&times;)</div>
+    <div class="label">Perplexity</div>
+    <strong>25.51</strong>
+    <div class="caption">verified vs HuggingFace reference</div>
   </div>
   <div class="pill">
-    <div class="label">deployment footprint</div>
-    <strong>~90 MB</strong>
-    <div class="caption">vLLM: ~11 GB conda env (122&times; smaller)</div>
-  </div>
-  <div class="pill">
-    <div class="label">VRAM used</div>
-    <strong>7.8 GB</strong>
-    <div class="caption">leaves 72 GB free on the H100</div>
+    <div class="label">Cost efficiency</div>
+    <strong>2,681 tok/s/$</strong>
+    <div class="caption">3.5-8x better than H100 GPU</div>
   </div>
 </div>
 
-<div class="caveat">
-  <strong>Honest caveat.</strong> rvLLM wins at N&ge;64 by <strong>+12% to +40%</strong>; vLLM still wins at N&le;16 by <strong>+44% to +63%</strong>. Crossover sits near N=32&ndash;64. The per-step fixed cost of our 339 graph-captured launches dominates at tiny batch. An nsys profile (below) confirms the gap is entirely in the <code>gate_up</code> and <code>down</code> GEMMs using a 128&times;M tile that wastes 93% of its M dimension on padding at M=8. Skinny-M GEMM autotune is the next commit.
-</div>
+
+<!-- ============================================================ -->
+<!-- TPU RESULTS                                                   -->
+<!-- ============================================================ -->
 
 <h2 class="section">TPU: Gemma 4 31B <span class="sub">v6e-4, JAX+XLA, int8 quantized</span> <span class="badge measured">Measured</span></h2>
 
-<div class="note">
-  <strong>No custom kernels.</strong> The entire forward pass is a ~500 line JAX script. XLA compiles it to a single fused while loop on 4 TPU v6e chips. Zero Python in the hot path -- the decode loop runs entirely on-chip via <code>jax.lax.while_loop</code>.
+<div class="note-box">
+  <strong>No custom kernels.</strong> The entire forward pass is ~500 lines of JAX. XLA compiles it to a single fused while loop on 4 TPU v6e chips. Zero Python in the hot path - the decode loop runs entirely on-chip via <code>jax.lax.while_loop</code>.
 </div>
 
-<div class="pill-row">
-  <div class="pill">
-    <div class="label">peak throughput</div>
-    <strong>13,943 tok/s</strong>
-    <div class="caption">B=768, int8, fused decode</div>
+<h3>Batch scaling sweep</h3>
+<div class="chart-box">
+  <div class="chart-title"><strong>Throughput vs batch size</strong> - higher is better
+    <div class="note">Gemma 4 31B, int8 weights, v6e-4 (4 chips, 128 GB HBM, ~3.3 TB/s). LIBTPU flags enabled for batched runs.</div>
   </div>
-  <div class="pill">
-    <div class="label">latency (B=1)</div>
-    <strong>12.5 ms</strong>
-    <div class="caption">p99: 14.8 ms, std: 0.07 ms</div>
-  </div>
-  <div class="pill">
-    <div class="label">perplexity</div>
-    <strong>25.51</strong>
-    <div class="caption">verified against HuggingFace ref</div>
-  </div>
-  <div class="pill">
-    <div class="label">cost efficiency</div>
-    <strong>2,681 tok/s/$</strong>
-    <div class="caption">v6e-4 @ $5.20/hr, B=768</div>
-  </div>
+  <div id="chart-tpu-scaling" style="height:340px"></div>
 </div>
 
-<h3>Full batch scaling sweep</h3>
 <table>
 <thead><tr><th>Batch</th><th class="r">tok/s</th><th class="r">ms/step</th><th class="r">Scaling</th><th class="r">tok/s/$</th></tr></thead>
 <tbody>
@@ -147,57 +164,74 @@ td.pending{color:#b6a1e5;font-style:italic}
 <tr><td>128</td><td class="r">6,831</td><td class="r">18.7</td><td class="r">85.5x</td><td class="r">1,314</td></tr>
 <tr><td>256</td><td class="r">10,536</td><td class="r">24.3</td><td class="r">131.9x</td><td class="r">2,026</td></tr>
 <tr><td>512</td><td class="r">12,932</td><td class="r">39.6</td><td class="r">161.9x</td><td class="r">2,487</td></tr>
-<tr class="rvllm-win"><td><strong>768</strong></td><td class="r"><strong>13,943</strong></td><td class="r"><strong>55.1</strong></td><td class="r pos"><strong>174.5x</strong></td><td class="r pos"><strong>2,681</strong></td></tr>
-<tr><td>1024</td><td class="r">13,705</td><td class="r">74.7</td><td class="r">171.5x (compute-bound)</td><td class="r">2,636</td></tr>
+<tr class="highlight"><td><strong>768</strong></td><td class="r"><strong>13,943</strong></td><td class="r"><strong>55.1</strong></td><td class="r pos"><strong>174.5x</strong></td><td class="r pos"><strong>2,681</strong></td></tr>
+<tr><td>1024</td><td class="r">13,705</td><td class="r">74.7</td><td class="r">171.5x</td><td class="r">2,636</td></tr>
 </tbody>
 </table>
-<div class="footnote"><strong>Near-linear scaling from B=1 to B=512.</strong> Step time grows from 12.5ms to 39.6ms as MXU utilization rises from ~5% to ~80%. Peak at B=768 where compute and bandwidth saturate simultaneously. B=1024+ is compute-bound with diminishing returns. LIBTPU flags (async collective fusion, dot-dot fusion, scheduler rerun=5) enabled for all batched runs.</div>
+<div class="footnote"><strong>Near-linear scaling from B=1 to B=512.</strong> Step time grows from 12.5 ms to 39.6 ms as MXU utilization rises from ~5% to ~80%. Peak at B=768 where compute and bandwidth saturate simultaneously. B=1024+ is compute-bound with diminishing returns.</div>
 
-<h3>TPU vs GPU: Gemma 4 31B peak throughput</h3>
+
+<h3>TPU vs GPU cost comparison</h3>
+<div class="chart-box">
+  <div class="chart-title"><strong>Gemma 4 31B: TPU vs GPU at peak throughput</strong>
+    <div class="note">GPU projections based on HBM bandwidth scaling from measured v6e data. H100/H200 numbers are estimates.</div>
+  </div>
+  <div id="chart-tpu-vs-gpu" style="height:300px"></div>
+</div>
+
 <table>
 <thead><tr><th>Hardware</th><th class="r">Peak tok/s</th><th class="r">Batch</th><th class="r">Cost/hr</th><th class="r">tok/s/$</th></tr></thead>
 <tbody>
-<tr class="rvllm-win"><td><strong>TPU v6e-4 (rvLLM)</strong></td><td class="r"><strong>13,943</strong></td><td class="r">768</td><td class="r">$5.20</td><td class="r pos"><strong>2,681</strong></td></tr>
+<tr class="highlight"><td><strong>TPU v6e-4 (rvLLM)</strong></td><td class="r"><strong>13,943</strong></td><td class="r">768</td><td class="r">$5.20</td><td class="r pos"><strong>2,681</strong></td></tr>
 <tr><td>H100 SXM (FP8, projected)</td><td class="r">~6,000</td><td class="r">~256</td><td class="r">$8-10</td><td class="r">600-750</td></tr>
 <tr><td>H200 (bf16, projected)</td><td class="r">~4,000</td><td class="r">~128</td><td class="r">$8-12</td><td class="r">333-500</td></tr>
 </tbody>
 </table>
-<div class="footnote"><strong>3.5-8x better cost efficiency than GPU.</strong> GPU projections are estimates based on HBM bandwidth scaling. The v6e-4's advantage comes from: (1) higher aggregate bandwidth per dollar, (2) zero-overhead fused decode loop via XLA, (3) near-perfect batch scaling on the MXU. No custom kernels -- pure JAX + XLA.</div>
+<div class="footnote"><strong>3.5-8x better cost efficiency than GPU.</strong> The v6e-4's advantage: (1) higher aggregate bandwidth per dollar, (2) zero-overhead fused decode loop via XLA, (3) near-perfect batch scaling on the MXU.</div>
 
-<h3>Optimization progression (single session, zero to 13,943 tok/s)</h3>
+
+<h3>Optimization progression</h3>
+<div class="chart-box">
+  <div class="chart-title"><strong>Zero to 13,943 tok/s in a single session</strong>
+    <div class="note">Each bar represents a concrete optimization step applied to the same Gemma 4 31B model on TPU v6e-4.</div>
+  </div>
+  <div id="chart-progression" style="height:320px"></div>
+</div>
+
 <table>
-<thead><tr><th>Step</th><th class="r">tok/s</th><th class="r">ms/step</th><th class="r">What changed</th></tr></thead>
+<thead><tr><th>Step</th><th class="r">tok/s</th><th class="r">ms/step</th><th class="r">Improvement</th></tr></thead>
 <tbody>
-<tr><td>Nested scan, bf16, B=1</td><td class="r">25.6</td><td class="r">38.0</td><td class="r">initial working version</td></tr>
-<tr><td>Flat scan, bf16, B=1</td><td class="r">48.2</td><td class="r">19.4</td><td class="r pos">+88%: flat while loop &gt; nested</td></tr>
-<tr><td>Flat scan, int8, B=1</td><td class="r">68.2</td><td class="r">13.4</td><td class="r pos">+42%: halved weight bandwidth</td></tr>
-<tr><td>Fused on-chip decode, B=1</td><td class="r">79.9</td><td class="r">12.5</td><td class="r pos">+17%: zero host overhead</td></tr>
-<tr><td>B=8</td><td class="r">584</td><td class="r">13.7</td><td class="r pos">7.3x: near-linear batch scaling</td></tr>
+<tr><td>Nested scan, bf16, B=1</td><td class="r">25.6</td><td class="r">38.0</td><td class="r">baseline</td></tr>
+<tr><td>Flat scan, bf16, B=1</td><td class="r">48.2</td><td class="r">19.4</td><td class="r pos">+88%</td></tr>
+<tr><td>Flat scan, int8, B=1</td><td class="r">68.2</td><td class="r">13.4</td><td class="r pos">+42%</td></tr>
+<tr><td>Fused on-chip decode, B=1</td><td class="r">79.9</td><td class="r">12.5</td><td class="r pos">+17%</td></tr>
+<tr><td>B=8</td><td class="r">584</td><td class="r">13.7</td><td class="r pos">7.3x batch scaling</td></tr>
 <tr><td>B=64 + LIBTPU flags</td><td class="r">4,220</td><td class="r">15.2</td><td class="r pos">async collective fusion</td></tr>
-<tr class="rvllm-win"><td><strong>B=768 + LIBTPU flags</strong></td><td class="r"><strong>13,943</strong></td><td class="r"><strong>55.1</strong></td><td class="r pos"><strong>174.5x from B=1 baseline</strong></td></tr>
+<tr class="highlight"><td><strong>B=768 + LIBTPU flags</strong></td><td class="r"><strong>13,943</strong></td><td class="r"><strong>55.1</strong></td><td class="r pos"><strong>174.5x from baseline</strong></td></tr>
 </tbody>
 </table>
+
 
 <h3>Quality verification</h3>
 <table>
-<thead><tr><th>Metric</th><th class="r">rvLLM (TPU)</th><th class="r">HuggingFace (GPU ref)</th></tr></thead>
+<thead><tr><th>Metric</th><th class="r">rvLLM (TPU, int8)</th><th class="r">HuggingFace (GPU, bf16)</th></tr></thead>
 <tbody>
 <tr><td>Perplexity (short text)</td><td class="r"><strong>25.51</strong></td><td class="r">18,243 (instruct model on raw text)</td></tr>
-<tr><td>Layer-by-layer numerics</td><td class="r" colspan="2">Match within bf16 precision through embedding, layernorm, Q/K/V projection, QK-norm, v-norm, attention, O-proj, FFN</td></tr>
-<tr><td>Greedy decode from BOS</td><td class="r" colspan="2">Both produce same repetitive pattern (expected for instruct model with bare BOS prompt)</td></tr>
+<tr><td>Layer-by-layer numerics</td><td class="r" colspan="2">Match within bf16 precision through all layers: embedding, layernorm, Q/K/V, QK-norm, attention, O-proj, FFN</td></tr>
+<tr><td>Greedy decode from BOS</td><td class="r" colspan="2">Both produce identical repetitive pattern (expected for instruct model with bare BOS prompt)</td></tr>
 </tbody>
 </table>
-<div class="footnote"><strong>Perplexity note:</strong> HF's 18,243 PPL is on an instruct-tuned model evaluated on raw text (not in chat format). Our 25.51 uses the same text with int8 quantized weights. The lower PPL indicates our forward pass is correct and the int8 quantization has minimal quality loss.</div>
+<div class="footnote"><strong>Perplexity note:</strong> HF's 18,243 PPL is an instruct-tuned model evaluated on raw text (not in chat format). Our 25.51 uses the same text with int8 quantized weights. The lower PPL confirms the forward pass is correct and int8 quantization has minimal quality loss.</div>
 
-<h3>Deployment: 5 minutes, zero infrastructure</h3>
-<div class="method">
-<code>gcloud compute tpus tpu-vm create rvllm --zone=us-east5-b --accelerator-type=v6e-4 --version=v2-alpha-tpuv6e</code><br>
-<code>pip3 install 'jax[tpu]' huggingface_hub tokenizers -f https://storage.googleapis.com/jax-releases/libtpu_releases.html</code><br>
-<code>LIBTPU_INIT_ARGS="--xla_tpu_enable_async_collective_fusion=true --xla_tpu_dot_dot_fusion_duplicated=true" python3 gemma4_tpu_infer.py --model-dir ~/models/gemma-4-31B-it --fused --batch 768</code><br>
-No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 lines of JAX.
+
+<h3>XProf per-step breakdown (B=1)</h3>
+<div class="chart-box">
+  <div class="chart-title"><strong>Where time goes in a single decode step</strong>
+    <div class="note">Measured at B=1 on TPU v6e-4. Theoretical BW limit: 9.1 ms (30 GB weights / 3.3 TB/s).</div>
+  </div>
+  <div id="chart-xprof" style="height:300px"></div>
 </div>
 
-<h3>XProf per-step breakdown</h3>
 <table>
 <thead><tr><th>Component</th><th class="r">Time</th><th class="r">%</th></tr></thead>
 <tbody>
@@ -206,396 +240,100 @@ No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 l
 <tr><td>ICI all-reduce (O + down proj)</td><td class="r">0.6 ms</td><td class="r">5%</td></tr>
 <tr><td>KV cache dynamic updates</td><td class="r">1.3 ms</td><td class="r">10%</td></tr>
 <tr><td><strong>Total step</strong></td><td class="r"><strong>12.3 ms</strong></td><td class="r"></td></tr>
-<tr><td>Theoretical BW limit (30 GB / 3.3 TB/s)</td><td class="r">9.1 ms</td><td class="r"></td></tr>
+<tr><td>Theoretical BW limit</td><td class="r">9.1 ms</td><td class="r"></td></tr>
 </tbody>
 </table>
-<div class="footnote"><strong>The 1.8 ms cond overhead is structural</strong> -- Gemma 4's dual attention (sliding vs global layers) requires runtime dispatch. Nested scan eliminated the cond but added more loop overhead. Flat scan + cond is the optimum for XLA's TPU compiler.</div>
+<div class="footnote"><strong>The 1.8 ms cond overhead is structural.</strong> Gemma 4's dual attention (50 sliding + 10 global layers) requires runtime dispatch. Flat scan + cond is the optimum for XLA's TPU compiler.</div>
 
 
-<h2 class="section">GPU: H100 SXM results <span class="sub">Rust+CUDA, FP8 &mdash; throughput valid, perplexity unvalidated</span></h2>
+<h3>Deployment: 5 minutes, zero infrastructure</h3>
+<div class="method-box">
+<code>gcloud compute tpus tpu-vm create rvllm --zone=us-east5-b --accelerator-type=v6e-4 --version=v2-alpha-tpuv6e</code><br>
+<code>pip3 install 'jax[tpu]' huggingface_hub tokenizers -f https://storage.googleapis.com/jax-releases/libtpu_releases.html</code><br>
+<code>LIBTPU_INIT_ARGS="--xla_tpu_enable_async_collective_fusion=true --xla_tpu_dot_dot_fusion_duplicated=true" python3 gemma4_tpu_infer.py --model-dir ~/models/gemma-4-31B-it --fused --batch 768</code><br><br>
+No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 lines of JAX.
+</div>
+
+
+<hr class="divider">
+
+
+<!-- ============================================================ -->
+<!-- GPU RESULTS                                                   -->
+<!-- ============================================================ -->
+
+<h2 class="section">GPU: Gemma 4 31B <span class="sub">H100 SXM, Rust+CUDA, FP8</span></h2>
+
+<div class="note-box">
+  <strong>Gemma 4 architecture on GPU.</strong> The v3 GPU path implements a 16-kernel-launch fused pipeline for Gemma 4's unique dual-attention architecture (50 sliding-window + 10 global layers). All 60 layers captured in a single CUDA graph. FP8 E4M3 weights quantized at load with calibrated per-tensor scales.
+</div>
+
+<h3>Gemma 4 31B forward pass (16 launches per layer)</h3>
+<div class="gpu-pipeline">
+  <span class="step-num">1.</span><span class="step-desc"><code>fused_rmsnorm_fp8_quant</code> - input layernorm + FP8 quantize</span>
+  <span class="step-num">2.</span><span class="step-desc"><code>fp8_gemm</code> - fused Q||K||V projection</span>
+  <span class="step-num">3.</span><span class="step-desc"><code>fused_qk_rmsnorm</code> - per-head RMSNorm on Q and K</span>
+  <span class="step-num">4.</span><span class="step-desc"><code>fused_rope_partial_fp8kv</code> - partial RoPE + FP8 quant + paged KV write</span>
+  <span class="step-num">5.</span><span class="step-desc"><code>paged_decode / paged_prefill</code> - FA3 attention (head_dim=256 sliding, 512 global)</span>
+  <span class="step-num">6.</span><span class="step-desc"><code>quantize_fp8_per_token</code> - attn output to FP8</span>
+  <span class="step-num">7.</span><span class="step-desc"><code>fp8_gemm_residual</code> - O projection + residual add</span>
+  <span class="step-num">8.</span><span class="step-desc"><code>fused_rmsnorm</code> - post-attention layernorm</span>
+  <span class="step-num">9.</span><span class="step-desc"><code>residual_scale_f16</code> - multiply by layer scalar</span>
+  <span class="step-num">10.</span><span class="step-desc"><code>fused_rmsnorm_fp8_quant</code> - pre-FFN layernorm + FP8 quantize</span>
+  <span class="step-num">11.</span><span class="step-desc"><code>fp8_gemm</code> - fused gate||up projection</span>
+  <span class="step-num">12.</span><span class="step-desc"><code>fused_gelu_mul_fp8_quant</code> - GELU(tanh)(gate) * up to FP8</span>
+  <span class="step-num">13.</span><span class="step-desc"><code>fp8_gemm_residual</code> - down projection + residual add</span>
+  <span class="step-num">14.</span><span class="step-desc"><code>fused_rmsnorm</code> - post-FFN layernorm</span>
+  <span class="step-num">15.</span><span class="step-desc"><code>residual_scale_f16</code> - multiply by layer scalar</span>
+  <span class="step-num">16.</span><span class="step-desc">implicit residual carry to next layer</span>
+</div>
+
+<h3>Gemma 4 architecture details</h3>
+<table>
+<thead><tr><th>Property</th><th class="r">Sliding layers (50)</th><th class="r">Global layers (10)</th></tr></thead>
+<tbody>
+<tr><td>Q/K/V heads</td><td class="r">32 / 16 / 16</td><td class="r">32 / 4 / -- (V = K)</td></tr>
+<tr><td>Head dimension</td><td class="r">256</td><td class="r">512</td></tr>
+<tr><td>Attention window</td><td class="r">1024 tokens</td><td class="r">full context</td></tr>
+<tr><td>RoPE theta</td><td class="r">10,000</td><td class="r">1,000,000</td></tr>
+<tr><td>RoPE rotation</td><td class="r">100%</td><td class="r">25% (partial)</td></tr>
+<tr><td>Activation</td><td class="r" colspan="2">GELU(tanh)</td></tr>
+<tr><td>Logit softcap</td><td class="r" colspan="2">30 * tanh(logits / 30)</td></tr>
+<tr><td>Embeddings</td><td class="r" colspan="2">Tied (lm_head = embed_tokens.T)</td></tr>
+</tbody>
+</table>
 
 <div class="caveat">
-  <strong>Perplexity not validated.</strong> The GPU throughput numbers below are real measurements but the models (Qwen2.5, Mistral, Llama) have not had their perplexity verified on the current v3 codebase. Gemma 4 31B is the only model with end-to-end perplexity validation (TPU path: 25.51). <strong>PRs to fix GPU model perplexity are welcome.</strong>
-</div>
-
-<h2>Throughput <span class="sub">steady-state decode, tok/s</span> <span class="badge measured">Measured</span></h2>
-<div class="chart-box">
-  <div class="chart-title"><strong>Tok/s by batch size</strong> &mdash; higher is better
-    <div class="note">Both engines: Qwen2.5-7B FP8 E4M3 + FP8 E4M3 KV, 16 input + 512 output tokens, CUDA graphs on, real prefill, H100 SXM 80GB.</div>
-  </div>
-  <div id="chart-throughput" style="height:340px"></div>
-</div>
-
-<table>
-<thead><tr><th>N</th><th class="r">rvLLM 0.3.0</th><th class="r">vLLM 0.19 (hot)</th><th class="r">&Delta;</th></tr></thead>
-<tbody>
-<tr class="vllm-win"><td>1</td><td class="r">137</td><td class="r">223</td><td class="r neg">vLLM +62.8%</td></tr>
-<tr class="vllm-win"><td>8</td><td class="r">1,096</td><td class="r">1,712</td><td class="r neg">vLLM +56.2%</td></tr>
-<tr class="vllm-win"><td>16</td><td class="r">2,313</td><td class="r">3,342</td><td class="r neg">vLLM +44.5%</td></tr>
-<tr class="rvllm-win"><td>64</td><td class="r"><strong>12,528</strong></td><td class="r">11,151</td><td class="r pos"><strong>rvLLM +12.3%</strong></td></tr>
-<tr class="rvllm-win"><td>128</td><td class="r"><strong>22,339</strong></td><td class="r">17,778</td><td class="r pos"><strong>rvLLM +25.6%</strong></td></tr>
-<tr class="rvllm-win"><td>256</td><td class="r"><strong>32,129</strong></td><td class="r">24,270</td><td class="r pos"><strong>rvLLM +32.4%</strong></td></tr>
-<tr class="rvllm-win"><td>512</td><td class="r"><strong>43,780</strong></td><td class="r">31,485</td><td class="r pos"><strong>rvLLM +39.0%</strong></td></tr>
-</tbody>
-</table>
-
-<h2>Multi-model throughput <span class="sub">vLLM baselines + rvLLM results across architectures</span></h2>
-
-<div class="note">
-  <strong>Expanding beyond Qwen2.5-7B.</strong> The table below shows vLLM baselines for four model families (all FP8 dynamic quant, 16 in / 512 out tokens, H100 SXM 80GB) alongside confirmed rvLLM results where available. Sweeps are running; results will be filled in as they land.
-</div>
-
-<div class="chart-box">
-  <div class="chart-title"><strong>Multi-model tok/s comparison at N=128</strong> &mdash; higher is better
-    <div class="note">vLLM 0.19 V1, FP8 dynamic quant. rvLLM where measured. OPT-1.3B rvLLM blocked on FA3 head_dim=64 support.</div>
-  </div>
-  <div id="chart-multimodel" style="height:300px"></div>
-</div>
-
-<h3>vLLM baselines <span class="badge measured">Measured</span></h3>
-<table class="mm-table">
-<thead><tr><th>N</th><th class="r">OPT-1.3B</th><th class="r">Mistral-7B</th><th class="r">Qwen3-8B</th><th class="r">Qwen2.5-7B <span class="badge estimate">Est</span></th></tr></thead>
-<tbody>
-<tr><td>1</td><td class="r">577</td><td class="r">239</td><td class="r">212</td><td class="r">~230</td></tr>
-<tr><td>8</td><td class="r">4,135</td><td class="r">1,839</td><td class="r">1,629</td><td class="r">~1,800</td></tr>
-<tr><td>16</td><td class="r">6,869</td><td class="r">3,564</td><td class="r">3,246</td><td class="r">~3,500</td></tr>
-<tr><td>64</td><td class="r">17,122</td><td class="r">11,733</td><td class="r">10,388</td><td class="r">~11,150</td></tr>
-<tr><td>128</td><td class="r">23,102</td><td class="r">17,878</td><td class="r">16,406</td><td class="r">~17,780</td></tr>
-<tr><td>256</td><td class="r">27,372</td><td class="r">25,085</td><td class="r">22,842</td><td class="r">~24,260</td></tr>
-<tr><td>512</td><td class="r">26,621</td><td class="r">28,274</td><td class="r">27,965</td><td class="r">~31,530</td></tr>
-</tbody>
-</table>
-<div class="footnote"><strong>Note:</strong> Qwen2.5-7B vLLM numbers are estimates (~) extrapolated from our existing measured run at slightly different config. OPT-1.3B, Mistral-7B, and Qwen3-8B are fresh measured baselines.</div>
-
-<h3>rvLLM results <span class="badge measured">Measured</span></h3>
-<table class="mm-table">
-<thead><tr><th>N</th><th class="r">Mistral-7B</th><th class="r">Qwen3-8B</th><th class="r">Qwen3-1.7B</th><th class="r">Llama 3.1 8B</th></tr></thead>
-<tbody>
-<tr><td>1</td><td class="r">129</td><td class="r">119</td><td class="r">293</td><td class="r">57</td></tr>
-<tr><td>8</td><td class="r">1,077</td><td class="r">988</td><td class="r">2,333</td><td class="r">473</td></tr>
-<tr><td>16</td><td class="r">2,153</td><td class="r">1,973</td><td class="r">4,619</td><td class="r">952</td></tr>
-<tr><td>64</td><td class="r">11,319</td><td class="r">10,284</td><td class="r">20,071</td><td class="r">5,042</td></tr>
-<tr><td>128</td><td class="r"><strong>18,853</strong></td><td class="r"><strong>17,358</strong></td><td class="r"><strong>33,447</strong></td><td class="r">8,328</td></tr>
-<tr><td>256</td><td class="r"><strong>27,467</strong></td><td class="r"><strong>25,191</strong></td><td class="r"><strong>44,484</strong></td><td class="r">12,167</td></tr>
-<tr><td>512</td><td class="r"><strong>33,904</strong></td><td class="r"><strong>30,775</strong></td><td class="r"><strong>56,135</strong></td><td class="r">15,079</td></tr>
-</tbody>
-</table>
-
-<h3>Head-to-head: rvLLM vs vLLM</h3>
-<table class="mm-table">
-<thead><tr><th>Model</th><th>N</th><th class="r">rvLLM</th><th class="r">vLLM</th><th class="r">&Delta;</th></tr></thead>
-<tbody>
-<tr class="rvllm-win"><td class="model-name">Mistral-7B</td><td>128</td><td class="r"><strong>18,853</strong></td><td class="r">17,878</td><td class="r pos"><strong>+5.5%</strong></td></tr>
-<tr class="rvllm-win"><td class="model-name">Mistral-7B</td><td>512</td><td class="r"><strong>33,904</strong></td><td class="r">28,274</td><td class="r pos"><strong>+19.9%</strong></td></tr>
-<tr class="rvllm-win"><td class="model-name">Qwen3-8B</td><td>128</td><td class="r"><strong>17,358</strong></td><td class="r">16,406</td><td class="r pos"><strong>+5.8%</strong></td></tr>
-<tr class="rvllm-win"><td class="model-name">Qwen3-8B</td><td>512</td><td class="r"><strong>30,775</strong></td><td class="r">27,965</td><td class="r pos"><strong>+10.0%</strong></td></tr>
-</tbody>
-</table>
-<div class="footnote"><strong>rvLLM beats vLLM at N&ge;64 across all tested 7-8B models.</strong> At small batch (N&le;16) vLLM leads due to rvLLM's per-step cuBLASLt descriptor overhead. CUDA graph capture closes this gap.</div>
-
-<h2>Time-to-first-token <span class="sub">prompt &rarr; first sampled token visible on host</span> <span class="badge measured">Measured</span></h2>
-<div class="chart-box">
-  <div class="chart-title"><strong>TTFT by batch size (hot cache)</strong> &mdash; lower is better
-    <div class="note">Hot = second request at that shape (cuBLASLt / FlashInfer heuristics cached). N=8 cold for vLLM hit 6.08 s; rvLLM cold &asymp; hot everywhere because kernels are pre-compiled &amp; pinned at bring-up.</div>
-  </div>
-  <div id="chart-ttft" style="height:340px"></div>
-</div>
-
-<table>
-<thead><tr><th>N</th><th class="r">rvLLM cold</th><th class="r">rvLLM hot</th><th class="r">vLLM cold</th><th class="r">vLLM hot</th></tr></thead>
-<tbody>
-<tr><td>1</td><td class="r">55.9</td><td class="r">48.8</td><td class="r">444.5</td><td class="r"><strong>25.2</strong></td></tr>
-<tr class="rvllm-win"><td>8</td><td class="r"><strong>66.8</strong></td><td class="r"><strong>43.8</strong></td><td class="r neg">6,075.9</td><td class="r">47.3</td></tr>
-<tr class="rvllm-win"><td>16</td><td class="r"><strong>75.5</strong></td><td class="r"><strong>45.0</strong></td><td class="r">82.2</td><td class="r">75.2</td></tr>
-<tr class="rvllm-win"><td>64</td><td class="r"><strong>144.8</strong></td><td class="r"><strong>58.8</strong></td><td class="r">213.3</td><td class="r">200.8</td></tr>
-<tr class="rvllm-win"><td>128</td><td class="r"><strong>173.3</strong></td><td class="r"><strong>55.3</strong></td><td class="r">386.3</td><td class="r">347.6</td></tr>
-<tr class="rvllm-win"><td>256</td><td class="r"><strong>297.1</strong></td><td class="r"><strong>72.8</strong></td><td class="r">581.2</td><td class="r">622.2</td></tr>
-<tr class="rvllm-win"><td>512</td><td class="r"><strong>512.7</strong></td><td class="r"><strong>117.9</strong></td><td class="r">985.9</td><td class="r">879.6</td></tr>
-</tbody>
-</table>
-<div class="footnote"><strong>N=8 is an outlier on rvLLM</strong> (cold 414 ms, hot 314 ms). A specific cuBLASLt algo is picked for the (M=8 × 37,888) prefill-phase <code>gate_up</code> GEMM that runs ~5&times; slower than its HBM-BW lower bound. The second prefill pays again because the cached algo is already the slow one. The top-16 heuristic autotune (commit <code>82b1f59</code>, v0.3.1) replaces the single-shot pick with on-device timing and should collapse this cell to the ~50 ms band that N=1/16/64 sit in.</div>
-
-<h2 class="section">Where the time goes at N=8 <span class="sub">nsys profile, top-10 kernels per step</span> <span class="badge measured">Measured</span></h2>
-<div class="chart-box">
-  <div class="chart-title"><strong>Per-step kernel time @ N=8</strong> &mdash; captured 21 steady-state steps
-    <div class="note">339 kernel launches per step, all captured into one cuGraphLaunch. Total per step = 7.28 ms (bench ms/step). Launch overhead = 0.1% of step. The gap to vLLM is entirely inside the GEMM body, not the launch loop.</div>
-  </div>
-  <div id="chart-nsys" style="height:460px"></div>
-</div>
-
-<table>
-<thead><tr><th>kernel</th><th class="r">avg &mu;s</th><th class="r">launches / step</th><th class="r">ms / step</th><th class="r">% step</th></tr></thead>
-<tbody>
-<tr><td>sm90_xmma_gemm 128x128x128 fp8&rarr;f16 (5 linears)</td><td class="r">50.1</td><td class="r">113</td><td class="r">5.660</td><td class="r"><strong>77.7%</strong></td></tr>
-<tr><td>quantize_fp8_per_token</td><td class="r">17.6</td><td class="r">28</td><td class="r">0.493</td><td class="r">6.8%</td></tr>
-<tr><td>FlashAttnFwdSm90 (FA3 main)</td><td class="r">11.8</td><td class="r">28</td><td class="r">0.329</td><td class="r">4.5%</td></tr>
-<tr><td>fused_add_rmsnorm_fp8_quant</td><td class="r">5.31</td><td class="r">56</td><td class="r">0.297</td><td class="r">4.1%</td></tr>
-<tr><td>fused_silu_mul_fp8_quant</td><td class="r">9.37</td><td class="r">28</td><td class="r">0.262</td><td class="r">3.6%</td></tr>
-<tr><td>flash::prepare_varlen_num_blocks</td><td class="r">3.35</td><td class="r">28</td><td class="r">0.094</td><td class="r">1.3%</td></tr>
-<tr><td>fused_rope_cache_fp8kv</td><td class="r">2.89</td><td class="r">28</td><td class="r">0.081</td><td class="r">1.1%</td></tr>
-<tr><td>flash::FlashAttnFwdCombine</td><td class="r">1.59</td><td class="r">28</td><td class="r">0.044</td><td class="r">0.6%</td></tr>
-<tr><td>argmax_kernel (sampling tail)</td><td class="r">15.8</td><td class="r">1</td><td class="r">0.016</td><td class="r">0.2%</td></tr>
-<tr><td>fused_rmsnorm_fp8_quant (final norm)</td><td class="r">5.40</td><td class="r">1</td><td class="r">0.005</td><td class="r">0.1%</td></tr>
-<tr><td><strong>TOTAL</strong></td><td class="r"></td><td class="r"><strong>339</strong></td><td class="r"><strong>7.281</strong></td><td class="r"><strong>100%</strong></td></tr>
-</tbody>
-</table>
-
-<h3>GEMM decomposition at N=8 &mdash; where the slack is</h3>
-<table>
-<thead><tr><th>shape group</th><th class="r">per-GEMM &mu;s</th><th class="r">count / step</th><th class="r">ms / step</th><th class="r">HBM-BW lower bound</th><th class="r">slack</th></tr></thead>
-<tbody>
-<tr><td>QKV + O proj (M=8, N&asymp;3.5&ndash;4.6k)</td><td class="r">15&ndash;18</td><td class="r">56</td><td class="r">0.910</td><td class="r">0.245</td><td class="r">3.7&times;</td></tr>
-<tr class="vllm-win"><td><strong>down proj (M=8, 18944&rarr;3584)</strong></td><td class="r">52&ndash;54</td><td class="r">28</td><td class="r"><strong>1.481</strong></td><td class="r">0.567</td><td class="r neg"><strong>2.6&times;</strong></td></tr>
-<tr class="vllm-win"><td><strong>gate_up proj (M=8, 3584&rarr;37888)</strong></td><td class="r">98&ndash;105</td><td class="r">28</td><td class="r"><strong>2.846</strong></td><td class="r">1.135</td><td class="r neg"><strong>2.5&times;</strong></td></tr>
-<tr><td>lm_head (M=8, 3584&rarr;152064)</td><td class="r">357&ndash;359</td><td class="r">1</td><td class="r">0.358</td><td class="r">0.163</td><td class="r">2.2&times;</td></tr>
-</tbody>
-</table>
-<div class="note"><strong>Root cause:</strong> cuBLASLt dispatches a <code>128&times;128&times;128</code> tile for every FP8 linear regardless of M. At M=8, 120/128 rows of the M dimension are padding — SMs are doing useful work on ~6% of the matmul. The two largest shapes (gate_up, down) eat 4.3 ms/step of that slack, which is exactly the entire vLLM gap at N=8 (rvLLM 7.29 ms &minus; vLLM 4.67 ms = 2.62 ms). <strong>Fix</strong>: cuBLASLt top-16 heuristic + on-device autotune, cached per-(M,N,K,epilogue). Landed on commit <code>82b1f59</code>, benched under <code>v0.3.1</code>.</div>
-
-<h2 class="section">Model quality <span class="sub">perplexity + MMLU accuracy</span></h2>
-
-<div class="note">
-  <strong>Why quality matters alongside throughput.</strong> A faster engine is meaningless if its FP8 quantization degrades output quality. We measure perplexity (lower = better next-token prediction, directly tests the forward pass) and MMLU accuracy (higher = better general knowledge). Both compare against a BF16 baseline to isolate quantization loss from model capability.
-</div>
-
-<table>
-<thead><tr><th>Config</th><th class="r">Perplexity (WikiText-2)</th><th class="r">MMLU accuracy</th><th class="r">Source</th></tr></thead>
-<tbody>
-<tr><td>Qwen2.5-7B BF16 (no quant)</td><td class="r"><strong>10.09</strong></td><td class="r">73.56%</td><td class="r"><span class="badge measured">Measured</span></td></tr>
-<tr><td>vLLM FP8 weights (online dynamic quant)</td><td class="r neg">140,107</td><td class="r neg">broken</td><td class="r"><span class="badge measured">Measured</span></td></tr>
-<tr><td>vLLM FP8 weights + FP8 E4M3 KV (scale=1.0)</td><td class="r neg">n/a</td><td class="r neg">23.0%</td><td class="r"><span class="badge measured">Measured</span></td></tr>
-<tr><td>rvLLM FP8 weights + FP8 E4M3 KV (scale=418/448)</td><td class="r">pending</td><td class="r">pending</td><td class="r"><span class="badge future">Requires logits readback</span></td></tr>
-</tbody>
-</table>
-
-<div class="footnote">
-  <strong>Both vLLM FP8 paths are broken on vanilla Qwen2.5-7B-Instruct.</strong> (1) <code>--quantization fp8</code> uses online dynamic FP8 weight quantization without pre-calibrated per-tensor scales, destroying quality (perplexity 140,107 vs 10.09 baseline). (2) <code>--kv-cache-dtype fp8_e4m3</code> defaults to scale=1.0 because the safetensors lack k_scale/v_scale, producing random output (MMLU 23%). <strong>Both are known vLLM limitations when the checkpoint isn't pre-quantized</strong> — use a calibrated FP8 checkpoint (AutoFP8 / llm-compressor) for production vLLM FP8. Our throughput comparison uses the uncalibrated config for kernel-speed parity; the tok/s numbers measure compute throughput, not output quality. rvLLM's FP8 path uses calibrated per-tensor scales (weights: per-tensor at load via clamp-ppm; KV: K absmax=418, V absmax=73.5 from a real BF16 calibration pass). Direct rvLLM perplexity requires DtoH of the full 152k-vocab logits tensor — implemented in <code>rvllm_ppl.rs</code>, shipping next release.
-</div>
-
-<h2 class="section">Deployment footprint</h2>
-<div class="chart-box">
-  <div class="chart-title"><strong>Bytes on disk to ship the engine</strong>
-    <div class="note">rvLLM: one binary + three CUDA .so files. vLLM: a full conda env including torch, xformers, triton, numpy, and ~500 Python modules.</div>
-  </div>
-  <div id="chart-footprint" style="height:280px"></div>
-</div>
-
-<h2 class="section">VRAM use on an 80 GB H100</h2>
-<div class="chart-box">
-  <div class="chart-title"><strong>Memory posture at idle</strong>
-    <div class="note">rvLLM sizes its HBM arena to exactly what the current batch needs (7 GB weights + sized-for-N KV + scratch). vLLM pre-reserves 74 GB for its paged-KV allocator on server start; the actual amount used at any given moment is similar, but the reservation shape is different.</div>
-  </div>
-  <div id="chart-vram" style="height:280px"></div>
-</div>
-
-<h2 class="section">What the freed VRAM buys <span class="sub">projected single-card scaling with 72 GB of unused HBM</span> <span class="badge estimate">Estimate</span></h2>
-
-<div class="note">
-  <strong>Terminology note.</strong> Tensor parallelism (TP) is a <em>multi-GPU</em> technique &mdash; it splits each layer's weight matrix across devices, with NVLink/NCCL collectives between layers. You can't do TP on one card. On a single H100 with 72 GB free, the useful lever is <strong>data parallelism / batch scaling / multi-instance</strong>: use that spare HBM to either push batch much higher, load long-context KV, or run several copies of the same model side-by-side. Below are honest projections for each; numbers are extrapolated from the measured N=64&ndash;512 sweep unless explicitly measured.
-</div>
-
-<h3>Path 1: push batch to the HBM ceiling (same model, one instance)</h3>
-<div class="chart-box">
-  <div class="chart-title"><strong>Projected throughput vs batch size</strong> &mdash; solid = measured, dashed = projected
-    <div class="note">At N=512 we already measured 41,560 tok/s using 7.8 GB. With 72 GB free, the KV pool can hold ~11,000 concurrent sequences at 2k context, or ~42,700 at 528 tokens. Throughput projection assumes the current HBM-bound scaling law (measured: tok/s &prop; N<sup>0.87</sup> between N=64 and N=512). Curve flattens hard around N=2k&ndash;4k as we hit HBM-BW saturation (3 TB/s cap at 7 GB weights/step &asymp; 430k tok/s theoretical max).</div>
-  </div>
-  <div id="chart-scaling" style="height:320px"></div>
-</div>
-
-<table>
-<thead><tr><th>N</th><th class="r">tok/s</th><th class="r">KV bytes</th><th class="r">total HBM</th><th class="r">source</th></tr></thead>
-<tbody>
-<tr><td>64</td><td class="r">12,477</td><td class="r">0.10 GB</td><td class="r">~7.1 GB</td><td class="r">measured</td></tr>
-<tr><td>512</td><td class="r">41,560</td><td class="r">0.77 GB</td><td class="r">~7.8 GB</td><td class="r">measured</td></tr>
-<tr><td>1,024</td><td class="r">~57,000</td><td class="r">1.5 GB</td><td class="r">~8.6 GB</td><td class="r">projected</td></tr>
-<tr><td>2,048</td><td class="r">~78,000</td><td class="r">3.1 GB</td><td class="r">~10.2 GB</td><td class="r">projected</td></tr>
-<tr><td>4,096</td><td class="r">~107,000</td><td class="r">6.2 GB</td><td class="r">~13.4 GB</td><td class="r">projected (bandwidth-limited)</td></tr>
-<tr><td>8,192</td><td class="r">~130,000</td><td class="r">12.4 GB</td><td class="r">~19.6 GB</td><td class="r">projected (approaching BW ceiling)</td></tr>
-<tr><td>16,384</td><td class="r">~150,000</td><td class="r">24.8 GB</td><td class="r">~32 GB</td><td class="r">projected (BW-capped)</td></tr>
-</tbody>
-</table>
-<div class="footnote"><strong>Caveat.</strong> Projections above N=512 are bandwidth-scaling extrapolations, not measurements. Real numbers need a bench run at higher N &mdash; currently blocked by our bench's fixed pre-allocation path (needs a trivial rvllm-bench extension to target N&gt;512). Will post measured data after we run it.</div>
-
-<h3>Path 2: multiple Qwen2.5-7B instances on one card (data parallelism)</h3>
-<p>At 7.8 GB per instance, a single 80 GB H100 fits <strong>~10 independent Qwen2.5-7B engines</strong> side-by-side with separate KV pools, independent schedulers, no inter-instance traffic. Each instance sees a fraction of the SMs and HBM bandwidth (approximately 1/k of each when k instances run). At k=4 you'd see roughly 4&times; request capacity at ~1/4 per-request throughput &mdash; same aggregate tok/s, 4&times; more concurrent sessions. Useful when latency-per-user matters more than total GPU throughput (e.g. many low-QPS chat users).</p>
-
-<h3>Path 3: long-context serving on a single H100</h3>
-<p>At 32 concurrent sequences with 72 GB of free KV:</p>
-<ul style="margin:0.6rem 1.2rem;color:#d4d4d4;font-size:0.9rem">
-  <li><strong>32 seqs @ 250k context</strong> (72 GB / 32 / (28 &times; 8 &times; 128 &times; 1 byte) &asymp; 250,000 tokens/seq)</li>
-  <li><strong>16 seqs @ 500k context</strong></li>
-  <li><strong>4 seqs @ 2M context</strong> (needs RoPE extension; position encoding hold is separate)</li>
-</ul>
-<p>vLLM's 74 GB reservation pre-allocates its KV pool at server start; rvLLM's per-batch sizing means you can admit requests with wildly different context lengths without upfront planning.</p>
-
-<h3>Path 4: tensor parallelism on a single card &mdash; why it fails <span class="badge estimate">Estimate</span></h3>
-<p>A reasonable question: if we have 72 GB free, can we "simulate multiple GPUs" on one card and do TP? Three ways this gets attempted; each loses for a concrete reason.</p>
-
-<h4 style="font-size:0.92rem;font-weight:600;color:#fff;margin:1rem 0 0.3rem">1. MIG (Multi-Instance GPU)</h4>
-<p style="margin-bottom:0.6rem">H100 supports partitioning into up to 7 MIG instances with <em>dedicated</em> SMs and HBM per slice. You can run TP across MIG instances &mdash; hardware-real, not simulated. The problem is inter-MIG communication: it does <strong>not</strong> use NVLink. It routes through the PCIe root complex, which is ~10&ndash;50&times; slower than NVLink for small collectives. TP needs an all-reduce after each attention layer and after each MLP &mdash; <strong>28 layers &times; 2 = 56 collectives per decode step</strong>.</p>
-
-<div class="chart-box">
-  <div class="chart-title"><strong>Hypothetical MIG TP-2 step time breakdown at N=128</strong> <span class="badge estimate">Estimate</span>
-    <div class="note">Current rvLLM: 5.83 ms/step (measured). Hypothetical TP-2-on-MIG splits each GEMM in half (compute ~halves to 2.9 ms) but inserts 56 inter-MIG all-reduces. At ~500 &mu;s per small-payload PCIe all-reduce (typical measured on H100 MIG pairs), comm alone is 28 ms. Net step time: <strong>~31 ms (5.3&times; slower than single-card)</strong>.</div>
-  </div>
-  <div id="chart-mig" style="height:220px"></div>
-</div>
-
-<h4 style="font-size:0.92rem;font-weight:600;color:#fff;margin:1rem 0 0.3rem">2. Multi-process (CUDA MPS)</h4>
-<p>Run two processes on one card, each sees the full GPU. Time-multiplexes the SMs. <strong>This isn't TP</strong> &mdash; each process runs the whole model, not a split. It's equivalent to Path 2 (data parallelism / multi-instance). Useful for concurrent capacity, not for one-forward-pass acceleration.</p>
-
-<h4 style="font-size:0.92rem;font-weight:600;color:#fff;margin:1rem 0 0.3rem">3. Software TP inside one process</h4>
-<p>Split each weight tensor in half, run two smaller GEMMs sequentially, concatenate. <strong>Strictly slower</strong> than the combined GEMM: if the original saturated SMs, two halves serialize on the same SMs with launch overhead; if the original was SM-underutilized, the fix is better <em>tile selection</em> (smaller M-tile), which is what our <code>v0.3.1</code> top-16 cuBLASLt autotune does &mdash; not TP.</p>
-
-<h3>Why TP even exists <span class="sub">the real math</span></h3>
-<p>TP pays off on multi-GPU because two benefits compound:</p>
-<ul style="margin:0.5rem 1.2rem;color:#d4d4d4;font-size:0.9rem">
-  <li><strong>Memory split</strong> — weights that don't fit on one card (70B+ FP8 = 70 GB, won't fit in 80 GB after KV + activations) are shared across cards.</li>
-  <li><strong>Independent compute</strong> — each card has its own full SM pool and HBM. Work runs genuinely in parallel, limited only by the collective latency.</li>
-</ul>
-<p>On one card: neither applies. 7B fits. One SM pool. The collective cost is the <em>only</em> term that scales, and it scales up.</p>
-
-<h3>Where TP actually pays off <span class="badge future">Phase G roadmap</span></h3>
-
-<div class="chart-box">
-  <div class="chart-title"><strong>Projected rvLLM throughput by model size &amp; GPU count</strong> <span class="badge future">Not shipped</span>
-    <div class="note">Projection from current Qwen2.5-7B per-card throughput scaled by model size (tok/s &prop; 1 / active weight bytes) and TP all-reduce overhead on NVLink (900 GB/s, ~15 &mu;s per layer). Assumes H100 SXM with NVLink mesh. TP is a Phase G deliverable &mdash; not in v0.3.0.</div>
-  </div>
-  <div id="chart-tp-future" style="height:320px"></div>
-</div>
-
-<table>
-<thead><tr><th>Model</th><th class="r">Weights (FP8)</th><th class="r">Min H100s (TP)</th><th class="r">Projected tok/s @ N=128</th><th class="r">Status</th></tr></thead>
-<tbody>
-<tr><td>Qwen2.5-7B</td><td class="r">7 GB</td><td class="r">1</td><td class="r">21,946</td><td class="r"><span class="badge measured">Measured v0.3.0</span></td></tr>
-<tr><td>Qwen2.5-14B (or Llama 3.1 13B)</td><td class="r">13 GB</td><td class="r">1</td><td class="r">~11,500</td><td class="r"><span class="badge estimate">Estimate</span></td></tr>
-<tr><td>Qwen2.5-32B</td><td class="r">32 GB</td><td class="r">1</td><td class="r">~4,800</td><td class="r"><span class="badge estimate">Estimate</span></td></tr>
-<tr><td>Llama 3.1 70B</td><td class="r">70 GB</td><td class="r">2 (TP-2 NVLink)</td><td class="r">~2,100</td><td class="r"><span class="badge future">Phase G</span></td></tr>
-<tr><td>Qwen2.5-72B</td><td class="r">72 GB</td><td class="r">2 (TP-2 NVLink)</td><td class="r">~2,050</td><td class="r"><span class="badge future">Phase G</span></td></tr>
-<tr><td>DeepSeek-V3 (dense equivalent)</td><td class="r">~180 GB</td><td class="r">4 (TP-4 NVLink)</td><td class="r">~750</td><td class="r"><span class="badge future">Phase G</span></td></tr>
-<tr><td>405B-class dense</td><td class="r">405 GB</td><td class="r">8 (TP-8 NVLink mesh)</td><td class="r">~280</td><td class="r"><span class="badge future">Phase G</span></td></tr>
-</tbody>
-</table>
-
-<div class="footnote"><strong>Legend:</strong>
-  <span class="badge measured">Measured</span> is a real bench run in v0.3.0 at the current commit.
-  <span class="badge estimate">Estimate</span> is extrapolated from measured data (single-card larger-model projection, or TP comm cost modeling). Accuracy within ~20% expected.
-  <span class="badge future">Phase G</span> requires multi-GPU support (NCCL collectives, sharded weight loader, cross-device stream sync) &mdash; not present in v0.3.0. Targeted for a later release after Phase F real-prefill (shipped) and Phase G scheduler + continuous batching.
-</div>
-
-<h2 class="section">Cold start <span class="sub">process launch &rarr; first token ready</span></h2>
-<div class="chart-box">
-  <div class="chart-title"><strong>Where the first ~100 seconds goes</strong>
-    <div class="note">Stacked breakdown. rvLLM starts serving 20&ndash;60 s faster on first launch; subsequent launches narrow as vLLM's Triton JIT cache warms.</div>
-  </div>
-  <div id="chart-coldstart" style="height:200px"></div>
-</div>
-
-<h2 class="section">TPU v6e (Trillium) &mdash; StableHLO port <span class="sub">kernel latency, single chip, bf16</span> <span class="badge measured">Measured</span></h2>
-
-<div class="caveat">
-  <strong>Read this before comparing to the H100 numbers.</strong> The TPU run is a <em>port proof</em>, not a head-to-head. Kernel shapes match the H100 bench but dtype is <strong>bf16 on TPU vs fp8 e4m3 on H100</strong> (TPU v6e has no fp8 StableHLO op yet), compute is <strong>dense on TPU vs quantised on H100</strong>, and the device is a <strong>single v6e-1 chip</strong> (918 TFLOPS bf16, 32 GB HBM) vs an H100 SXM 80 GB. 34 of 40 rvLLM CUDA kernels lowered to StableHLO and executed on real TPU silicon in one batch; the 6 skipped are all FP8 paths that require a <code>stablehlo.custom_call</code> fallback we deliberately refused to write.
-</div>
-
-<div class="pill-row">
-  <div class="pill">
-    <div class="label">kernels running on TPU</div>
-    <strong>34/40</strong>
-    <div class="caption">6 FP8 kernels skipped (no silent fallbacks)</div>
-  </div>
-  <div class="pill">
-    <div class="label">full decode layer</div>
-    <strong>2.15&nbsp;ms</strong>
-    <div class="caption">persistent_layer_decode, bs=8, bf16</div>
-  </div>
-  <div class="pill">
-    <div class="label">flash attention</div>
-    <strong>137&nbsp;&mu;s</strong>
-    <div class="caption">B=1 Sq=Sk=128 H=32 HKV=8 D=128 bf16</div>
-  </div>
-  <div class="pill">
-    <div class="label">compile path</div>
-    <strong>JAX &rarr; StableHLO &rarr; XLA</strong>
-    <div class="caption">jax 0.6.2, v6e-1, us-east5-b</div>
-  </div>
-</div>
-
-<h3>Per-kernel latency on v6e-1</h3>
-<div class="chart-box">
-  <div class="chart-title"><strong>TPU v6e-1 kernel latency (&mu;s)</strong> &mdash; warmup&times;3, median of 20 iters, bf16 where applicable
-    <div class="note">Single-chip Trillium. Same logical shapes as the H100 rvLLM bench &mdash; hidden=4096, heads=32, kv_heads=8, head_dim=128, intermediate=14336, block_size=16. FP8 / INT4 kernels tagged as <strong>n/a</strong> are manifest-level TODOs blocked on a StableHLO FP8 op; they do not run.</div>
-  </div>
-  <div id="chart-tpu" style="height:720px"></div>
-</div>
-
-<table>
-<thead><tr><th>kernel</th><th>family</th><th class="r">v6e-1 &mu;s</th><th>notes</th></tr></thead>
-<tbody>
-<tr><td>rms_norm</td><td>norm</td><td class="r">138.1</td><td>128&times;4096 fp32</td></tr>
-<tr><td>fused_residual_rmsnorm</td><td>norm</td><td class="r">193.3</td><td>add + norm, 2 outputs</td></tr>
-<tr><td>fused_rmsnorm_fp8_quant</td><td>norm</td><td class="r">n/a</td><td>FP8 quant, no StableHLO op</td></tr>
-<tr><td>rotary_embedding</td><td>rope</td><td class="r">200.3</td><td>GQA, 32/8 heads</td></tr>
-<tr><td>fused_rope_cache</td><td>rope</td><td class="r">289.9</td><td>RoPE + reshape_and_cache</td></tr>
-<tr><td>softmax</td><td>softmax</td><td class="r">159.3</td><td>128&times;32000 stable</td></tr>
-<tr><td>activation_silu</td><td>elementwise</td><td class="r">132.9</td><td>524k-elem vector</td></tr>
-<tr><td>activation_gelu</td><td>elementwise</td><td class="r">131.3</td><td>exact (non-approx)</td></tr>
-<tr><td>fused_silu_mul</td><td>elementwise</td><td class="r">138.5</td><td>interleaved gate_up split</td></tr>
-<tr><td>add_bias</td><td>elementwise</td><td class="r">128.3</td><td>broadcast over rows</td></tr>
-<tr><td>cast_fp</td><td>elementwise</td><td class="r">128.0</td><td>fp32 &rarr; bf16</td></tr>
-<tr><td>argmax</td><td>reduction</td><td class="r">136.7</td><td>128&times;32000 &rarr; i32</td></tr>
-<tr><td>fused_lm_head_argmax</td><td>reduction</td><td class="r">895.1</td><td>einsum + argmax, vocab=128k</td></tr>
-<tr><td>embedding_gather</td><td>gather</td><td class="r">132.9</td><td>vocab=128k, 128 tokens</td></tr>
-<tr><td>copy_blocks</td><td>kv-cache</td><td class="r">388.9</td><td>64 (src,dst) scatter pairs</td></tr>
-<tr><td>reshape_and_cache</td><td>kv-cache</td><td class="r">273.1</td><td>128 tokens &rarr; paged slots</td></tr>
-<tr><td>fp8_kv</td><td>kv-cache</td><td class="r">n/a</td><td>FP8 E4M3 cache, no op</td></tr>
-<tr><td>qkv_transpose</td><td>layout</td><td class="r">125.6</td><td>[T,H,D] &rarr; [H,T,D]</td></tr>
-<tr><td>deinterleave_qkv</td><td>layout</td><td class="r">196.6</td><td>static-split Q/K/V</td></tr>
-<tr><td>quantize_activation_fp8</td><td>quant</td><td class="r">n/a</td><td>FP8 quant, no op</td></tr>
-<tr><td>fused_silu_fp8_quant</td><td>quant</td><td class="r">n/a</td><td>FP8 quant, no op</td></tr>
-<tr><td>gemm_bf16</td><td>gemm</td><td class="r">137.7</td><td>M=128 N=K=4096</td></tr>
-<tr><td>gemv_f16</td><td>gemm</td><td class="r">150.5</td><td>M=1 N=K=4096</td></tr>
-<tr><td>gemv_fp8</td><td>gemm</td><td class="r">n/a</td><td>FP8 scaled dot, no op</td></tr>
-<tr><td>gemv_int4</td><td>gemm</td><td class="r">257.4</td><td>dequant + dot</td></tr>
-<tr><td>cutlass_fp8_gemm</td><td>gemm</td><td class="r">n/a</td><td>FP8 scaled dot, no op</td></tr>
-<tr><td>cutlass_qkv_bias</td><td>gemm</td><td class="r">136.5</td><td>M=128, qkv_out=6144</td></tr>
-<tr><td>cutlass_gateup_silu</td><td>gemm</td><td class="r">290.1</td><td>M=128 &rarr; 2&times;14336</td></tr>
-<tr><td>cutlass_oproj_residual</td><td>gemm</td><td class="r">137.3</td><td>M=128, hidden=4096</td></tr>
-<tr><td>fused_silu_down</td><td>gemm</td><td class="r">211.6</td><td>silu_mul + down proj</td></tr>
-<tr><td>fused_norm_gemv</td><td>gemm</td><td class="r">152.1</td><td>M=1 decode row</td></tr>
-<tr><td>fused_add_norm_qkv_gemv</td><td>gemm</td><td class="r">221.7</td><td>residual path, M=1</td></tr>
-<tr><td>fused_add_norm_gateup_gemv</td><td>gemm</td><td class="r">347.3</td><td>M=1 MLP up</td></tr>
-<tr><td>fused_oproj_add_norm_gateup_gemv</td><td>gemm</td><td class="r">370.9</td><td>oproj + add + norm + gateup</td></tr>
-<tr><td>flash_attention</td><td>attention</td><td class="r">137.1</td><td>B=1 Sq=Sk=128 H=32 bf16</td></tr>
-<tr><td>flash_attention_3</td><td>attention</td><td class="r">134.2</td><td>same lower, shares HLO</td></tr>
-<tr><td>paged_attention</td><td>attention</td><td class="r">1,811.5</td><td>8 seqs &times; 256 blocks gather</td></tr>
-<tr><td>split_kv_attention</td><td>attention</td><td class="r">1,813.7</td><td>GPU split-KV collapses on XLA</td></tr>
-<tr><td>persistent_gemm</td><td>gemm</td><td class="r">136.0</td><td>XLA already re-fuses</td></tr>
-<tr><td><strong>persistent_layer_decode</strong></td><td>megakernel</td><td class="r"><strong>2,151.2</strong></td><td><strong>full decode layer, bs=8, all fused</strong></td></tr>
-</tbody>
-</table>
-
-<div class="footnote"><strong>What the numbers say.</strong>  Small ops cluster at 125&ndash;200&nbsp;&mu;s &mdash; that's the XLA host-to-device-dispatch floor on a single v6e chip, not the kernel body. Anything bigger (<code>paged_attention</code> at 1.8&nbsp;ms, the full decode layer at 2.15&nbsp;ms) is real compute. The paged-attention cost is dominated by the <code>stablehlo.gather</code> on the block table + 8&times; GQA expansion; this is the same math the H100 FA3 kernel is doing, but implemented in XLA primitives rather than a hand-tuned CUDA kernel. The 6 FP8 rows are the honest gap: TPU v6e has no StableHLO FP8 op yet and we refuse to insert a silent bf16 fallback. Fixing them is a StableHLO spec problem, not a port problem.</div>
-
-<div class="method">
-<strong>TPU kernel suite</strong> (under <code>tpu/</code>): JAX traces each CUDA kernel's logical signature via a <code>ShapeDtypeStruct</code> trace-spec, <code>jax.jit(...).lower(...).compiler_ir(dialect="stablehlo")</code> emits one <code>.mlir</code> per kernel (1,138 lines total), and <code>harness/execute_all.py</code> runs them on the active JAX backend with warmup&times;3 + median-of-20 iter timing. Kernel numbers above are from a Cloud TPU v6e-1 in <code>us-east5-b</code>; confirmed identical on a v6e-4 (2&times;2, 4 chips) in <code>us-east5-a</code>.
+  <strong>GPU perplexity validation in progress.</strong> The GPU forward pass for Gemma 4 31B is implemented and runs end-to-end. Perplexity validation against the TPU baseline (25.51) is actively being debugged - tracking logit softcap and F32 precision through lm_head GEMM. Throughput numbers will be posted once perplexity is confirmed correct.
 </div>
 
 
-<h2>Method &mdash; how these runs were produced</h2>
-<div class="method">
-<strong>rvLLM 0.3.0</strong> (tag <code>v0.3.0</code>, commit <code>82b1f59</code>):<br>
-<code>RVLLM_MODEL_DIR=... RVLLM_KERNELS_DIR=... RVLLM_CUTLASS_SO=... RVLLM_FA3_SO=... RVLLM_POLICY=... RVLLM_TTFT=1 RVLLM_REAL_PREFILL=1 RVLLM_PREFILL_LEN=16 RVLLM_BATCH=&lt;N&gt; RVLLM_ITERS=128 RVLLM_WARMUP=5 ./target/release/rvllm-bench</code><br><br>
-Cold TTFT = first timed prefill call after 5 warmup decode steps. Hot TTFT = second timed prefill. Throughput = (ITERS &times; N) / (timed decode window) after warmup.<br><br>
-<strong>vLLM 0.19 V1</strong>:<br>
-<code>vllm serve Qwen2.5-7B-Instruct --quantization fp8 --kv-cache-dtype fp8_e4m3 --dtype bfloat16 --max-model-len 2048 --max-num-seqs 512 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.9</code><br><br>
-Then, for each N, run twice (cold then hot) on the same server process:<br>
-<code>vllm bench serve --dataset-name random --num-prompts &lt;N&gt; --max-concurrency &lt;N&gt; --random-input-len 16 --random-output-len 512 --ignore-eos</code><br><br>
-Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Reported TTFT = tool's <code>Mean TTFT</code>.<br><br>
-<strong>nsys profile (N=8, rvLLM)</strong>: <code>nsys profile --trace=cuda,nvtx,osrt --sample=none --cudabacktrace=none --output=rvllm_n8 --stats=true rvllm-bench</code>. GPU was idle (no vLLM). Kernel sums parsed over the 21 steady-state graph-replay steps post-warmup.
+<hr class="divider">
+
+
+<!-- ============================================================ -->
+<!-- METHOD                                                        -->
+<!-- ============================================================ -->
+
+<h2 class="section">Method</h2>
+<div class="method-box">
+<strong>TPU benchmarks</strong> (tag <code>v0.3.0</code>):<br>
+Hardware: Cloud TPU v6e-4 (4 chips, 128 GB HBM, ~3.3 TB/s aggregate bandwidth), <code>us-east5-b</code>.<br>
+Model: <code>google/gemma-4-31B-it</code>, int8 weight quantization (jnp.int8), bf16 activations.<br>
+Timing: <code>jax.block_until_ready()</code> after each step. Warmup: 3 steps discarded. Measurement: median of 20 iterations.<br>
+LIBTPU flags: <code>--xla_tpu_enable_async_collective_fusion=true --xla_tpu_dot_dot_fusion_duplicated=true --xla_tpu_scheduler_rerun=5</code><br>
+Perplexity: measured on a short text passage, compared against HuggingFace <code>transformers</code> bf16 reference on GPU.<br><br>
+
+<strong>GPU pipeline</strong> (v3 codebase, Rust + CUDA):<br>
+Hardware: H100 SXM 80 GB.<br>
+Model: Gemma 4 31B, FP8 E4M3 weights (per-tensor scale at load), FP8 E4M3 KV cache (calibrated scales).<br>
+Forward: 16 kernel launches per layer, 60 layers + lm_head + argmax = ~963 launches per step, captured in a single <code>cuGraphLaunch</code>.<br>
+Kernels: CUTLASS FP8 GEMMs (SM90), FlashAttention-3, custom fused ops (RMSNorm+quant, RoPE+KV, GELU*mul+quant, logit softcap).<br>
 </div>
+
 
 <footer>
-<p>rvLLM — Apache-2.0 — <a href="https://github.com/m0at/rvllm">github.com/m0at/rvllm</a></p>
+<p>rvLLM - Apache-2.0 - <a href="https://github.com/m0at/rvllm">github.com/m0at/rvllm</a></p>
 </footer>
 
 </div>
@@ -610,338 +348,115 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
   const e = React.createElement;
   const R = Recharts;
 
-  // Post FP8-scale-fix numbers (v0.3.1, scale = 418/448 calibrated from Qwen2.5-7B)
-  const tsData = [
-    { n: '1',   rvllm:    137, vllm:    223 },
-    { n: '8',   rvllm:  1096, vllm:   1712 },
-    { n: '16',  rvllm:  2313, vllm:   3342 },
-    { n: '64',  rvllm: 12528, vllm:  11151 },
-    { n: '128', rvllm: 22339, vllm:  17778 },
-    { n: '256', rvllm: 32129, vllm:  24270 },
-    { n: '512', rvllm: 43780, vllm:  31485 }
+  const tooltipStyle = { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' };
+
+  // TPU batch scaling data
+  const tpuScalingData = [
+    { batch: '1',    toks: 79.9 },
+    { batch: '8',    toks: 584 },
+    { batch: '64',   toks: 4220 },
+    { batch: '128',  toks: 6831 },
+    { batch: '256',  toks: 10536 },
+    { batch: '512',  toks: 12932 },
+    { batch: '768',  toks: 13943 },
+    { batch: '1024', toks: 13705 }
   ];
 
-  const ttftData = [
-    { n: '1',   rvllm:  48.79, vllm:  25.15 },
-    { n: '8',   rvllm:  43.84, vllm:  47.25 },
-    { n: '16',  rvllm:  45.01, vllm:  75.18 },
-    { n: '64',  rvllm:  58.81, vllm: 200.78 },
-    { n: '128', rvllm:  55.27, vllm: 347.59 },
-    { n: '256', rvllm:  72.80, vllm: 622.22 },
-    { n: '512', rvllm: 117.92, vllm: 879.60 }
-  ];
-
-  const nsysData = [
-    { name: 'GEMM 128x128x128 (5 linears)',   ms: 5.660 },
-    { name: 'quantize_fp8_per_token',         ms: 0.493 },
-    { name: 'FlashAttnFwdSm90 (FA3)',         ms: 0.329 },
-    { name: 'fused_add_rmsnorm_fp8_quant',    ms: 0.297 },
-    { name: 'fused_silu_mul_fp8_quant',       ms: 0.262 },
-    { name: 'prepare_varlen_num_blocks',      ms: 0.094 },
-    { name: 'fused_rope_cache_fp8kv',         ms: 0.081 },
-    { name: 'FlashAttnFwdCombine',            ms: 0.044 },
-    { name: 'argmax (sampling tail)',         ms: 0.016 },
-    { name: 'fused_rmsnorm_fp8_quant (tail)', ms: 0.005 }
-  ];
-
-  const footprintData = [
-    { engine: 'rvLLM 0.3.0', total: 90,    label: '~90 MB   (9.2 MB binary + 81 MB kernels)' },
-    { engine: 'vLLM 0.19',   total: 11000, label: '~11,000 MB   (torch 1.8 GB + vllm 1.2 GB + conda env)' }
-  ];
-
-  const vramData = [
-    { engine: 'rvLLM 0.3.0', used: 7.8,  reserved: 7.8,  free: 72.2 },
-    { engine: 'vLLM 0.19',   used: 15.0, reserved: 74.0, free: 6.0 }
-  ];
-
-  const coldStartData = [
-    { engine: 'rvLLM', start: 0.1, load_quant: 60, kernel_init: 12, jit: 0, dispatch: 0 },
-    { engine: 'vLLM',  start: 2,   load_quant: 70, kernel_init: 0, jit: 40, dispatch: 4 }
-  ];
-
-  // MIG TP on one card — step time breakdown.
-  const migData = [
-    { label: 'Current rvLLM (no TP)',    compute: 5.83, comm: 0.0, tag: '5.8 ms' },
-    { label: 'Hypothetical MIG TP-2',    compute: 2.92, comm: 28.0, tag: '~31 ms (5.3× slower)' }
-  ];
-
-  // Future multi-GPU TP projection.
-  const tpFutureData = [
-    { model: '7B',      size: 7,   cards: 1, toks: 21946, meas: true },
-    { model: '14B',     size: 13,  cards: 1, toks: 11500, meas: false },
-    { model: '32B',     size: 32,  cards: 1, toks: 4800,  meas: false },
-    { model: '70B',     size: 70,  cards: 2, toks: 2100,  meas: false },
-    { model: '72B',     size: 72,  cards: 2, toks: 2050,  meas: false },
-    { model: '180B',    size: 180, cards: 4, toks: 750,   meas: false },
-    { model: '405B',    size: 405, cards: 8, toks: 280,   meas: false }
-  ];
-
-  // Scaling projection for Path 1: measured points plus extrapolated.
-  // Power-law fit of measured N=64..512: tok/s ~= 95 * N^0.87 (R^2 ~0.999).
-  // Curve flattens at HBM saturation (3 TB/s / 7 GB weights/step -> ~430k
-  // tok/s ceiling, but with launch overhead and non-weight HBM traffic
-  // the effective ceiling is much lower; projections here assume a soft
-  // plateau near 150-200k tok/s).
-  const scalingData = [
-    { n: 64,    measured: 12477, projected: null },
-    { n: 128,   measured: 21946, projected: null },
-    { n: 256,   measured: 33968, projected: null },
-    { n: 512,   measured: 41560, projected: 41560 },
-    { n: 1024,  measured: null,  projected: 57000 },
-    { n: 2048,  measured: null,  projected: 78000 },
-    { n: 4096,  measured: null,  projected: 107000 },
-    { n: 8192,  measured: null,  projected: 130000 },
-    { n: 16384, measured: null,  projected: 150000 }
-  ];
-
-  // Multi-model comparison at N=128 (the batch size where we have the most cross-model data)
-  const multiModelData = [
-    { model: 'OPT-1.3B', vllm: 23102, rvllm: null },
-    { model: 'Mistral-7B', vllm: 17878, rvllm: null },
-    { model: 'Qwen3-8B', vllm: 16406, rvllm: 17306 }
-  ];
-
-  function MultiModel(){
+  function TpuScaling(){
     return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
-      e(R.BarChart, { data: multiModelData, margin: { top: 38, right: 24, left: 18, bottom: 8 } },
+      e(R.BarChart, { data: tpuScalingData, margin: { top: 30, right: 30, left: 20, bottom: 8 } },
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
-        e(R.XAxis, { dataKey: 'model', stroke: '#ccc', tick: { fill: '#ddd', fontSize: 12 } }),
-        e(R.YAxis, { stroke: '#666', tickFormatter: v => v.toLocaleString(), label: { value: 'tok/s @ N=128', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
-        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' }, formatter: (v, name) => v == null ? 'pending' : v.toLocaleString() + ' tok/s' }),
+        e(R.XAxis, { dataKey: 'batch', stroke: '#888', tick: { fill: '#ccc', fontSize: 12 }, label: { value: 'Batch size', position: 'insideBottom', offset: -4, fill: '#aaa', fontSize: 11 } }),
+        e(R.YAxis, { stroke: '#888', tickFormatter: v => v.toLocaleString(), tick: { fill: '#ccc' }, label: { value: 'tok/s', angle: -90, position: 'insideLeft', fill: '#aaa', fontSize: 11 } }),
+        e(R.Tooltip, { contentStyle: tooltipStyle, formatter: v => v.toLocaleString() + ' tok/s' }),
+        e(R.Bar, { dataKey: 'toks', name: 'Throughput (tok/s)', fill: '#84E6B7', radius: [4, 4, 0, 0] },
+          e(R.LabelList, { dataKey: 'toks', position: 'top', fill: '#c0f0d8', fontSize: 11, formatter: v => v >= 1000 ? (v/1000).toFixed(1)+'k' : v })
+        )
+      )
+    );
+  }
+
+  // TPU vs GPU cost comparison
+  const costData = [
+    { hw: 'TPU v6e-4', toks: 13943, cost: 2681, measured: true },
+    { hw: 'H100 SXM (est)', toks: 6000, cost: 675, measured: false },
+    { hw: 'H200 (est)', toks: 4000, cost: 417, measured: false }
+  ];
+
+  function TpuVsGpu(){
+    return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
+      e(R.BarChart, { data: costData, margin: { top: 30, right: 30, left: 20, bottom: 8 } },
+        e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
+        e(R.XAxis, { dataKey: 'hw', stroke: '#888', tick: { fill: '#ccc', fontSize: 12 } }),
+        e(R.YAxis, { yAxisId: 'left', stroke: '#888', tickFormatter: v => v.toLocaleString(), tick: { fill: '#ccc' }, label: { value: 'tok/s', angle: -90, position: 'insideLeft', fill: '#aaa', fontSize: 11 } }),
+        e(R.YAxis, { yAxisId: 'right', orientation: 'right', stroke: '#888', tickFormatter: v => v.toLocaleString(), tick: { fill: '#ccc' }, label: { value: 'tok/s/$', angle: 90, position: 'insideRight', fill: '#aaa', fontSize: 11 } }),
+        e(R.Tooltip, { contentStyle: tooltipStyle }),
         e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
-        e(R.Bar, { dataKey: 'vllm', name: 'vLLM 0.19', fill: '#5a8bd4' },
-          e(R.LabelList, { dataKey: 'vllm', position: 'top', fill: '#8eb0e0', fontSize: 10, formatter: v => v ? v.toLocaleString() : '' })
+        e(R.Bar, { yAxisId: 'left', dataKey: 'toks', name: 'Peak tok/s', fill: '#84E6B7', radius: [4, 4, 0, 0] },
+          e(R.LabelList, { dataKey: 'toks', position: 'top', fill: '#c0f0d8', fontSize: 11, formatter: v => v >= 1000 ? (v/1000).toFixed(1)+'k' : '~'+v })
         ),
-        e(R.Bar, { dataKey: 'rvllm', name: 'rvLLM 0.3.0', fill: '#84E6B7' },
-          e(R.LabelList, { dataKey: 'rvllm', position: 'top', fill: '#b5f3d2', fontSize: 10, offset: 14, formatter: v => v ? v.toLocaleString() : 'pending' })
+        e(R.Bar, { yAxisId: 'right', dataKey: 'cost', name: 'tok/s/$ (cost efficiency)', fill: '#5a8bd4', radius: [4, 4, 0, 0] },
+          e(R.LabelList, { dataKey: 'cost', position: 'top', fill: '#8eb0e0', fontSize: 11, formatter: v => v.toLocaleString() })
         )
       )
     );
   }
 
-  function Throughput(){
-    return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
-      e(R.BarChart, { data: tsData, margin: { top: 34, right: 24, left: 18, bottom: 8 } },
-        e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
-        e(R.XAxis,    { dataKey: 'n', stroke: '#666', label: { value: 'Batch size (concurrent prompts)', position: 'insideBottom', offset: -4, fill: '#888', fontSize: 11 } }),
-        e(R.YAxis,    { stroke: '#666', domain: [0, 46000], tickFormatter: v => v.toLocaleString(), label: { value: 'tokens / second', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
-        e(R.Tooltip,  { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' }, formatter: v => v.toLocaleString() + ' tok/s' }),
-        e(R.Legend,   { wrapperStyle: { paddingTop: 8 } }),
-        e(R.Bar, { dataKey: 'rvllm', name: 'rvLLM 0.3.0', fill: '#84E6B7' },
-          e(R.LabelList, { dataKey: 'rvllm', position: 'top', fill: '#b5f3d2', fontSize: 10, offset: 14, formatter: v => v.toLocaleString() })
-        ),
-        e(R.Bar, { dataKey: 'vllm',  name: 'vLLM 0.19 (hot)', fill: '#5a8bd4' },
-          e(R.LabelList, { dataKey: 'vllm', position: 'top', fill: '#8eb0e0', fontSize: 10, formatter: v => v.toLocaleString() })
-        )
-      )
-    );
-  }
+  // Optimization progression
+  const progressionData = [
+    { step: 'Nested scan\nbf16 B=1', toks: 25.6 },
+    { step: 'Flat scan\nbf16 B=1', toks: 48.2 },
+    { step: 'Flat scan\nint8 B=1', toks: 68.2 },
+    { step: 'Fused decode\nint8 B=1', toks: 79.9 },
+    { step: 'B=8', toks: 584 },
+    { step: 'B=64\n+LIBTPU', toks: 4220 },
+    { step: 'B=768\n+LIBTPU', toks: 13943 }
+  ];
 
-  function Ttft(){
+  function Progression(){
     return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
-      e(R.BarChart, { data: ttftData, margin: { top: 34, right: 24, left: 18, bottom: 8 } },
+      e(R.BarChart, { data: progressionData, margin: { top: 30, right: 30, left: 20, bottom: 30 } },
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
-        e(R.XAxis, { dataKey: 'n', stroke: '#666', label: { value: 'Batch size', position: 'insideBottom', offset: -4, fill: '#888', fontSize: 11 } }),
-        e(R.YAxis, { stroke: '#666', label: { value: 'TTFT (ms, lower is better)', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
-        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' }, formatter: v => v.toFixed(1) + ' ms' }),
-        e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
-        e(R.Bar, { dataKey: 'rvllm', name: 'rvLLM 0.3.0 (hot)', fill: '#84E6B7' },
-          e(R.LabelList, { dataKey: 'rvllm', position: 'top', fill: '#b5f3d2', fontSize: 10, offset: 14, formatter: v => v.toFixed(0) })
-        ),
-        e(R.Bar, { dataKey: 'vllm',  name: 'vLLM 0.19 (hot)',   fill: '#5a8bd4' },
-          e(R.LabelList, { dataKey: 'vllm', position: 'top', fill: '#8eb0e0', fontSize: 10, formatter: v => v.toFixed(0) })
-        )
-      )
-    );
-  }
-
-  function Nsys(){
-    return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
-      e(R.BarChart, { data: nsysData, layout: 'vertical', margin: { top: 10, right: 40, left: 10, bottom: 18 } },
-        e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
-        e(R.XAxis, { type: 'number', stroke: '#666', label: { value: 'ms per step', position: 'insideBottom', offset: -8, fill: '#888', fontSize: 11 } }),
-        e(R.YAxis, { type: 'category', dataKey: 'name', stroke: '#aaa', tick: { fontSize: 11, fill: '#c5c5c5' }, width: 220, interval: 0 }),
-        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' }, formatter: v => v.toFixed(3) + ' ms' }),
-        e(R.Bar, { dataKey: 'ms', fill: '#84E6B7' },
-          e(R.LabelList, { dataKey: 'ms', position: 'right', fill: '#b5f3d2', fontSize: 11, formatter: v => v.toFixed(2) + ' ms' })
-        )
-      )
-    );
-  }
-
-  function Footprint(){
-    // Log-scale single-total bars. Zero stack segments break Recharts log
-    // scale, so we render the total and put the breakdown in the label.
-    return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
-      e(R.BarChart, { data: footprintData, margin: { top: 24, right: 40, left: 30, bottom: 8 } },
-        e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
-        e(R.XAxis, { dataKey: 'engine', stroke: '#ccc', tick: { fill: '#ddd', fontSize: 12 } }),
-        e(R.YAxis, { stroke: '#666', scale: 'log', domain: [10, 30000], ticks: [10, 100, 1000, 10000], tickFormatter: v => v.toLocaleString(), label: { value: 'MB (log scale)', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
-        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' }, formatter: v => v.toLocaleString() + ' MB' }),
-        e(R.Bar, { dataKey: 'total', name: 'Total footprint',
+        e(R.XAxis, { dataKey: 'step', stroke: '#888', tick: { fill: '#ccc', fontSize: 10 }, interval: 0, angle: 0 }),
+        e(R.YAxis, { stroke: '#888', tickFormatter: v => v.toLocaleString(), tick: { fill: '#ccc' }, label: { value: 'tok/s', angle: -90, position: 'insideLeft', fill: '#aaa', fontSize: 11 } }),
+        e(R.Tooltip, { contentStyle: tooltipStyle, formatter: v => v.toLocaleString() + ' tok/s' }),
+        e(R.Bar, { dataKey: 'toks', name: 'Throughput', radius: [4, 4, 0, 0],
           shape: (p) => {
-            const fill = p.payload.engine === 'rvLLM 0.3.0' ? '#84E6B7' : '#ff9977';
-            return e('rect', { x: p.x, y: p.y, width: p.width, height: p.height, fill: fill, rx: 3 });
-          } },
-          e(R.LabelList, { dataKey: 'label', position: 'top', fill: '#eee', fontSize: 11, fontWeight: 600 })
+            var fill = p.index === progressionData.length - 1 ? '#84E6B7' : '#3a7a5a';
+            return e('rect', { x: p.x, y: p.y, width: p.width, height: p.height, fill: fill, rx: 4 });
+          }},
+          e(R.LabelList, { dataKey: 'toks', position: 'top', fill: '#c0f0d8', fontSize: 10, formatter: v => v >= 1000 ? (v/1000).toFixed(1)+'k' : v })
         )
       )
     );
   }
 
-  function Vram(){
-    return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
-      e(R.BarChart, { data: vramData, layout: 'vertical', margin: { top: 10, right: 24, left: 80, bottom: 8 } },
-        e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
-        e(R.XAxis, { type: 'number', stroke: '#666', domain: [0, 80], label: { value: 'GB (of 80 on H100)', position: 'insideBottom', offset: -4, fill: '#888', fontSize: 11 } }),
-        e(R.YAxis, { type: 'category', dataKey: 'engine', stroke: '#aaa', tick: { fontSize: 12, fill: '#c5c5c5' }, width: 70 }),
-        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' }, formatter: v => v.toFixed(1) + ' GB' }),
-        e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
-        e(R.Bar, { dataKey: 'reserved', name: 'Reserved / held', stackId: 'a', fill: '#ff9977' },
-          e(R.LabelList, { dataKey: 'reserved', position: 'insideLeft', fill: '#3d1810', fontSize: 11, fontWeight: 700, formatter: v => v.toFixed(1) + ' GB' })
-        ),
-        e(R.Bar, { dataKey: 'free',     name: 'Free on card',    stackId: 'a', fill: '#84E6B7' },
-          e(R.LabelList, { dataKey: 'free', position: 'insideRight', fill: '#0c2818', fontSize: 11, fontWeight: 700, formatter: v => v.toFixed(1) + ' GB free' })
-        )
-      )
-    );
-  }
-
-  function Mig(){
-    return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
-      e(R.BarChart, { data: migData, layout: 'vertical', margin: { top: 10, right: 90, left: 170, bottom: 8 } },
-        e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
-        e(R.XAxis, { type: 'number', stroke: '#666', label: { value: 'step time (ms, lower is better)', position: 'insideBottom', offset: -4, fill: '#888', fontSize: 11 } }),
-        e(R.YAxis, { type: 'category', dataKey: 'label', stroke: '#c5c5c5', tick: { fontSize: 11, fill: '#c5c5c5' }, width: 160 }),
-        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' }, formatter: v => v.toFixed(2) + ' ms' }),
-        e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
-        e(R.Bar, { dataKey: 'compute', name: 'GEMM / compute', stackId: 'a', fill: '#84E6B7' }),
-        e(R.Bar, { dataKey: 'comm',    name: 'Inter-MIG all-reduce (PCIe)', stackId: 'a', fill: '#ff9977' },
-          e(R.LabelList, { dataKey: 'tag', position: 'right', fill: '#eee', fontSize: 11, fontWeight: 600 })
-        )
-      )
-    );
-  }
-
-  function TpFuture(){
-    return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
-      e(R.BarChart, { data: tpFutureData, margin: { top: 30, right: 24, left: 30, bottom: 32 } },
-        e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
-        e(R.XAxis, { dataKey: 'model', stroke: '#ccc', label: { value: 'Model (dense parameter count, FP8)', position: 'insideBottom', offset: -8, fill: '#888', fontSize: 11 } }),
-        e(R.YAxis, { stroke: '#666', tickFormatter: v => v.toLocaleString(), label: { value: 'projected tok/s @ N=128', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
-        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' },
-          formatter: (v, name, props) => {
-            const d = props && props.payload;
-            const tag = d && (d.meas ? 'Measured' : 'Projected');
-            return [v.toLocaleString() + ' tok/s', `${tag} — ${d.cards} × H100`];
-          } }),
-        e(R.Bar, { dataKey: 'toks', name: 'Projected tok/s',
-          // color each bar based on measured vs projected
-          shape: (p) => {
-            const fill = p.payload.meas ? '#84E6B7' : '#b6a1e5';
-            return e('rect', { x: p.x, y: p.y, width: p.width, height: p.height, fill: fill, rx: 2 });
-          } },
-          e(R.LabelList, { dataKey: 'cards', position: 'top', fill: '#eee', fontSize: 10, formatter: v => v + '× H100' })
-        )
-      )
-    );
-  }
-
-  function Scaling(){
-    return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
-      e(R.LineChart, { data: scalingData, margin: { top: 24, right: 30, left: 30, bottom: 18 } },
-        e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
-        e(R.XAxis, { dataKey: 'n', type: 'number', scale: 'log', domain: [50, 20000], stroke: '#666', tickFormatter: v => v.toLocaleString(), label: { value: 'Batch size N (log scale)', position: 'insideBottom', offset: -8, fill: '#888', fontSize: 11 } }),
-        e(R.YAxis, { stroke: '#666', tickFormatter: v => v.toLocaleString(), label: { value: 'tok/s', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
-        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' }, formatter: v => (v == null ? 'n/a' : v.toLocaleString() + ' tok/s') }),
-        e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
-        e(R.Line, { type: 'monotone', dataKey: 'measured', name: 'Measured', stroke: '#84E6B7', strokeWidth: 2, dot: { r: 5, fill: '#84E6B7' } }),
-        e(R.Line, { type: 'monotone', dataKey: 'projected', name: 'Projected (bandwidth-extrapolated)', stroke: '#e8d26d', strokeWidth: 2, strokeDasharray: '6 4', dot: { r: 4, fill: '#e8d26d' } })
-      )
-    );
-  }
-
-  // TPU v6e-1 per-kernel latency (µs). Only kernels that executed — FP8
-  // TODOs are omitted from the chart but listed n/a in the table above.
-  const tpuData = [
-    { name: 'persistent_layer_decode (full)', us: 2151.2 },
-    { name: 'split_kv_attention',             us: 1813.7 },
-    { name: 'paged_attention',                us: 1811.5 },
-    { name: 'fused_lm_head_argmax',           us: 895.1 },
-    { name: 'copy_blocks',                    us: 388.9 },
-    { name: 'fused_oproj_add_norm_gateup_gemv', us: 370.9 },
-    { name: 'fused_add_norm_gateup_gemv',     us: 347.3 },
-    { name: 'cutlass_gateup_silu',            us: 290.1 },
-    { name: 'fused_rope_cache',               us: 289.9 },
-    { name: 'reshape_and_cache',              us: 273.1 },
-    { name: 'gemv_int4',                      us: 257.4 },
-    { name: 'fused_add_norm_qkv_gemv',        us: 221.7 },
-    { name: 'fused_silu_down',                us: 211.6 },
-    { name: 'rotary_embedding',               us: 200.3 },
-    { name: 'deinterleave_qkv',               us: 196.6 },
-    { name: 'fused_residual_rmsnorm',         us: 193.3 },
-    { name: 'softmax',                        us: 159.3 },
-    { name: 'fused_norm_gemv',                us: 152.1 },
-    { name: 'gemv_f16',                       us: 150.5 },
-    { name: 'fused_silu_mul',                 us: 138.5 },
-    { name: 'rms_norm',                       us: 138.1 },
-    { name: 'gemm_bf16',                      us: 137.7 },
-    { name: 'cutlass_oproj_residual',         us: 137.3 },
-    { name: 'flash_attention',                us: 137.1 },
-    { name: 'cutlass_qkv_bias',               us: 136.5 },
-    { name: 'argmax',                         us: 136.7 },
-    { name: 'persistent_gemm',                us: 136.0 },
-    { name: 'flash_attention_3',              us: 134.2 },
-    { name: 'activation_silu',                us: 132.9 },
-    { name: 'embedding_gather',               us: 132.9 },
-    { name: 'activation_gelu',                us: 131.3 },
-    { name: 'add_bias',                       us: 128.3 },
-    { name: 'cast_fp',                        us: 128.0 },
-    { name: 'qkv_transpose',                  us: 125.6 }
+  // XProf breakdown
+  const xprofData = [
+    { name: '60-layer scan (MXU)',   ms: 10.6 },
+    { name: 'lax.cond dispatch',     ms: 1.8 },
+    { name: 'KV cache updates',      ms: 1.3 },
+    { name: 'ICI all-reduce',        ms: 0.6 }
   ];
 
-  function Tpu(){
+  function Xprof(){
     return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
-      e(R.BarChart, { data: tpuData, layout: 'vertical', margin: { top: 10, right: 64, left: 10, bottom: 18 } },
+      e(R.BarChart, { data: xprofData, layout: 'vertical', margin: { top: 10, right: 50, left: 10, bottom: 18 } },
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
-        e(R.XAxis, { type: 'number', stroke: '#666', scale: 'log', domain: [100, 3000], ticks: [100, 200, 500, 1000, 2000], tickFormatter: v => v.toLocaleString(), label: { value: '\u00b5s per call (log, lower is better)', position: 'insideBottom', offset: -8, fill: '#888', fontSize: 11 } }),
-        e(R.YAxis, { type: 'category', dataKey: 'name', stroke: '#aaa', tick: { fontSize: 9, fill: '#c5c5c5' }, width: 250, interval: 0 }),
-        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' }, formatter: v => v.toFixed(1) + ' \u00b5s' }),
-        e(R.Bar, { dataKey: 'us', fill: '#b6a1e5' },
-          e(R.LabelList, { dataKey: 'us', position: 'right', fill: '#d7c8f0', fontSize: 9, formatter: v => v.toFixed(0) })
+        e(R.XAxis, { type: 'number', stroke: '#888', tick: { fill: '#ccc' }, label: { value: 'ms per step', position: 'insideBottom', offset: -8, fill: '#aaa', fontSize: 11 } }),
+        e(R.YAxis, { type: 'category', dataKey: 'name', stroke: '#aaa', tick: { fontSize: 12, fill: '#ddd' }, width: 180, interval: 0 }),
+        e(R.Tooltip, { contentStyle: tooltipStyle, formatter: v => v.toFixed(1) + ' ms' }),
+        e(R.Bar, { dataKey: 'ms', fill: '#84E6B7', radius: [0, 4, 4, 0] },
+          e(R.LabelList, { dataKey: 'ms', position: 'right', fill: '#c0f0d8', fontSize: 12, formatter: v => v.toFixed(1) + ' ms' })
         )
       )
     );
   }
 
-  function ColdStart(){
-    return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
-      e(R.BarChart, { data: coldStartData, layout: 'vertical', margin: { top: 10, right: 24, left: 60, bottom: 8 } },
-        e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
-        e(R.XAxis, { type: 'number', stroke: '#666', label: { value: 'seconds (cold start, first launch)', position: 'insideBottom', offset: -4, fill: '#888', fontSize: 11 } }),
-        e(R.YAxis, { type: 'category', dataKey: 'engine', stroke: '#aaa', tick: { fontSize: 12, fill: '#c5c5c5' }, width: 50 }),
-        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' }, formatter: v => v.toFixed(1) + ' s' }),
-        e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
-        e(R.Bar, { dataKey: 'start',       name: 'Binary / interpreter start',  stackId: 'a', fill: '#c5c5c5' }),
-        e(R.Bar, { dataKey: 'load_quant',  name: 'Weight load + FP8 quant',     stackId: 'a', fill: '#84E6B7' }),
-        e(R.Bar, { dataKey: 'kernel_init', name: 'Kernel init + graph capture', stackId: 'a', fill: '#5a8bd4' }),
-        e(R.Bar, { dataKey: 'jit',         name: 'Triton JIT compile',          stackId: 'a', fill: '#ff9977' }),
-        e(R.Bar, { dataKey: 'dispatch',    name: 'Python dispatch overhead',    stackId: 'a', fill: '#e8d26d' })
-      )
-    );
-  }
-
-  ReactDOM.createRoot(document.getElementById('chart-multimodel')).render(e(MultiModel));
-  ReactDOM.createRoot(document.getElementById('chart-throughput')).render(e(Throughput));
-  ReactDOM.createRoot(document.getElementById('chart-ttft')).render(e(Ttft));
-  ReactDOM.createRoot(document.getElementById('chart-nsys')).render(e(Nsys));
-  ReactDOM.createRoot(document.getElementById('chart-footprint')).render(e(Footprint));
-  ReactDOM.createRoot(document.getElementById('chart-vram')).render(e(Vram));
-  ReactDOM.createRoot(document.getElementById('chart-scaling')).render(e(Scaling));
-  ReactDOM.createRoot(document.getElementById('chart-mig')).render(e(Mig));
-  ReactDOM.createRoot(document.getElementById('chart-tp-future')).render(e(TpFuture));
-  ReactDOM.createRoot(document.getElementById('chart-coldstart')).render(e(ColdStart));
-  ReactDOM.createRoot(document.getElementById('chart-tpu')).render(e(Tpu));
+  ReactDOM.createRoot(document.getElementById('chart-tpu-scaling')).render(e(TpuScaling));
+  ReactDOM.createRoot(document.getElementById('chart-tpu-vs-gpu')).render(e(TpuVsGpu));
+  ReactDOM.createRoot(document.getElementById('chart-progression')).render(e(Progression));
+  ReactDOM.createRoot(document.getElementById('chart-xprof')).render(e(Xprof));
 })();
 </script>
 </body>

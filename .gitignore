@@ -30,3 +30,4 @@ build/
 *.fdb_latexmk
 *.synctex.gz
 zig/.zig-cache/
+.wrangler/
