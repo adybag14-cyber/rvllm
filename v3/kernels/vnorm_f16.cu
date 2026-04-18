@@ -45,7 +45,9 @@ vnorm_f16_kernel(
         local_ss += val * val;
     }
     float sum_sq = block_reduce_sum(local_ss, smem);
+    if (threadIdx.x == 0) smem[0] = sum_sq;
     __syncthreads();
+    sum_sq = smem[0];
 
     float rms = rsqrtf(sum_sq / (float)head_dim + eps);
 
