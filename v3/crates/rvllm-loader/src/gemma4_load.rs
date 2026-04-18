@@ -347,13 +347,13 @@ pub fn load_gemma4_model(
         let use_f16_layers = std::env::var("RVLLM_F16_LAYERS").map_or(false, |v| v == "1");
         let (qkv_f16_w, o_proj_f16_w, gate_up_f16_w, down_proj_f16_w) = if use_f16_layers {
             let qkv_buf = concat_tensors(&[&q_tensor, &k_tensor, &v_tensor], &shards, model_dir)?;
-            let qkv_r = arena.region(&format!("qkv_f16_L{l}"), qkv_buf.len(), 16)?;
+            let qkv_r = arena.region(Box::leak(format!("qkv_f16_L{l}").into_boxed_str()), qkv_buf.len(), 16)?;
             unsafe { qkv_r.copy_from_host(&qkv_buf)? };
             let qkv_w = F16Weight { offset_bytes: qkv_r.device_ptr(), shape: vec![qkv_rows, arch.hidden_size] };
 
             let o_entry = must_get(&ln("self_attn.o_proj.weight"))?;
             let o_buf = tensor_to_f16_bytes(&o_entry.1, bytes_of(o_entry.0, &o_entry.1), model_dir)?;
-            let o_r = arena.region(&format!("o_f16_L{l}"), o_buf.len(), 16)?;
+            let o_r = arena.region(Box::leak(format!("o_f16_L{l}").into_boxed_str()), o_buf.len(), 16)?;
             unsafe { o_r.copy_from_host(&o_buf)? };
             let o_w = F16Weight { offset_bytes: o_r.device_ptr(), shape: o_entry.1.shape.clone() };
 
@@ -361,13 +361,13 @@ pub fn load_gemma4_model(
                 &[&must_get(&ln("mlp.gate_proj.weight"))?, &must_get(&ln("mlp.up_proj.weight"))?],
                 &shards, model_dir,
             )?;
-            let gu_r = arena.region(&format!("gu_f16_L{l}"), gu_buf.len(), 16)?;
+            let gu_r = arena.region(Box::leak(format!("gu_f16_L{l}").into_boxed_str()), gu_buf.len(), 16)?;
             unsafe { gu_r.copy_from_host(&gu_buf)? };
             let gu_w = F16Weight { offset_bytes: gu_r.device_ptr(), shape: vec![2 * arch.intermediate_size, arch.hidden_size] };
 
             let d_entry = must_get(&ln("mlp.down_proj.weight"))?;
             let d_buf = tensor_to_f16_bytes(&d_entry.1, bytes_of(d_entry.0, &d_entry.1), model_dir)?;
-            let d_r = arena.region(&format!("d_f16_L{l}"), d_buf.len(), 16)?;
+            let d_r = arena.region(Box::leak(format!("d_f16_L{l}").into_boxed_str()), d_buf.len(), 16)?;
             unsafe { d_r.copy_from_host(&d_buf)? };
             let d_w = F16Weight { offset_bytes: d_r.device_ptr(), shape: d_entry.1.shape.clone() };
 
