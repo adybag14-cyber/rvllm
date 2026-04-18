@@ -37,6 +37,7 @@ pub struct ModelArch {
     pub rope_theta: f32,
     pub max_position_embeddings: usize,
     pub attention_bias: bool,
+    pub rms_norm_eps: f32,
     pub layer_types: Vec<LayerAttnType>,
 }
 
@@ -58,20 +59,23 @@ impl ModelArch {
             },
             bt: std::backtrace::Backtrace::capture(),
         })?;
-        let num_hidden_layers = v["num_hidden_layers"].as_u64().unwrap_or(0) as usize;
-        let hidden_size = v["hidden_size"].as_u64().unwrap_or(0) as usize;
-        let num_attention_heads = v["num_attention_heads"].as_u64().unwrap_or(0) as usize;
-        let num_key_value_heads = v["num_key_value_heads"]
+        // Gemma 3/4: model params nested under text_config.
+        let tc = if v["hidden_size"].is_u64() { &v } else { &v["text_config"] };
+        let num_hidden_layers = tc["num_hidden_layers"].as_u64().unwrap_or(0) as usize;
+        let hidden_size = tc["hidden_size"].as_u64().unwrap_or(0) as usize;
+        let num_attention_heads = tc["num_attention_heads"].as_u64().unwrap_or(0) as usize;
+        let num_key_value_heads = tc["num_key_value_heads"]
             .as_u64()
             .unwrap_or(num_attention_heads as u64) as usize;
-        let intermediate_size = v["intermediate_size"].as_u64().unwrap_or(0) as usize;
-        let vocab_size = v["vocab_size"].as_u64().unwrap_or(0) as usize;
-        let rope_theta = v["rope_theta"].as_f64().unwrap_or(10000.0) as f32;
+        let intermediate_size = tc["intermediate_size"].as_u64().unwrap_or(0) as usize;
+        let vocab_size = tc["vocab_size"].as_u64().unwrap_or(0) as usize;
+        let rope_theta = tc["rope_theta"].as_f64().unwrap_or(10000.0) as f32;
         let max_position_embeddings =
-            v["max_position_embeddings"].as_u64().unwrap_or(2048) as usize;
-        let attention_bias = v["attention_bias"].as_bool().unwrap_or(false);
+            tc["max_position_embeddings"].as_u64().unwrap_or(2048) as usize;
+        let attention_bias = tc["attention_bias"].as_bool().unwrap_or(false);
+        let rms_norm_eps = tc["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32;
         let layer_types_val = v["layer_types"].as_array()
-            .or_else(|| v["text_config"]["layer_types"].as_array());
+            .or_else(|| tc["layer_types"].as_array());
         let layer_types: Vec<LayerAttnType> = match layer_types_val {
             Some(arr) => arr.iter().map(|t| {
                 match t.as_str().unwrap_or("full_attention") {
@@ -81,11 +85,10 @@ impl ModelArch {
             }).collect(),
             None => vec![LayerAttnType::Full; num_hidden_layers],
         };
-        let head_dim = if num_attention_heads == 0 {
-            0
-        } else {
-            hidden_size / num_attention_heads
-        };
+        let head_dim = tc["head_dim"]
+            .as_u64()
+            .map(|d| d as usize)
+            .unwrap_or_else(|| if num_attention_heads == 0 { 0 } else { hidden_size / num_attention_heads });
         if head_dim != 128 {
             return Err(RvllmError::Loader {
                 err: LoaderError::Corrupt {
@@ -111,6 +114,7 @@ impl ModelArch {
             rope_theta,
             max_position_embeddings,
             attention_bias,
+            rms_norm_eps,
             layer_types,
         })
     }
@@ -170,14 +174,25 @@ fn build_tensor_index(
 pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Result<LoadedModel> {
     let (shards, tensors) = build_tensor_index(model_dir)?;
 
+    let wprefix: &str = if tensors.contains_key("model.embed_tokens.weight") {
+        "model"
+    } else if tensors.contains_key("language_model.model.embed_tokens.weight") {
+        eprintln!("[loader] detected language_model.model.* weight prefix");
+        "language_model.model"
+    } else {
+        "model"
+    };
+    let tie_embeddings = !tensors.contains_key("lm_head.weight")
+        && !tensors.contains_key(&format!("{wprefix}.lm_head.weight"));
+
     let bytes_of = |si: usize, e: &TensorEntry| -> &[u8] {
         let s = &shards[si].bytes();
         let start = e.file_offset as usize;
         &s[start..start + e.nbytes as usize]
     };
 
-    let get_tensor = |prefix: &str| -> Option<(usize, TensorEntry)> {
-        tensors.get(prefix).cloned()
+    let get_tensor = |name: &str| -> Option<(usize, TensorEntry)> {
+        tensors.get(name).cloned()
     };
 
     let must_get = |name: &str| -> Result<(usize, TensorEntry)> {
@@ -206,16 +221,21 @@ pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Resul
         })
     };
 
-    let embedding = upload_f16("embedding", "model.embed_tokens.weight")?;
-    let final_norm = upload_f16("final_norm", "model.norm.weight")?;
-    // LM head as FP8 per-tensor, so the final GEMM matches the layer path.
-    let lm_head_fp8 = upload_fp8_from(
-        arena,
-        "lm_head",
-        &must_get("lm_head.weight")?,
-        &shards,
-        model_dir,
-    )?;
+    let embed_name = format!("{wprefix}.embed_tokens.weight");
+    let norm_name = format!("{wprefix}.norm.weight");
+    let embedding = upload_f16("embedding", &embed_name)?;
+    let final_norm = upload_f16("final_norm", &norm_name)?;
+    let lm_head_fp8 = if tie_embeddings {
+        eprintln!("[loader] tied embeddings -> reusing embed_tokens as lm_head");
+        let (si, e) = must_get(&embed_name)?;
+        upload_fp8_from(arena, "lm_head", &(si, e), &shards, model_dir)?
+    } else {
+        upload_fp8_from(arena, "lm_head", &must_get("lm_head.weight")?, &shards, model_dir)?
+    };
+    eprintln!(
+        "[loader] lm_head FP8 scale={:.6e} clamp_ppm={:.1}",
+        lm_head_fp8.scale, lm_head_fp8.clamp_ppm,
+    );
 
     // RoPE cos/sin table -- precompute at load time.
     let (cos_bytes, sin_bytes) = rope_cos_sin_bytes(arch);
@@ -237,27 +257,50 @@ pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Resul
     };
 
     // --- per-layer --------------------------------------------------------
+    // Detect pre-quantized FP8 models (e.g. neuralmagic) by checking
+    // the dtype of the first q_proj weight tensor.
+    let weights_are_fp8 = get_tensor(&format!("{wprefix}.layers.0.self_attn.q_proj.weight"))
+        .map_or(false, |(_, e)| e.dtype == DType::Fp8E4M3);
+    if weights_are_fp8 {
+        eprintln!("[loader] detected pre-quantized FP8 weights, using direct upload");
+    }
+
     let mut layers = Vec::with_capacity(arch.num_hidden_layers);
     for l in 0..arch.num_hidden_layers {
-        let ln = |s: &str| format!("model.layers.{l}.{s}");
+        let ln = |s: &str| format!("{wprefix}.layers.{l}.{s}");
 
-        let qkv_f16_bytes = concat_qkv(
-            &must_get(&ln("self_attn.q_proj.weight"))?,
-            &must_get(&ln("self_attn.k_proj.weight"))?,
-            &must_get(&ln("self_attn.v_proj.weight"))?,
-            &shards,
-            model_dir,
-        )?;
         let qkv_rows = (arch.num_attention_heads + 2 * arch.num_key_value_heads) * arch.head_dim;
         let qkv_cols = arch.hidden_size;
-        let qkv = upload_fp8(
-            arena,
-            "qkv",
-            &qkv_f16_bytes,
-            &[qkv_rows, qkv_cols],
-            &ln("self_attn.qkv.weight"),
-            model_dir,
-        )?;
+        let qkv = if weights_are_fp8 {
+            upload_fp8_fused_direct(
+                arena, "qkv",
+                &[
+                    must_get(&ln("self_attn.q_proj.weight"))?,
+                    must_get(&ln("self_attn.k_proj.weight"))?,
+                    must_get(&ln("self_attn.v_proj.weight"))?,
+                ],
+                &[
+                    get_tensor(&ln("self_attn.q_proj.weight_scale")),
+                    get_tensor(&ln("self_attn.k_proj.weight_scale")),
+                    get_tensor(&ln("self_attn.v_proj.weight_scale")),
+                ],
+                &shards,
+                &[qkv_rows, qkv_cols],
+            )?
+        } else {
+            let qkv_f16_bytes = concat_qkv(
+                &must_get(&ln("self_attn.q_proj.weight"))?,
+                &must_get(&ln("self_attn.k_proj.weight"))?,
+                &must_get(&ln("self_attn.v_proj.weight"))?,
+                &shards,
+                model_dir,
+            )?;
+            upload_fp8(
+                arena, "qkv", &qkv_f16_bytes,
+                &[qkv_rows, qkv_cols],
+                &ln("self_attn.qkv.weight"), model_dir,
+            )?
+        };
 
         let qkv_bias = if arch.attention_bias {
             let qkv_bias_bytes = concat_qkv_bias(
@@ -277,38 +320,55 @@ pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Resul
             None
         };
 
-        let o_proj = upload_fp8_from(
-            arena,
-            "o_proj",
-            &must_get(&ln("self_attn.o_proj.weight"))?,
-            &shards,
-            model_dir,
-        )?;
+        let o_proj = if weights_are_fp8 {
+            upload_fp8_direct(
+                arena, "o_proj",
+                &must_get(&ln("self_attn.o_proj.weight"))?,
+                get_tensor(&ln("self_attn.o_proj.weight_scale")),
+                &shards,
+            )?
+        } else {
+            upload_fp8_from(arena, "o_proj",
+                &must_get(&ln("self_attn.o_proj.weight"))?, &shards, model_dir)?
+        };
 
-        let gate_up_f16 = concat_gate_up(
-            &must_get(&ln("mlp.gate_proj.weight"))?,
-            &must_get(&ln("mlp.up_proj.weight"))?,
-            &shards,
-            model_dir,
-        )?;
         let gate_up_rows = 2 * arch.intermediate_size;
         let gate_up_cols = arch.hidden_size;
-        let gate_up = upload_fp8(
-            arena,
-            "gate_up",
-            &gate_up_f16,
-            &[gate_up_rows, gate_up_cols],
-            &ln("mlp.gate_up.weight"),
-            model_dir,
-        )?;
+        let gate_up = if weights_are_fp8 {
+            upload_fp8_fused_direct(
+                arena, "gate_up",
+                &[
+                    must_get(&ln("mlp.gate_proj.weight"))?,
+                    must_get(&ln("mlp.up_proj.weight"))?,
+                ],
+                &[
+                    get_tensor(&ln("mlp.gate_proj.weight_scale")),
+                    get_tensor(&ln("mlp.up_proj.weight_scale")),
+                ],
+                &shards,
+                &[gate_up_rows, gate_up_cols],
+            )?
+        } else {
+            let gate_up_f16 = concat_gate_up(
+                &must_get(&ln("mlp.gate_proj.weight"))?,
+                &must_get(&ln("mlp.up_proj.weight"))?,
+                &shards, model_dir,
+            )?;
+            upload_fp8(arena, "gate_up", &gate_up_f16,
+                &[gate_up_rows, gate_up_cols], &ln("mlp.gate_up.weight"), model_dir)?
+        };
 
-        let down_proj = upload_fp8_from(
-            arena,
-            "down_proj",
-            &must_get(&ln("mlp.down_proj.weight"))?,
-            &shards,
-            model_dir,
-        )?;
+        let down_proj = if weights_are_fp8 {
+            upload_fp8_direct(
+                arena, "down_proj",
+                &must_get(&ln("mlp.down_proj.weight"))?,
+                get_tensor(&ln("mlp.down_proj.weight_scale")),
+                &shards,
+            )?
+        } else {
+            upload_fp8_from(arena, "down_proj",
+                &must_get(&ln("mlp.down_proj.weight"))?, &shards, model_dir)?
+        };
 
         let input_layernorm = {
             let (si, e) = must_get(&ln("input_layernorm.weight"))?;
@@ -331,6 +391,13 @@ pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Resul
             }
         };
 
+        if l < 2 {
+            eprintln!(
+                "[loader] layer {l} FP8 scales: qkv={:.6e} o={:.6e} gate_up={:.6e} down={:.6e} | clamp_ppm: qkv={:.1} o={:.1} gu={:.1} dn={:.1}",
+                qkv.scale, o_proj.scale, gate_up.scale, down_proj.scale,
+                qkv.clamp_ppm, o_proj.clamp_ppm, gate_up.clamp_ppm, down_proj.clamp_ppm,
+            );
+        }
         layers.push(LayerWeights {
             qkv,
             qkv_bias,
@@ -370,6 +437,7 @@ fn tensor_to_f16_bytes(
         DType::F16 => Ok(raw.to_vec()),
         DType::Bf16 => Ok(bf16_bytes_to_f16_bytes(raw)),
         DType::F32 => Ok(f32_bytes_to_f16_bytes(raw)),
+        DType::Fp8E4M3 => Ok(fp8e4m3_bytes_to_f16_bytes(raw)),
         _ => Err(RvllmError::Loader {
             err: LoaderError::DtypeMismatch {
                 tensor: e.name.clone(),
@@ -394,6 +462,25 @@ fn bf16_bytes_to_f16_bytes(raw: &[u8]) -> Vec<u8> {
         let hi = raw[2 * i + 1];
         let as_f32 = f32::from_bits(u32::from_le_bytes([0, 0, lo, hi]));
         out.extend_from_slice(&f16::from_f32(as_f32).to_le_bytes());
+    }
+    out
+}
+
+fn fp8e4m3_bytes_to_f16_bytes(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len() * 2);
+    for &b in raw {
+        let s = (b >> 7) & 1;
+        let e = (b >> 3) & 0xF;
+        let m = b & 0x7;
+        let val = if e == 0 {
+            if m == 0 { 0.0f32 } else { (m as f32) * (1.0 / 512.0) * if s != 0 { -1.0 } else { 1.0 } }
+        } else if e == 15 && m == 7 {
+            f32::NAN
+        } else {
+            let v = f32::from_bits(((e as u32 + 120) << 23) | ((m as u32) << 20));
+            if s != 0 { -v } else { v }
+        };
+        out.extend_from_slice(&f16::from_f32(val).to_le_bytes());
     }
     out
 }
@@ -509,6 +596,103 @@ fn upload_fp8(
         clamp_ppm: q.clamp_ppm,
         dtype: DType::Fp8E4M3,
     })
+}
+
+fn upload_fp8_direct(
+    arena: &HbmArena,
+    region_name: &'static str,
+    (si, entry): &(usize, TensorEntry),
+    scale_tensor: Option<(usize, TensorEntry)>,
+    shards: &[ShardMap],
+) -> Result<Fp8Weight> {
+    let raw = {
+        let s = shards[*si].bytes();
+        let start = entry.file_offset as usize;
+        &s[start..start + entry.nbytes as usize]
+    };
+    let region = arena.region(region_name, raw.len(), 16)?;
+    unsafe { region.copy_from_host(raw)? };
+    let scale = if let Some((ssi, se)) = scale_tensor {
+        let sb = &shards[ssi].bytes()[se.file_offset as usize..se.file_offset as usize + 4];
+        f32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]])
+    } else {
+        1.0 / 448.0
+    };
+    let scale_region = arena.region("fp8_scale", 4, 4)?;
+    unsafe { scale_region.copy_from_host(&scale.to_le_bytes())? };
+    eprintln!("[loader] {region_name} FP8 direct: scale={scale:.6e}");
+    Ok(Fp8Weight {
+        offset_bytes: region.device_ptr() - arena_base(arena),
+        scale_ptr: scale_region.device_ptr(),
+        shape: entry.shape.clone(),
+        scale,
+        clamp_ppm: 0.0,
+        dtype: DType::Fp8E4M3,
+    })
+}
+
+fn upload_fp8_fused_direct(
+    arena: &HbmArena,
+    region_name: &'static str,
+    parts: &[(usize, TensorEntry)],
+    scale_tensors: &[Option<(usize, TensorEntry)>],
+    shards: &[ShardMap],
+    shape: &[usize],
+) -> Result<Fp8Weight> {
+    let mut scales: Vec<f32> = Vec::new();
+    for st in scale_tensors {
+        if let Some((ssi, se)) = st {
+            let sb = &shards[*ssi].bytes()[se.file_offset as usize..se.file_offset as usize + 4];
+            scales.push(f32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]));
+        } else {
+            scales.push(1.0 / 448.0);
+        }
+    }
+    let max_scale = scales.iter().copied().fold(0.0f32, f32::max);
+    let mut fused = Vec::new();
+    for (i, (si, entry)) in parts.iter().enumerate() {
+        let raw = {
+            let s = shards[*si].bytes();
+            let start = entry.file_offset as usize;
+            &s[start..start + entry.nbytes as usize]
+        };
+        if (scales[i] - max_scale).abs() < 1e-12 {
+            fused.extend_from_slice(raw);
+        } else {
+            let ratio = scales[i] / max_scale;
+            for &b in raw {
+                let f = fp8_e4m3_to_f32(b) * ratio;
+                fused.push(fp8_e4m3_encode(f));
+            }
+        }
+    }
+    let region = arena.region(region_name, fused.len(), 16)?;
+    unsafe { region.copy_from_host(&fused)? };
+    let scale_region = arena.region("fp8_scale", 4, 4)?;
+    unsafe { scale_region.copy_from_host(&max_scale.to_le_bytes())? };
+    eprintln!("[loader] {region_name} FP8 fused: scales={scales:?} -> unified={max_scale:.6e}");
+    Ok(Fp8Weight {
+        offset_bytes: region.device_ptr() - arena_base(arena),
+        scale_ptr: scale_region.device_ptr(),
+        shape: shape.to_vec(),
+        scale: max_scale,
+        clamp_ppm: 0.0,
+        dtype: DType::Fp8E4M3,
+    })
+}
+
+fn fp8_e4m3_to_f32(b: u8) -> f32 {
+    let s = (b >> 7) & 1;
+    let e = (b >> 3) & 0xF;
+    let m = b & 0x7;
+    let val = if e == 0 {
+        if m == 0 { 0.0f32 } else { (m as f32) * (1.0 / 512.0) }
+    } else if e == 15 && m == 7 {
+        return f32::NAN;
+    } else {
+        f32::from_bits(((e as u32 + 120) << 23) | ((m as u32) << 20))
+    };
+    if s != 0 { -val } else { val }
 }
 
 fn concat_qkv(

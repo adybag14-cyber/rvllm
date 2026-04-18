@@ -50,22 +50,20 @@ __global__ void fused_rope_cache_fp8kv_kernel(
     const float cos_val = __half2float(cos_table[pos * half_dim + tid]);
     const float sin_val = __half2float(sin_table[pos * half_dim + tid]);
 
-    // Q: apply RoPE + FP8-quantize to q_fp8_out.
     if (head_idx < num_heads) {
-        int q_base = (token_idx * num_heads + head_idx) * head_dim;
-        float q0 = __half2float(q_in[q_base + 2 * tid]);
-        float q1 = __half2float(q_in[q_base + 2 * tid + 1]);
+        int q_off = (token_idx * num_heads + head_idx) * head_dim;
+        float q0 = __half2float(q_in[q_off + 2 * tid]);
+        float q1 = __half2float(q_in[q_off + 2 * tid + 1]);
         float q0r = q0 * cos_val - q1 * sin_val;
         float q1r = q0 * sin_val + q1 * cos_val;
-        q_fp8_out[q_base + 2 * tid]     = __nv_fp8_e4m3(q0r * q_scale_inv);
-        q_fp8_out[q_base + 2 * tid + 1] = __nv_fp8_e4m3(q1r * q_scale_inv);
+        q_fp8_out[q_off + 2 * tid]     = __nv_fp8_e4m3(q0r * q_scale_inv);
+        q_fp8_out[q_off + 2 * tid + 1] = __nv_fp8_e4m3(q1r * q_scale_inv);
     }
 
-    // K: RoPE + FP8-quantize into paged cache. V: FP8-quantize only.
     if (head_idx < num_kv_heads) {
-        int k_base = (token_idx * num_kv_heads + head_idx) * head_dim;
-        float k0 = __half2float(k_in[k_base + 2 * tid]);
-        float k1 = __half2float(k_in[k_base + 2 * tid + 1]);
+        int kv_off = (token_idx * num_kv_heads + head_idx) * head_dim;
+        float k0 = __half2float(k_in[kv_off + 2 * tid]);
+        float k1 = __half2float(k_in[kv_off + 2 * tid + 1]);
         float k0r = k0 * cos_val - k1 * sin_val;
         float k1r = k0 * sin_val + k1 * cos_val;
 
@@ -75,9 +73,8 @@ __global__ void fused_rope_cache_fp8kv_kernel(
             key_cache[cache_offset + 2 * tid]     = __nv_fp8_e4m3(k0r * kv_scale_inv);
             key_cache[cache_offset + 2 * tid + 1] = __nv_fp8_e4m3(k1r * kv_scale_inv);
 
-            int v_base = (token_idx * num_kv_heads + head_idx) * head_dim;
-            float v0 = __half2float(v_in[v_base + 2 * tid]);
-            float v1 = __half2float(v_in[v_base + 2 * tid + 1]);
+            float v0 = __half2float(v_in[kv_off + 2 * tid]);
+            float v1 = __half2float(v_in[kv_off + 2 * tid + 1]);
             value_cache[cache_offset + 2 * tid]     = __nv_fp8_e4m3(v0 * kv_scale_inv);
             value_cache[cache_offset + 2 * tid + 1] = __nv_fp8_e4m3(v1 * kv_scale_inv);
         }

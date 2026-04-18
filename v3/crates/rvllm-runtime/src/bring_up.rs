@@ -277,7 +277,10 @@ impl Bringup {
         let mlp_out_fp8 = arena.region("mlp_out_fp8", (max_tokens * inter) as usize, 16)?;
         let mlp_out_scale = arena.region("mlp_out_scale", (max_tokens * 4) as usize, 16)?;
 
-        let num_blocks_total: u32 = 1024;
+        let num_blocks_total: u32 = std::env::var("RVLLM_NUM_BLOCKS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024);
         // FA3 paged_decode block_size (tokens per KV page). Default 64;
         // sweepable via RVLLM_BLOCK_SIZE to test 32 / 128 / 256.
         let block_size: u32 = std::env::var("RVLLM_BLOCK_SIZE")
@@ -444,7 +447,7 @@ impl Bringup {
             max_blocks_per_seq,
             num_blocks_total,
             attn_scale: 1.0 / (head_dim as f32).sqrt(),
-            rms_eps: 1e-6,
+            rms_eps: arch.rms_norm_eps,
         };
         let kernels = layer_exec::LayerKernels {
             fused_rmsnorm: self.fused_modules.fn_rmsnorm,
@@ -884,7 +887,10 @@ impl Bringup {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(64);
-        let num_blocks_total: u32 = 1024;
+        let num_blocks_total: u32 = std::env::var("RVLLM_NUM_BLOCKS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024);
         let max_blocks_per_seq: u32 = (num_blocks_total / num_seqs).max(1);
         let kv_per_layer = 2 * num_blocks_total * block_size * nkvh * head_dim;
 
@@ -986,7 +992,7 @@ impl Bringup {
             max_blocks_per_seq,
             num_blocks_total,
             attn_scale: 1.0 / (head_dim as f32).sqrt(),
-            rms_eps: 1e-6,
+            rms_eps: arch.rms_norm_eps,
         };
         let kernels = layer_exec::LayerKernels {
             fused_rmsnorm: self.fused_modules.fn_rmsnorm,
@@ -1005,6 +1011,7 @@ impl Bringup {
 
         let stream = self.stream.raw();
         let residual_ptr = residual.device_ptr();
+        let step_counter = std::cell::Cell::new(0u32);
 
         let one_step = |_phase: layer_exec::LayerPhase| -> Result<()> {
             for (layer_idx, layer) in self.model.layers.iter().enumerate() {
@@ -1061,7 +1068,52 @@ impl Bringup {
                     layer_exec::LayerPhase::Decode,
                     self.arch.layer_types[layer_idx],
                 )?;
+                #[cfg(feature = "cuda")]
+                if step_counter.get() == 0 {
+                    cudarc::driver::sys::cuStreamSynchronize(stream as _);
+                    let mut s = [0u16; 4];
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(s.as_mut_ptr() as *mut _, residual_ptr, 8);
+                    let v: Vec<f32> = s.iter().map(|&x| f16_to_f32(x)).collect();
+                    eprintln!("  L{layer_idx}: [{:.4}, {:.4}, {:.4}, {:.4}]", v[0], v[1], v[2], v[3]);
+                    if layer_idx == 0 {
+                        // Read back the per-token activation scale and weight scales
+                        let mut act_scale_val = [0f32; 1];
+                        cudarc::driver::sys::cuMemcpyDtoH_v2(
+                            act_scale_val.as_mut_ptr() as *mut _,
+                            hidden_scale.device_ptr(), 4,
+                        );
+                        let mut wt_qkv_scale = [0f32; 1];
+                        cudarc::driver::sys::cuMemcpyDtoH_v2(
+                            wt_qkv_scale.as_mut_ptr() as *mut _,
+                            layer.qkv.scale_ptr, 4,
+                        );
+                        let mut wt_o_scale = [0f32; 1];
+                        cudarc::driver::sys::cuMemcpyDtoH_v2(
+                            wt_o_scale.as_mut_ptr() as *mut _,
+                            layer.o_proj.scale_ptr, 4,
+                        );
+                        let mut wt_gu_scale = [0f32; 1];
+                        cudarc::driver::sys::cuMemcpyDtoH_v2(
+                            wt_gu_scale.as_mut_ptr() as *mut _,
+                            layer.gate_up.scale_ptr, 4,
+                        );
+                        let mut wt_dn_scale = [0f32; 1];
+                        cudarc::driver::sys::cuMemcpyDtoH_v2(
+                            wt_dn_scale.as_mut_ptr() as *mut _,
+                            layer.down_proj.scale_ptr, 4,
+                        );
+                        eprintln!(
+                            "  [DBG L0] act_scale(hidden)={:.6e} wt_qkv={:.6e} wt_o={:.6e} wt_gu={:.6e} wt_dn={:.6e}",
+                            act_scale_val[0], wt_qkv_scale[0], wt_o_scale[0], wt_gu_scale[0], wt_dn_scale[0],
+                        );
+                        eprintln!(
+                            "  [DBG L0] rust-side scales: qkv={:.6e} o={:.6e} gu={:.6e} dn={:.6e}",
+                            layer.qkv.scale, layer.o_proj.scale, layer.gate_up.scale, layer.down_proj.scale,
+                        );
+                    }
+                }
             }
+            step_counter.set(step_counter.get() + 1);
             // LM head (no argmax).
             rvllm_fused::FusedRmsnormFp8QuantLaunch {
                 num_tokens: num_seqs,
@@ -1129,6 +1181,33 @@ impl Bringup {
                 stream,
             )?;
 
+            // Probe embedding before layer 0 on first token.
+            #[cfg(feature = "cuda")]
+            if t == 0 {
+                unsafe {
+                    cudarc::driver::sys::cuStreamSynchronize(stream as _);
+                    let mut emb = [0u16; 8];
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        emb.as_mut_ptr() as *mut _, residual_ptr, 16,
+                    );
+                    let vals: Vec<f32> = emb.iter().map(|&x| f16_to_f32(x)).collect();
+                    let mut amax = 0f32;
+                    let n = hidden as usize;
+                    let mut all_emb = vec![0u16; n];
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        all_emb.as_mut_ptr() as *mut _, residual_ptr, (n * 2) as _,
+                    );
+                    for &v in &all_emb {
+                        let f = f16_to_f32(v).abs();
+                        if f > amax && !f.is_nan() { amax = f; }
+                    }
+                    eprintln!(
+                        "  [DBG t=0] embed first8={:.4?} amax={:.4} expected_scale={:.6e}",
+                        &vals[..4], amax, amax / 448.0,
+                    );
+                }
+            }
+
             // Forward + LM head.
             set_step_meta(t as i32)?;
             one_step(layer_exec::LayerPhase::Decode)?;
@@ -1145,7 +1224,11 @@ impl Bringup {
 
                 let target = token_ids[t + 1] as usize;
                 if t == 0 {
-                                let first5: Vec<f32> = logits_host[..5].iter().map(|&b| f16_to_f32(b)).collect();
+                    let first5: Vec<f32> = logits_host[..5].iter().map(|&b| f16_to_f32(b)).collect();
+                    let max_val = logits_host.iter().map(|&b| f16_to_f32(b)).filter(|v| !v.is_nan()).fold(f32::MIN, f32::max);
+                    let min_val = logits_host.iter().map(|&b| f16_to_f32(b)).filter(|v| !v.is_nan()).fold(f32::MAX, f32::min);
+                    let target_logit = f16_to_f32(logits_host[token_ids[t + 1] as usize]);
+                    eprintln!("  [DBG] logits: first5={:?} min={:.1} max={:.1} target[{}]={:.1}", first5, min_val, max_val, token_ids[t+1], target_logit);
                     let nan_count = logits_host.iter().filter(|&&b| f16_to_f32(b).is_nan()).count();
                     if nan_count > 0 {
                         eprintln!(

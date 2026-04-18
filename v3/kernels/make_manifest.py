@@ -20,6 +20,7 @@ NAME_TO_FILE = {
     "fused_lm_head_argmax": "fused_lm_head_argmax.ptx",
     "embedding_gather": "embedding_gather.ptx",
     "embedding_gather_f16": "embedding_gather_f16.ptx",
+    "fp8_rescale": "fp8_rescale.ptx",
 }
 
 

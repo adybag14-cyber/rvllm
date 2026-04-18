@@ -325,11 +325,7 @@ impl CublasLt {
                 return Err(cublaslt_err("heuristic"));
             }
 
-            let best_algo = if in_capture {
-                eprintln!(
-                    "[cublaslt] WARN: algo cache miss during graph capture (m={m} n={n} k={k} kind={}), using heuristic top-1",
-                    key.kind
-                );
+            let best_algo = if in_capture || beta_one {
                 heur[0].algo
             } else {
                 // Time each candidate. We reuse the caller's A/B/D device
@@ -339,12 +335,15 @@ impl CublasLt {
                 let mut best_ns: f64 = f64::MAX;
                 let one_f32: f32 = 1.0;
                 let zero_f32: f32 = 0.0;
-                let c_ptr_probe = if beta_one && c_residual != 0 {
-                    c_residual as *const _
-                } else {
-                    d_f16 as *const _
-                };
-                let beta_probe = if beta_one { &one_f32 } else { &zero_f32 };
+                // CRITICAL: always use beta=0 during timing probes.
+                // With beta=1 the probes write D = GEMM + C where C=D=residual,
+                // accumulating the GEMM output into the live residual buffer
+                // ~200 times (16 candidates * 13 iters). This corrupted layer 0
+                // residual by ~30,000x. beta=0 means C is never read, so no
+                // buffer is corrupted. Algo timing is unaffected because tile
+                // and schedule selection does not depend on the beta path.
+                let c_ptr_probe = d_f16 as *const _;
+                let beta_probe = &zero_f32;
 
                 let mut ev_start: cudarc::driver::sys::CUevent = std::ptr::null_mut();
                 let mut ev_stop: cudarc::driver::sys::CUevent = std::ptr::null_mut();
