@@ -152,21 +152,25 @@ pub unsafe fn gemma4_forward(
     let qkv_rows = (dims.num_heads + 2 * dims.num_kv_heads) * dims.head_dim;
 
     #[cfg(feature = "cuda")]
-    let dbg = {
+    let dbg_layer: i32 = {
         use std::sync::atomic::{AtomicU32, Ordering};
         static DBG_CTR: AtomicU32 = AtomicU32::new(0);
         let cnt = DBG_CTR.fetch_add(1, Ordering::Relaxed);
-        cnt == 0 && std::env::var("RVLLM_DBG_LAYER").is_ok()
+        if cnt < 2 && std::env::var("RVLLM_DBG_LAYER").is_ok() {
+            cnt as i32
+        } else {
+            -1
+        }
     };
     #[cfg(feature = "cuda")]
     macro_rules! probe {
         ($label:expr, $ptr:expr, $n:expr) => {
-            if dbg {
+            if dbg_layer >= 0 {
                 cudarc::driver::sys::cuStreamSynchronize(stream as _);
                 let mut s = [0u16; 4];
                 cudarc::driver::sys::cuMemcpyDtoH_v2(s.as_mut_ptr() as *mut _, $ptr, 8);
                 let v: Vec<f32> = s.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect();
-                eprintln!("    [L0 {}] first4={:.4?}", $label, v);
+                eprintln!("    [L{} {}] first4={:.4?}", dbg_layer, $label, v);
             }
         };
     }
@@ -443,6 +447,9 @@ pub unsafe fn gemma4_forward(
         weights.layer_scalar_ptr,
         stream,
     )?;
+
+    #[cfg(feature = "cuda")]
+    probe!("after_step14_residual", residual, dims.hidden);
 
     #[cfg(not(feature = "cuda"))]
     {
