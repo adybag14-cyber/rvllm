@@ -3255,6 +3255,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvllm-xla"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "half",
+ "libloading 0.8.9",
+ "rvllm-core",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "rvllm-zig"
 version = "0.1.0"
 

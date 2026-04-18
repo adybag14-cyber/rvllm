@@ -1,0 +1,26 @@
+[package]
+name = "rvllm-xla"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+description = "XLA/TPU backend for the rvLLM inference engine"
+keywords = ["llm", "inference", "tpu", "xla", "stablehlo"]
+categories = ["hardware-support", "science"]
+
+[features]
+default = []
+# Links against libtpu.so at runtime via dlopen. Requires libtpu on the
+# target machine (Cloud TPU VM or GKE TPU node).
+tpu = ["dep:libloading"]
+
+[dependencies]
+rvllm-core.workspace = true
+thiserror.workspace = true
+bytemuck.workspace = true
+tracing.workspace = true
+half.workspace = true
+libloading = { version = "0.8", optional = true }
