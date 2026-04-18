@@ -429,6 +429,9 @@ pub unsafe fn gemma4_forward(
         stream,
     )?;
 
+    #[cfg(feature = "cuda")]
+    probe!("after_step13_residual", residual, dims.hidden);
+
     // 14. residual *= layer_scalar (once per layer, after both sub-blocks)
     gemma4_launcher::ResidualScaleF16Launch {
         num_tokens: dims.num_tokens,
