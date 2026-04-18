@@ -67,8 +67,8 @@ td.pending{color:#b6a1e5;font-style:italic}
 <div class="wrap">
 
 <header>
-  <h1>rvLLM 0.3.1 &mdash; benchmark results</h1>
-  <div class="sub">FP8 inference engine in Rust+CUDA. Single H100 SXM 80GB. Now running <strong>Gemma 4 31B</strong> (60 layers, hybrid sliding/global attention, GELU, QK-norm, dual RoPE, logit softcap) alongside Qwen3-8B, Mistral-7B, and Llama 3.1 8B.</div>
+  <h1>rvLLM 0.3.2 &mdash; benchmark results</h1>
+  <div class="sub">LLM inference engine: Rust+CUDA on GPU, JAX+XLA on TPU. <strong>Gemma 4 31B at 79.9 tok/s on TPU v6e-4</strong> (int8, TP=4 SPMD, zero host overhead). Also: Qwen3-8B, Mistral-7B, Llama 3.1 8B on H100 SXM.</div>
   <div class="meta">
     <a href="index.html">site</a>
     <a href="https://github.com/m0at/rvllm">github</a>
@@ -78,9 +78,9 @@ td.pending{color:#b6a1e5;font-style:italic}
 
 <div class="pill-row">
   <div class="pill">
-    <div class="label">Gemma 4 31B FP8</div>
-    <strong>11.2 tok/s</strong>
-    <div class="caption">31B params, single H100, batch=1</div>
+    <div class="label">Gemma 4 31B on TPU</div>
+    <strong>79.9 tok/s</strong>
+    <div class="caption">v6e-4, int8, TP=4, PPL 25.51</div>
   </div>
   <div class="pill">
     <div class="label">Mistral-7B peak (N=512)</div>
@@ -171,9 +171,74 @@ td.pending{color:#b6a1e5;font-style:italic}
 </tbody>
 </table>
 
-<h3>Gemma 4 31B FP8 <span class="badge measured">Measured</span> <span class="badge future">Sweep running</span></h3>
+<h2 class="section">TPU: Gemma 4 31B <span class="sub">v6e-4, JAX+XLA, int8 quantized</span> <span class="badge measured">Measured</span></h2>
+
 <div class="note">
-  <strong>First 31B model on rvLLM.</strong> 60 layers with hybrid attention: 50 sliding (FA3 SM90, head_dim=256, 1024-token window) + 10 global (SM89 fallback, head_dim=512). GELU(tanh), QK-norm, dual RoPE, logit softcap. Pre-quantized FP8 weights from RedHatAI.
+  <strong>No custom kernels.</strong> The entire forward pass is a ~500 line JAX script. XLA compiles it to a single fused while loop on 4 TPU v6e chips. Zero Python in the hot path -- the decode loop runs entirely on-chip via <code>jax.lax.while_loop</code>.
+</div>
+
+<div class="pill-row">
+  <div class="pill">
+    <div class="label">decode throughput</div>
+    <strong>79.9 tok/s</strong>
+    <div class="caption">fused on-chip decode, zero host overhead</div>
+  </div>
+  <div class="pill">
+    <div class="label">per-step latency</div>
+    <strong>12.5 ms</strong>
+    <div class="caption">p99: 14.8 ms, std: 0.07 ms</div>
+  </div>
+  <div class="pill">
+    <div class="label">perplexity</div>
+    <strong>25.51</strong>
+    <div class="caption">verified against HuggingFace ref</div>
+  </div>
+  <div class="pill">
+    <div class="label">cost efficiency</div>
+    <strong>15.4 tok/s/$</strong>
+    <div class="caption">v6e-4 @ $5.20/hr</div>
+  </div>
+</div>
+
+<h3>TPU vs GPU: Gemma 4 31B decode</h3>
+<table>
+<thead><tr><th>Hardware</th><th class="r">tok/s</th><th class="r">ms/step</th><th class="r">Cost/hr</th><th class="r">tok/s/$</th><th class="r">Quantization</th></tr></thead>
+<tbody>
+<tr class="rvllm-win"><td><strong>TPU v6e-4 (rvLLM)</strong></td><td class="r"><strong>79.9</strong></td><td class="r"><strong>12.5</strong></td><td class="r">$5.20</td><td class="r pos"><strong>15.4</strong></td><td class="r">int8</td></tr>
+<tr><td>H100 SXM (FP8)</td><td class="r">~55</td><td class="r">~18</td><td class="r">$8-10</td><td class="r">5-7</td><td class="r">FP8</td></tr>
+<tr><td>H100 SXM (bf16)</td><td class="r">~35</td><td class="r">~29</td><td class="r">$8-10</td><td class="r">3-5</td><td class="r">bf16</td></tr>
+<tr><td>H200 (bf16)</td><td class="r">~40</td><td class="r">~25</td><td class="r">$8-12</td><td class="r">3-5</td><td class="r">bf16</td></tr>
+</tbody>
+</table>
+
+<h3>Optimization progression</h3>
+<table>
+<thead><tr><th>Version</th><th class="r">tok/s</th><th class="r">ms/step</th><th class="r">Change</th></tr></thead>
+<tbody>
+<tr><td>Nested scan, bf16</td><td class="r">25.6</td><td class="r">38.0</td><td class="r">initial working version</td></tr>
+<tr><td>Flat scan, bf16</td><td class="r">48.2</td><td class="r">19.4</td><td class="r pos">+88% (eliminated nested loop overhead)</td></tr>
+<tr><td>Flat scan, int8</td><td class="r">68.2</td><td class="r">13.4</td><td class="r pos">+42% (halved weight bandwidth)</td></tr>
+<tr class="rvllm-win"><td><strong>Fused on-chip decode, int8</strong></td><td class="r"><strong>79.9</strong></td><td class="r"><strong>12.5</strong></td><td class="r pos"><strong>+17% (zero host overhead)</strong></td></tr>
+</tbody>
+</table>
+
+<h3>XProf per-step breakdown</h3>
+<table>
+<thead><tr><th>Component</th><th class="r">Time</th><th class="r">%</th></tr></thead>
+<tbody>
+<tr><td>60-layer scan (while loop on MXU)</td><td class="r">10.6 ms</td><td class="r">86%</td></tr>
+<tr><td>jax.lax.cond branch dispatch</td><td class="r">1.8 ms</td><td class="r">14%</td></tr>
+<tr><td>ICI all-reduce (O + down proj)</td><td class="r">0.6 ms</td><td class="r">5%</td></tr>
+<tr><td>KV cache dynamic updates</td><td class="r">1.3 ms</td><td class="r">10%</td></tr>
+<tr><td><strong>Total step</strong></td><td class="r"><strong>12.3 ms</strong></td><td class="r"></td></tr>
+<tr><td>Theoretical BW limit (30 GB / 3.3 TB/s)</td><td class="r">9.1 ms</td><td class="r"></td></tr>
+</tbody>
+</table>
+<div class="footnote"><strong>The 1.8 ms cond overhead is structural</strong> -- Gemma 4's dual attention (sliding vs global layers) requires runtime dispatch. Nested scan eliminated the cond but added more loop overhead. Flat scan + cond is the optimum for XLA's TPU compiler.</div>
+
+<h3>Gemma 4 31B FP8 on H100 <span class="badge measured">Measured</span></h3>
+<div class="note">
+  <strong>GPU path (Rust+CUDA).</strong> 60 layers with hybrid attention: 50 sliding (FA3 SM90, head_dim=256, 1024-token window) + 10 global (SM89 fallback, head_dim=512). GELU(tanh), QK-norm, dual RoPE, logit softcap.
 </div>
 <table class="mm-table">
 <thead><tr><th>N</th><th class="r">rvLLM tok/s</th><th class="r">ms/step</th></tr></thead>
@@ -181,12 +246,10 @@ td.pending{color:#b6a1e5;font-style:italic}
 <tr><td>1</td><td class="r">11.2</td><td class="r">89.3</td></tr>
 <tr><td>8</td><td class="r">87</td><td class="r">91.6</td></tr>
 <tr><td>64</td><td class="r">704</td><td class="r">90.9</td></tr>
-<tr><td>128</td><td class="r pending">running</td><td class="r">--</td></tr>
-<tr><td>256</td><td class="r pending">running</td><td class="r">--</td></tr>
-<tr><td>512</td><td class="r pending">running</td><td class="r">--</td></tr>
+<tr><td>128</td><td class="r pending">pending</td><td class="r">--</td></tr>
 </tbody>
 </table>
-<div class="footnote"><strong>Bottleneck:</strong> 85% of time in cuBLASLt FP8 GEMMs (descriptor create/destroy overhead, not compute). At batch=1 each GEMM is a memory-bound GEMV. CUDA graph capture and CUTLASS migration will close the gap.</div>
+<div class="footnote"><strong>GPU Gemma 4 bottleneck:</strong> cuBLASLt descriptor overhead at batch=1. CUDA graph capture will close the gap. The TPU path avoids this entirely -- XLA fuses all ops into one compiled loop.</div>
 
 <h3>Head-to-head: rvLLM vs vLLM</h3>
 <table class="mm-table">
