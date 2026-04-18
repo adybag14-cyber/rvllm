@@ -634,7 +634,39 @@ impl Gemma4Bringup {
                     residual_ptr, stream,
                 )?;
 
-                if step_counter.get() == 0 && layer_idx < 3 {
+                if step_counter.get() == 0 && layer_idx == 0 {
+                    cudarc::driver::sys::cuStreamSynchronize(stream as _);
+                    let mut s = [0u16; 4];
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        s.as_mut_ptr() as *mut _, residual_ptr, 8,
+                    );
+                    let v: Vec<f32> = s.iter().map(|&x| f16_to_f32(x)).collect();
+                    let mut amax = 0f32;
+                    let n = hidden as usize;
+                    let mut all = vec![0u16; n];
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        all.as_mut_ptr() as *mut _, residual_ptr, (n * 2) as _,
+                    );
+                    for &b in &all {
+                        let f = f16_to_f32(b).abs();
+                        if f > amax && !f.is_nan() { amax = f; }
+                    }
+                    eprintln!("  [ppl L0] residual first4={:.6?} amax={:.6}", v, amax);
+                    // Check layer_scalar value
+                    let mut sc = [0u16; 1];
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        sc.as_mut_ptr() as *mut _, layer.layer_scalar.offset_bytes, 2,
+                    );
+                    eprintln!("  [ppl L0] layer_scalar={:.6}", f16_to_f32(sc[0]));
+                    // Check norm gamma amax
+                    let mut ng = vec![0u16; n];
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        ng.as_mut_ptr() as *mut _, layer.input_layernorm.offset_bytes, (n * 2) as _,
+                    );
+                    let gamma_amax = ng.iter().map(|&b| f16_to_f32(b).abs()).fold(0f32, f32::max);
+                    eprintln!("  [ppl L0] input_norm_gamma amax={:.6}", gamma_amax);
+                }
+                if step_counter.get() == 0 && layer_idx < 3 && layer_idx > 0 {
                     cudarc::driver::sys::cuStreamSynchronize(stream as _);
                     let mut s = [0u16; 4];
                     cudarc::driver::sys::cuMemcpyDtoH_v2(
