@@ -1311,7 +1311,7 @@ fn bytemuck_cast_i32(v: &[i32]) -> &[u8] {
 /// Async DtoH of `bytes` from device `src` to host `dst` on `stream`.
 /// Caller must fence the stream afterwards to ensure the copy completes.
 #[cfg(feature = "cuda")]
-fn dtoh_async_sync(src: u64, dst: *mut i32, bytes: usize, stream: u64) -> Result<()> {
+pub(crate) fn dtoh_async_sync(src: u64, dst: *mut i32, bytes: usize, stream: u64) -> Result<()> {
     use cudarc::driver::sys::*;
     let r = unsafe {
         cuMemcpyDtoHAsync_v2(dst as *mut _, src, bytes, stream as CUstream)
@@ -1327,7 +1327,7 @@ fn dtoh_async_sync(src: u64, dst: *mut i32, bytes: usize, stream: u64) -> Result
 }
 
 #[cfg(feature = "cuda")]
-fn compute_nll_f16(logits_f16: &[u16], target: usize) -> f64 {
+pub(crate) fn compute_nll_f16(logits_f16: &[u16], target: usize) -> f64 {
     let mut max_val: f32 = f32::NEG_INFINITY;
     for &bits in logits_f16.iter() {
         let v = f16_to_f32(bits);
