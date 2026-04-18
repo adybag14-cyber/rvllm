@@ -268,27 +268,6 @@ impl CublasLt {
         let algo = if let Some(a) = cached_algo {
             a
         } else {
-            // Top-K heuristic + on-device timing. cuBLASLt's heuristic
-            // estimator is often wrong at small M for FP8 (picks a
-            // 128x128x128 tile even when most of M is padding). Pulling
-            // the top-16 candidates and timing each with CUDA events
-            // closes the small-batch gap measurably. One-time cost per
-            // unique (M,N,K,kind); cached thereafter.
-            //
-            // IMPORTANT: cuEvent timing is NOT graph-capture-safe. If we
-            // reach this code during capture (cache miss), fall back to
-            // the heuristic's top-1 without timing.
-            const CANDIDATES: i32 = 16;
-            const WARMUP_ITERS: u32 = 3;
-            const TIMED_ITERS: u32 = 10;
-
-            let in_capture = {
-                let mut status: cudarc::driver::sys::CUstreamCaptureStatus =
-                    cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
-                let _ = cudarc::driver::sys::cuStreamIsCapturing(stream as _, &mut status);
-                status != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
-            };
-
             let mut pref: lt::cublasLtMatmulPreference_t = std::ptr::null_mut();
             let r = lt::cublasLtMatmulPreferenceCreate(&mut pref);
             if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
@@ -304,100 +283,18 @@ impl CublasLt {
             if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
                 return Err(cublaslt_err("pref set workspace"));
             }
-
-            let mut heur: [lt::cublasLtMatmulHeuristicResult_t; CANDIDATES as usize] =
+            let mut heur: [lt::cublasLtMatmulHeuristicResult_t; 1] =
                 std::mem::zeroed();
             let mut ret: i32 = 0;
             let r = lt::cublasLtMatmulAlgoGetHeuristic(
-                self.handle,
-                desc,
-                layout_a,
-                layout_b,
-                layout_d,
-                layout_d,
-                pref,
-                CANDIDATES,
-                heur.as_mut_ptr(),
-                &mut ret,
+                self.handle, desc, layout_a, layout_b, layout_d, layout_d,
+                pref, 1, heur.as_mut_ptr(), &mut ret,
             );
             lt::cublasLtMatmulPreferenceDestroy(pref);
             if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS || ret == 0 {
                 return Err(cublaslt_err("heuristic"));
             }
-
-            let best_algo = if in_capture || beta_one {
-                heur[0].algo
-            } else {
-                // Time each candidate. We reuse the caller's A/B/D device
-                // pointers -- safe because the caller's buffers are already
-                // valid for the intended matmul on this stream.
-                let mut best_algo = heur[0].algo;
-                let mut best_ns: f64 = f64::MAX;
-                let one_f32: f32 = 1.0;
-                let zero_f32: f32 = 0.0;
-                // CRITICAL: always use beta=0 during timing probes.
-                // With beta=1 the probes write D = GEMM + C where C=D=residual,
-                // accumulating the GEMM output into the live residual buffer
-                // ~200 times (16 candidates * 13 iters). This corrupted layer 0
-                // residual by ~30,000x. beta=0 means C is never read, so no
-                // buffer is corrupted. Algo timing is unaffected because tile
-                // and schedule selection does not depend on the beta path.
-                let c_ptr_probe = d_f16 as *const _;
-                let beta_probe = &zero_f32;
-
-                let mut ev_start: cudarc::driver::sys::CUevent = std::ptr::null_mut();
-                let mut ev_stop: cudarc::driver::sys::CUevent = std::ptr::null_mut();
-                cudarc::driver::sys::cuEventCreate(&mut ev_start, 0);
-                cudarc::driver::sys::cuEventCreate(&mut ev_stop, 0);
-
-                for i in 0..ret as usize {
-                    for _ in 0..WARMUP_ITERS {
-                        let _ = lt::cublasLtMatmul(
-                            self.handle, desc,
-                            &one_f32 as *const _ as *const _,
-                            b_fp8 as *const _, layout_a,
-                            a_fp8 as *const _, layout_b,
-                            beta_probe as *const _ as *const _,
-                            c_ptr_probe, layout_d,
-                            d_f16 as *mut _, layout_d,
-                            &heur[i].algo,
-                            self.workspace as *mut _, self.workspace_bytes,
-                            stream as _,
-                        );
-                    }
-                    cudarc::driver::sys::cuEventRecord(ev_start, stream as _);
-                    for _ in 0..TIMED_ITERS {
-                        let r2 = lt::cublasLtMatmul(
-                            self.handle, desc,
-                            &one_f32 as *const _ as *const _,
-                            b_fp8 as *const _, layout_a,
-                            a_fp8 as *const _, layout_b,
-                            beta_probe as *const _ as *const _,
-                            c_ptr_probe, layout_d,
-                            d_f16 as *mut _, layout_d,
-                            &heur[i].algo,
-                            self.workspace as *mut _, self.workspace_bytes,
-                            stream as _,
-                        );
-                        if r2 != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                            break;
-                        }
-                    }
-                    cudarc::driver::sys::cuEventRecord(ev_stop, stream as _);
-                    cudarc::driver::sys::cuEventSynchronize(ev_stop);
-                    let mut ms: f32 = 0.0;
-                    cudarc::driver::sys::cuEventElapsedTime(&mut ms, ev_start, ev_stop);
-                    let per_iter_ns = (ms as f64) * 1.0e6 / (TIMED_ITERS as f64);
-                    if per_iter_ns < best_ns && per_iter_ns > 0.0 {
-                        best_ns = per_iter_ns;
-                        best_algo = heur[i].algo;
-                    }
-                }
-                cudarc::driver::sys::cuEventDestroy_v2(ev_start);
-                cudarc::driver::sys::cuEventDestroy_v2(ev_stop);
-                best_algo
-            };
-
+            let best_algo = heur[0].algo;
             if let Ok(mut c) = self.algo_cache.lock() {
                 c.insert(key, best_algo);
             }

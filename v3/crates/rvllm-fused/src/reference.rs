@@ -95,6 +95,35 @@ pub fn fused_silu_mul_fp8_quant_ref(
     quantize_fp8_per_token_ref(&y, intermediate, fp8_out, scales);
 }
 
+/// GELU(tanh)(gate) * up, then per-token FP8 quant.
+/// Same layout as SiLU variant: `gate_up` is `[T, 2, intermediate]`.
+pub fn fused_gelu_mul_fp8_quant_ref(
+    gate_up: &[f32],
+    num_tokens: usize,
+    intermediate: usize,
+    fp8_out: &mut [u8],
+    scales: &mut [f32],
+) {
+    assert_eq!(gate_up.len(), num_tokens * 2 * intermediate);
+    assert_eq!(fp8_out.len(), num_tokens * intermediate);
+    let mut y = vec![0f32; num_tokens * intermediate];
+    for t in 0..num_tokens {
+        let base = t * 2 * intermediate;
+        let gate = &gate_up[base..base + intermediate];
+        let up = &gate_up[base + intermediate..base + 2 * intermediate];
+        let yrow = &mut y[t * intermediate..(t + 1) * intermediate];
+        for i in 0..intermediate {
+            let g = gate[i];
+            let sqrt_2_over_pi: f32 = 0.7978845608;
+            let x3 = g * g * g;
+            let inner = sqrt_2_over_pi * (g + 0.044715 * x3);
+            let gelu = 0.5 * g * (1.0 + inner.tanh());
+            yrow[i] = gelu * up[i];
+        }
+    }
+    quantize_fp8_per_token_ref(&y, intermediate, fp8_out, scales);
+}
+
 /// Argmax along the last axis of `[rows, cols]`, written to `out`.
 pub fn argmax_ref(logits: &[f32], rows: usize, cols: usize, out: &mut [i32]) {
     assert_eq!(logits.len(), rows * cols);

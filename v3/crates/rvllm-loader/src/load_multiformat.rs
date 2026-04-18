@@ -16,11 +16,14 @@ use crate::fp8_quant::{check_clamp_gate, quantize_per_tensor_ref, FP8_E4M3_MAX};
 use crate::safetensors::{ShardHeader, ShardIndex, TensorEntry};
 use crate::weights::{F16Weight, Fp8Weight, LayerWeights, LoadedModel};
 
-/// Per-layer attention type. Qwen3.5/3.6 use a hybrid pattern:
-/// 3 GDN linear attention layers, then 1 standard full attention layer.
+/// Per-layer attention type.
+/// - Full: standard causal attention over entire context
+/// - SlidingAttention: local sliding window (Gemma 4)
+/// - Linear: GDN linear attention (Qwen3.5/3.6)
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum LayerAttnType {
     Full,
+    SlidingAttention,
     Linear,
 }
 
@@ -39,6 +42,16 @@ pub struct ModelArch {
     pub attention_bias: bool,
     pub rms_norm_eps: f32,
     pub layer_types: Vec<LayerAttnType>,
+    // -- Gemma 4 fields (None / 0 for non-Gemma models) --
+    pub global_head_dim: Option<usize>,
+    pub num_global_key_value_heads: Option<usize>,
+    pub global_rope_theta: Option<f32>,
+    pub partial_rotary_factor: Option<f32>,
+    pub sliding_window: Option<usize>,
+    pub final_logit_softcapping: Option<f32>,
+    pub hidden_activation: Option<String>,
+    pub tie_word_embeddings: bool,
+    pub attention_k_eq_v: bool,
 }
 
 impl ModelArch {
@@ -59,8 +72,9 @@ impl ModelArch {
             },
             bt: std::backtrace::Backtrace::capture(),
         })?;
-        // Gemma 3/4: model params nested under text_config.
-        let tc = if v["hidden_size"].is_u64() { &v } else { &v["text_config"] };
+        // Gemma 3/4: text model params nested under text_config.
+        let has_text_config = v["text_config"]["hidden_size"].is_u64();
+        let tc = if has_text_config { &v["text_config"] } else { &v };
         let num_hidden_layers = tc["num_hidden_layers"].as_u64().unwrap_or(0) as usize;
         let hidden_size = tc["hidden_size"].as_u64().unwrap_or(0) as usize;
         let num_attention_heads = tc["num_attention_heads"].as_u64().unwrap_or(0) as usize;
@@ -69,16 +83,21 @@ impl ModelArch {
             .unwrap_or(num_attention_heads as u64) as usize;
         let intermediate_size = tc["intermediate_size"].as_u64().unwrap_or(0) as usize;
         let vocab_size = tc["vocab_size"].as_u64().unwrap_or(0) as usize;
-        let rope_theta = tc["rope_theta"].as_f64().unwrap_or(10000.0) as f32;
+        // Gemma 4 nests rope_theta under rope_parameters.sliding_attention.
+        let rope_theta = tc["rope_parameters"]["sliding_attention"]["rope_theta"]
+            .as_f64()
+            .or_else(|| tc["rope_theta"].as_f64())
+            .unwrap_or(10000.0) as f32;
         let max_position_embeddings =
             tc["max_position_embeddings"].as_u64().unwrap_or(2048) as usize;
         let attention_bias = tc["attention_bias"].as_bool().unwrap_or(false);
         let rms_norm_eps = tc["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32;
-        let layer_types_val = v["layer_types"].as_array()
-            .or_else(|| tc["layer_types"].as_array());
+        let layer_types_val = tc["layer_types"].as_array()
+            .or_else(|| v["layer_types"].as_array());
         let layer_types: Vec<LayerAttnType> = match layer_types_val {
             Some(arr) => arr.iter().map(|t| {
                 match t.as_str().unwrap_or("full_attention") {
+                    "sliding_attention" => LayerAttnType::SlidingAttention,
                     "linear_attention" => LayerAttnType::Linear,
                     _ => LayerAttnType::Full,
                 }
@@ -89,20 +108,61 @@ impl ModelArch {
             .as_u64()
             .map(|d| d as usize)
             .unwrap_or_else(|| if num_attention_heads == 0 { 0 } else { hidden_size / num_attention_heads });
-        if head_dim != 128 {
+        // Accept head_dim 128 (Llama/Qwen/Mistral) and 256 (Gemma 4).
+        if head_dim != 128 && head_dim != 256 {
             return Err(RvllmError::Loader {
                 err: LoaderError::Corrupt {
                     detail: format!(
-                        "v3 requires head_dim == 128, got {head_dim} (hidden={hidden_size}, heads={num_attention_heads})"
+                        "v3 requires head_dim in {{128, 256}}, got {head_dim} (hidden={hidden_size}, heads={num_attention_heads})"
                     ),
                 },
                 ctx: LoaderCtx {
-                    path: p,
+                    path: p.clone(),
                     tensor: None,
                 },
                 bt: std::backtrace::Backtrace::capture(),
             });
         }
+        let hidden_activation = tc["hidden_act"].as_str()
+            .or_else(|| tc["hidden_activation"].as_str())
+            .map(|s| s.to_string());
+        let global_head_dim = tc["global_head_dim"].as_u64().map(|d| d as usize);
+        let num_global_key_value_heads = tc["num_global_key_value_heads"].as_u64().map(|d| d as usize);
+        let global_rope_theta = tc.get("rope_parameters")
+            .and_then(|rp| rp["full_attention"]["rope_theta"].as_f64())
+            .or_else(|| tc["rope_theta_global"].as_f64())
+            .map(|t| t as f32);
+        let partial_rotary_factor = tc.get("rope_parameters")
+            .and_then(|rp| rp["full_attention"]["partial_rotary_factor"].as_f64())
+            .or_else(|| tc["partial_rotary_factor"].as_f64())
+            .map(|f| f as f32);
+        let sliding_window = tc["sliding_window"].as_u64()
+            .or_else(|| tc["sliding_window_size"].as_u64())
+            .map(|s| s as usize);
+        let final_logit_softcapping = tc["final_logit_softcapping"].as_f64()
+            .or_else(|| tc["logit_softcapping"].as_f64())
+            .map(|s| s as f32);
+        let tie_word_embeddings = tc["tie_word_embeddings"].as_bool()
+            .or_else(|| v["tie_word_embeddings"].as_bool())
+            .unwrap_or(false);
+        let attention_k_eq_v = tc["attention_k_eq_v"].as_bool().unwrap_or(false);
+
+        if global_head_dim.is_some() {
+            let n_sliding = layer_types.iter().filter(|t| **t == LayerAttnType::SlidingAttention).count();
+            let n_full = layer_types.iter().filter(|t| **t == LayerAttnType::Full).count();
+            eprintln!(
+                "[loader] Gemma 4: {num_hidden_layers} layers ({n_sliding} sliding + {n_full} full), \
+                 head_dim={head_dim}/{}, kv_heads={num_key_value_heads}/{}, \
+                 rope={rope_theta}/{:?}, partial_rot={:?}, sw={:?}, \
+                 softcap={:?}, act={:?}, tied={}",
+                global_head_dim.unwrap_or(0),
+                num_global_key_value_heads.unwrap_or(0),
+                global_rope_theta, partial_rotary_factor,
+                sliding_window, final_logit_softcapping,
+                hidden_activation, tie_word_embeddings,
+            );
+        }
+
         Ok(Self {
             num_hidden_layers,
             hidden_size,
@@ -116,6 +176,15 @@ impl ModelArch {
             attention_bias,
             rms_norm_eps,
             layer_types,
+            global_head_dim,
+            num_global_key_value_heads,
+            global_rope_theta,
+            partial_rotary_factor,
+            sliding_window,
+            final_logit_softcapping,
+            hidden_activation,
+            tie_word_embeddings,
+            attention_k_eq_v,
         })
     }
 }
@@ -829,6 +898,18 @@ mod tests {
             vocab_size: 32,
             rope_theta: 10000.0,
             max_position_embeddings: 4,
+            attention_bias: false,
+            rms_norm_eps: 1e-6,
+            layer_types: vec![LayerAttnType::Full],
+            global_head_dim: None,
+            num_global_key_value_heads: None,
+            global_rope_theta: None,
+            partial_rotary_factor: None,
+            sliding_window: None,
+            final_logit_softcapping: None,
+            hidden_activation: None,
+            tie_word_embeddings: false,
+            attention_k_eq_v: false,
         };
         let (cos, sin) = rope_cos_sin_bytes(&a);
         // 4 positions * 64 half * 2 bytes = 512

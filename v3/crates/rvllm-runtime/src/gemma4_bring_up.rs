@@ -36,6 +36,7 @@ pub struct Gemma4FusedModules {
     pub argmax_mod: LoadedModule,
     pub qk_norm_mod: LoadedModule,
     pub softcap_mod: LoadedModule,
+    pub residual_scale_mod: LoadedModule,
     pub fn_rmsnorm: KernelFn,
     pub fn_rmsnorm_fp8_quant: KernelFn,
     pub fn_quantize: KernelFn,
@@ -44,6 +45,7 @@ pub struct Gemma4FusedModules {
     pub fn_argmax: KernelFn,
     pub fn_qk_rmsnorm: KernelFn,
     pub fn_softcap: KernelFn,
+    pub fn_residual_scale: KernelFn,
 }
 
 pub struct Gemma4Bringup {
@@ -142,6 +144,7 @@ impl Gemma4Bringup {
             fused_rope_partial_fp8kv: self.fused.fn_rope_partial_fp8kv,
             fused_gelu_mul: self.fused.fn_gelu_mul,
             quantize_fp8_per_token: self.fused.fn_quantize,
+            residual_scale_f16: self.fused.fn_residual_scale,
         }
     }
 }
@@ -153,6 +156,7 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
     let argmax_mod = loader.load_ptx("argmax")?;
     let qk_norm_mod = loader.load_ptx("fused_qk_rmsnorm")?;
     let softcap_mod = loader.load_ptx("logit_softcap")?;
+    let residual_scale_mod = loader.load_ptx("residual_scale_f16")?;
 
     let fn_rmsnorm = rmsnorm_mod.get_function("fused_rmsnorm_fp8_quant_kernel")?;
     let fn_rmsnorm_fp8_quant = rmsnorm_mod.get_function("fused_rmsnorm_fp8_quant_kernel")?;
@@ -165,6 +169,8 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
     let fn_qk_rmsnorm =
         qk_norm_mod.get_function("fused_qk_rmsnorm_kernel")?;
     let fn_softcap = softcap_mod.get_function("logit_softcap_kernel")?;
+    let fn_residual_scale =
+        residual_scale_mod.get_function("residual_scale_f16_kernel")?;
 
     Ok(Gemma4FusedModules {
         rmsnorm_mod,
@@ -173,6 +179,7 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
         argmax_mod,
         qk_norm_mod,
         softcap_mod,
+        residual_scale_mod,
         fn_rmsnorm,
         fn_rmsnorm_fp8_quant,
         fn_quantize,
@@ -181,5 +188,6 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
         fn_argmax,
         fn_qk_rmsnorm,
         fn_softcap,
+        fn_residual_scale,
     })
 }

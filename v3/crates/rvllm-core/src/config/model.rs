@@ -13,6 +13,7 @@ pub enum ModelArch {
     Llama,
     Mistral,
     Gemma2,
+    Gemma4,
 }
 
 impl ModelArch {
@@ -22,6 +23,7 @@ impl ModelArch {
             "LlamaForCausalLM" => Some(ModelArch::Llama),
             "MistralForCausalLM" => Some(ModelArch::Mistral),
             "Gemma2ForCausalLM" => Some(ModelArch::Gemma2),
+            "Gemma4ForConditionalGeneration" => Some(ModelArch::Gemma4),
             _ => None,
         }
     }
@@ -76,17 +78,27 @@ impl ModelConfig {
             )
         })?;
 
-        let hidden_size = hf::usize_field(v, "hidden_size", file)?;
-        let num_layers = hf::usize_field(v, "num_hidden_layers", file)?;
-        let num_attention_heads = hf::usize_field(v, "num_attention_heads", file)?;
-        let num_kv_heads = hf::usize_field(v, "num_key_value_heads", file)?;
-        let intermediate_size = hf::usize_field(v, "intermediate_size", file)?;
-        let vocab_size = hf::usize_field(v, "vocab_size", file)?;
-        let max_position_embeddings = hf::usize_field(v, "max_position_embeddings", file)?;
-        let rms_norm_eps = hf::f32_field(v, "rms_norm_eps", file)?;
-        let rope_theta = hf::f32_field(v, "rope_theta", file)?;
-        let tie_word_embeddings = hf::bool_field_opt(v, "tie_word_embeddings").unwrap_or(false);
-        let torch_dtype = match hf::str_field(v, "torch_dtype", file)?.as_str() {
+        // Gemma 3/4: text model fields nested under text_config.
+        let tc = if v["text_config"]["hidden_size"].is_u64() { &v["text_config"] } else { v };
+
+        let hidden_size = hf::usize_field(tc, "hidden_size", file)?;
+        let num_layers = hf::usize_field(tc, "num_hidden_layers", file)?;
+        let num_attention_heads = hf::usize_field(tc, "num_attention_heads", file)?;
+        let num_kv_heads = hf::usize_field(tc, "num_key_value_heads", file)?;
+        let intermediate_size = hf::usize_field(tc, "intermediate_size", file)?;
+        let vocab_size = hf::usize_field(tc, "vocab_size", file)?;
+        let max_position_embeddings = hf::usize_field(tc, "max_position_embeddings", file)?;
+        let rms_norm_eps = hf::f32_field(tc, "rms_norm_eps", file)?;
+        let rope_theta = tc["rope_parameters"]["sliding_attention"]["rope_theta"]
+            .as_f64()
+            .map(|t| t as f32)
+            .map(Ok)
+            .unwrap_or_else(|| hf::f32_field(tc, "rope_theta", file))?;
+        let tie_word_embeddings = hf::bool_field_opt(tc, "tie_word_embeddings")
+            .or_else(|| hf::bool_field_opt(v, "tie_word_embeddings"))
+            .unwrap_or(false);
+        let torch_dtype = match hf::str_field(v, "torch_dtype", file)
+            .or_else(|_| hf::str_field(tc, "dtype", file))?.as_str() {
             "float16" => DType::F16,
             "bfloat16" => DType::Bf16,
             other => {
@@ -109,8 +121,10 @@ impl ModelConfig {
                 "num_attention_heads",
             ));
         }
-        let head_dim = hidden_size / num_attention_heads;
-        if head_dim * num_attention_heads != hidden_size {
+        // Gemma 4 has explicit head_dim (256) that doesn't equal hidden_size/num_heads.
+        let head_dim = tc["head_dim"].as_u64().map(|d| d as usize)
+            .unwrap_or_else(|| hidden_size / num_attention_heads);
+        if tc["head_dim"].as_u64().is_none() && head_dim * num_attention_heads != hidden_size {
             return Err(RvllmError::config(
                 ConfigError::Inconsistent {
                     reasons: vec![format!(

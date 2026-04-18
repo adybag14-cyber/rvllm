@@ -15,6 +15,7 @@ NAME_TO_FILE = {
     "fused_rope_cache_fp8kv": "fused_rope_cache_fp8kv.ptx",
     "add_bias_f16": "add_bias_f16.ptx",
     "fused_silu_fp8_quant": "fused_silu_fp8_quant.ptx",
+    "fused_gelu_mul_fp8_quant": "fused_gelu_mul_fp8_quant.ptx",
     "argmax": "argmax.ptx",
     "quantize_activation_fp8": "quantize_activation_fp8.ptx",
     "fused_lm_head_argmax": "fused_lm_head_argmax.ptx",

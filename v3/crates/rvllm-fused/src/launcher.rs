@@ -241,11 +241,7 @@ impl QuantizeFp8PerTokenLaunch {
             (&mut dim) as *mut i32 as *mut core::ffi::c_void,
         ];
         const SMEM: u32 = 32 * 4;
-        // Vector path: 8 halves per uint4; tie block to vec_per_row/8.
-        let vec_per_row = (self.dim / 8).max(1);
-        let min_threads = (vec_per_row + 7) / 8;
-        let block_threads = ((min_threads.max(32) + 31) / 32 * 32).min(1024);
-        let block = (block_threads, 1, 1);
+        let block = (self.dim.min(1024).max(256), 1, 1);
         let grid = (self.num_tokens, 1, 1);
         launch_raw(kernel, grid, block, SMEM, stream, &args)
     }

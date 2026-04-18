@@ -10,11 +10,15 @@
 //! - Full weight set resident before first forward; no lazy loading.
 
 pub mod fp8_quant;
+pub mod gemma4_arch;
+pub mod gemma4_load;
+pub mod gemma4_weights;
 pub mod load;
+pub mod load_multiformat;
 pub mod safetensors;
 pub mod weights;
 
 pub use fp8_quant::{check_clamp_gate, quantize_per_tensor_ref, QuantResult, FP8_E4M3_MAX};
-pub use load::{load_model, LayerAttnType, ModelArch};
+pub use load::{load_model, LayerAttnType, MlpActivation, ModelArch};
 pub use safetensors::{ShardHeader, ShardIndex, TensorEntry};
 pub use weights::{F16Weight, Fp8Weight, LayerWeights, LoadedModel};

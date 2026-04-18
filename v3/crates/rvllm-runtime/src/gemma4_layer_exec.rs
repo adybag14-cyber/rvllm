@@ -1,4 +1,4 @@
-//! Gemma 4 layer forward -- 16 kernel launches per layer.
+//! Gemma 4 layer forward -- 15 kernel launches per layer.
 //!
 //! Differs from the Llama/Qwen path (layer_exec.rs) in:
 //!   - 4 norms per layer (input, post_attn, pre_ff, post_ff)
@@ -7,8 +7,7 @@
 //!   - Partial RoPE (only rotate first rotary_dim dims per head)
 //!   - Per-layer KV head count (sliding vs global)
 //!   - head_dim = 256 (requires FA3 .so compiled for 256)
-//!   - Post-feedforward residual scaling (no learnable scalar yet,
-//!     but the norm structure matches Gemma 3/4)
+//!   - Per-layer learnable scalar (multiply residual after each sub-block)
 //!
 //! Launch sequence:
 //!   1.  fused_rmsnorm_fp8_quant          input_layernorm
@@ -19,11 +18,13 @@
 //!   6.  quantize_fp8_per_token          attn_out -> fp8
 //!   7.  fp8_gemm_residual (cuBLASLt)    O proj += residual
 //!   8.  fused_rmsnorm                   post_attention_layernorm (norm only)
+//!  8b.  residual_scale_f16              residual *= layer_scalar
 //!   9.  fused_rmsnorm_fp8_quant         pre_feedforward_layernorm
 //!  10.  fp8_gemm (cuBLASLt)             gate||up projection
 //!  11.  fused_gelu_mul_fp8_quant        GELU(tanh)(gate) * up -> FP8
 //!  12.  fp8_gemm_residual (cuBLASLt)    down proj += residual
 //!  13.  fused_rmsnorm                   post_feedforward_layernorm (norm only)
+//!  14.  residual_scale_f16              residual *= layer_scalar
 
 use rvllm_core::Result;
 use rvllm_cutlass::CublasLt;
@@ -71,6 +72,7 @@ pub struct Gemma4LayerWeightPtrs {
     pub gate_up_scale: u64,
     pub down_fp8: u64,
     pub down_scale: u64,
+    pub layer_scalar_ptr: u64, // [1] f16, per-layer residual multiplier
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -117,6 +119,7 @@ pub struct Gemma4LayerKernels {
     pub fused_rope_partial_fp8kv: KernelFn,
     pub fused_gelu_mul: KernelFn,
     pub quantize_fp8_per_token: KernelFn,
+    pub residual_scale_f16: KernelFn,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -291,6 +294,18 @@ pub unsafe fn gemma4_forward(
         stream,
     )?;
 
+    // 8b. residual *= layer_scalar (per-layer learnable scale)
+    gemma4_launcher::ResidualScaleF16Launch {
+        num_tokens: dims.num_tokens,
+        hidden: dims.hidden,
+    }
+    .launch(
+        kernels.residual_scale_f16,
+        residual,
+        weights.layer_scalar_ptr,
+        stream,
+    )?;
+
     // 9. pre_feedforward_layernorm -> FP8 quant
     FusedRmsnormFp8QuantLaunch {
         num_tokens: dims.num_tokens,
@@ -358,6 +373,18 @@ pub unsafe fn gemma4_forward(
         kernels.fused_rmsnorm,
         residual,
         weights.post_ff_norm_gamma,
+        stream,
+    )?;
+
+    // 14. residual *= layer_scalar (per-layer learnable scale, applied again)
+    gemma4_launcher::ResidualScaleF16Launch {
+        num_tokens: dims.num_tokens,
+        hidden: dims.hidden,
+    }
+    .launch(
+        kernels.residual_scale_f16,
+        residual,
+        weights.layer_scalar_ptr,
         stream,
     )?;
 

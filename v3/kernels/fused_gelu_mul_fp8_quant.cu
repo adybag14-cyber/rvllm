@@ -1,84 +1,115 @@
-// Fused GELU(tanh) * mul + per-tensor FP8 E4M3 quantization.
+// Fused GELU(tanh)*up + per-token FP8 E4M3 quantization for SM90.
+// Input layout: [num_tokens, 2 * intermediate_size] as [gate | up] per row.
+// Output: [num_tokens, intermediate_size] in FP8 with per-row scales.
+// Compile: nvcc -ptx -arch=sm_90 -O3 --use_fast_math
 //
-// Replaces fused_silu_mul_fp8_quant for Gemma 4 (uses GELU(tanh) activation).
-//
-// Input:  gate_up [num_tokens, 2 * intermediate] f16
-//         Layout: first `intermediate` elements = gate, next = up
-// Output: out_fp8 [num_tokens, intermediate] FP8 E4M3
-//         scale   [num_tokens] f32 per-tensor scale
+// Vectorized: 128-bit loads (8 halves), register-cached intermediates
+// (eliminates second global memory pass), 64-bit FP8 stores.
 //
 // GELU(tanh)(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+// Used by Gemma 4 (gelu_pytorch_tanh) instead of SiLU.
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
-#include <math_constants.h>
+
+#define FP8_E4M3_MAX 448.0f
+#define WARPS_MAX 32
+#define VEC_SIZE 8
+#define MAX_VECS_PER_THREAD 4  // supports intermediate_size up to 32768
+
+__device__ __forceinline__ float warp_reduce_max(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, offset));
+    return val;
+}
+
+__device__ __forceinline__ float block_reduce_max(float val, float* smem) {
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+    val = warp_reduce_max(val);
+    if (lane_id == 0) smem[warp_id] = val;
+    __syncthreads();
+    int num_warps = (blockDim.x + 31) / 32;
+    val = (lane_id < num_warps) ? smem[lane_id] : 0.0f;
+    if (warp_id == 0) val = warp_reduce_max(val);
+    return val;
+}
 
 __device__ __forceinline__ float gelu_tanh(float x) {
+    // 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
     const float sqrt_2_over_pi = 0.7978845608f;
     float x3 = x * x * x;
     float inner = sqrt_2_over_pi * (x + 0.044715f * x3);
     return 0.5f * x * (1.0f + tanhf(inner));
 }
 
-extern "C"
-__global__ void fused_gelu_mul_fp8_quant_kernel(
-    __nv_fp8_e4m3* __restrict__ out_fp8,    // [num_tokens, intermediate]
-    float* __restrict__ scale,               // [num_tokens]
-    const __half* __restrict__ gate_up,      // [num_tokens, 2 * intermediate]
-    int intermediate
+// GELU(gate) * up + per-token FP8 quantization.
+// grid=(num_tokens), block=(min(intermediate_size, 1024))
+// shared mem: WARPS_MAX * sizeof(float)
+// Requires: intermediate_size % 8 == 0 (true for all transformer models)
+extern "C" __global__ void __launch_bounds__(1024)
+fused_gelu_mul_fp8_quant_kernel(
+    __nv_fp8_storage_t* __restrict__ output_fp8,
+    float*              __restrict__ output_scales,
+    const __half*       __restrict__ gate_up,
+    int intermediate_size
 ) {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    const int n_vecs = intermediate_size / VEC_SIZE;
 
-    // Shared memory for warp-level amax reduction
-    extern __shared__ float smem[];
+    // 128-bit vectorized pointers for gate and up halves of this row
+    const uint4* gate_vec = reinterpret_cast<const uint4*>(
+        gate_up + row * 2 * intermediate_size);
+    const uint4* up_vec = reinterpret_cast<const uint4*>(
+        gate_up + row * 2 * intermediate_size + intermediate_size);
 
-    const __half* gate_row = gate_up + row * 2 * intermediate;
-    const __half* up_row = gate_row + intermediate;
+    __shared__ float smem[WARPS_MAX];
 
-    float local_amax = 0.0f;
+    // Register cache: store gelu(g)*u to avoid reloading in pass 2
+    float cached[MAX_VECS_PER_THREAD * VEC_SIZE];
 
-    for (int i = tid; i < intermediate; i += blockDim.x) {
-        float g = __half2float(gate_row[i]);
-        float u = __half2float(up_row[i]);
-        float val = gelu_tanh(g) * u;
-        float aval = fabsf(val);
-        if (aval > local_amax) local_amax = aval;
-    }
+    // Pass 1: vectorized 128-bit loads, compute GELU(gate)*up, find absmax
+    float local_max = 0.0f;
+    int vec_idx = 0;
+    for (int i = tid; i < n_vecs; i += stride, vec_idx++) {
+        uint4 gv = gate_vec[i];
+        uint4 uv = up_vec[i];
+        const __half* g = reinterpret_cast<const __half*>(&gv);
+        const __half* u = reinterpret_cast<const __half*>(&uv);
 
-    // Warp reduce
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-        float other = __shfl_down_sync(0xffffffff, local_amax, offset);
-        if (other > local_amax) local_amax = other;
-    }
-
-    int warp_id = tid / warpSize;
-    int lane = tid % warpSize;
-    if (lane == 0) smem[warp_id] = local_amax;
-    __syncthreads();
-
-    int num_warps = (blockDim.x + warpSize - 1) / warpSize;
-    if (warp_id == 0) {
-        float v = (lane < num_warps) ? smem[lane] : 0.0f;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-            float other = __shfl_down_sync(0xffffffff, v, offset);
-            if (other > v) v = other;
-        }
-        if (lane == 0) {
-            float s = fmaxf(v, 1e-12f) / 448.0f;
-            smem[0] = s;
-            scale[row] = s;
+        #pragma unroll
+        for (int j = 0; j < VEC_SIZE; j++) {
+            float gf = __half2float(g[j]);
+            float uf = __half2float(u[j]);
+            float gelu_g = gelu_tanh(gf);
+            float v = gelu_g * uf;
+            cached[vec_idx * VEC_SIZE + j] = v;
+            local_max = fmaxf(local_max, fabsf(v));
         }
     }
+
+    float absmax = block_reduce_max(local_max, smem);
     __syncthreads();
 
-    float inv_scale = 1.0f / smem[0];
+    float scale = absmax / FP8_E4M3_MAX;
+    scale = fmaxf(scale, 1e-12f);
+    if (tid == 0) output_scales[row] = scale;
+    float inv_scale = 1.0f / scale;
 
-    __nv_fp8_e4m3* out_row = out_fp8 + row * intermediate;
-    for (int i = tid; i < intermediate; i += blockDim.x) {
-        float g = __half2float(gate_row[i]);
-        float u = __half2float(up_row[i]);
-        float val = gelu_tanh(g) * u;
-        out_row[i] = __nv_fp8_e4m3(val * inv_scale);
+    // Pass 2: quantize from register cache, 64-bit vectorized FP8 store
+    uint2* out_vec = reinterpret_cast<uint2*>(output_fp8 + row * intermediate_size);
+    vec_idx = 0;
+    for (int i = tid; i < n_vecs; i += stride, vec_idx++) {
+        __nv_fp8_storage_t fp8[VEC_SIZE];
+        #pragma unroll
+        for (int j = 0; j < VEC_SIZE; j++) {
+            fp8[j] = __nv_cvt_float_to_fp8(
+                cached[vec_idx * VEC_SIZE + j] * inv_scale,
+                __NV_SATFINITE, __NV_E4M3);
+        }
+        out_vec[i] = *reinterpret_cast<const uint2*>(fp8);
     }
 }

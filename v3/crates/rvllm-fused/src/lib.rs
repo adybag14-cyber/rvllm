@@ -13,6 +13,8 @@
 pub mod launch_raw;
 pub mod launcher;
 pub mod reference;
+pub mod gemma4_launcher;
+pub mod gemma4_reference;
 
 pub use launch_raw::launch_raw;
 pub use launcher::{
@@ -23,6 +25,6 @@ pub use launcher::{
 };
 pub use reference::{
     argmax_ref, embedding_gather_ref, fused_add_rmsnorm_fp8_quant_ref,
-    fused_silu_mul_fp8_quant_ref, quantize_fp8_per_token_ref, residual_add_ref, rmsnorm_ref,
-    rope_ref, FP8_E4M3_MAX,
+    fused_gelu_mul_fp8_quant_ref, fused_silu_mul_fp8_quant_ref, quantize_fp8_per_token_ref,
+    residual_add_ref, rmsnorm_ref, rope_ref, FP8_E4M3_MAX,
 };

@@ -318,6 +318,56 @@ impl RmsnormInplaceLaunch {
 }
 
 // ---------------------------------------------------------------------------
+// residual_scale_f16 (multiply residual by per-layer scalar)
+// ---------------------------------------------------------------------------
+
+pub struct ResidualScaleF16Launch {
+    pub num_tokens: u32,
+    pub hidden: u32,
+}
+
+impl ResidualScaleF16Launch {
+    pub fn validate(&self) -> Result<()> {
+        if self.num_tokens == 0 {
+            return Err(invalid("num_tokens", "must be > 0"));
+        }
+        if self.hidden == 0 {
+            return Err(invalid("hidden", "must be > 0"));
+        }
+        Ok(())
+    }
+
+    /// Multiplies every element of the residual buffer by a single f16
+    /// scalar loaded from `scalar_ptr`. Applied in-place.
+    ///
+    /// Kernel sig: `(residual_f16_inout, scalar_ptr, hidden)`.
+    /// Grid: (num_tokens, 1, 1), Block: (min(hidden, 1024), 1, 1).
+    ///
+    /// # Safety
+    /// Caller owns device pointers for the call's duration.
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        residual: u64,
+        scalar_ptr: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.validate()?;
+        let mut residual = residual;
+        let mut scalar_ptr = scalar_ptr;
+        let mut hidden = self.hidden as i32;
+        let args = [
+            (&mut residual) as *mut u64 as *mut core::ffi::c_void,
+            (&mut scalar_ptr) as *mut u64 as *mut core::ffi::c_void,
+            (&mut hidden) as *mut i32 as *mut core::ffi::c_void,
+        ];
+        let block = (self.hidden.min(1024), 1, 1);
+        let grid = (self.num_tokens, 1, 1);
+        launch_raw(kernel, grid, block, 0, stream, &args)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // logit_softcap
 // ---------------------------------------------------------------------------
 
@@ -418,6 +468,24 @@ mod tests {
             cap: 0.0,
         };
         assert!(l.validate().is_err());
+    }
+
+    #[test]
+    fn residual_scale_rejects_zero_tokens() {
+        let l = ResidualScaleF16Launch {
+            num_tokens: 0,
+            hidden: 5376,
+        };
+        assert!(l.validate().is_err());
+    }
+
+    #[test]
+    fn residual_scale_accepts_valid() {
+        let l = ResidualScaleF16Launch {
+            num_tokens: 32,
+            hidden: 5376,
+        };
+        assert!(l.validate().is_ok());
     }
 
     #[test]

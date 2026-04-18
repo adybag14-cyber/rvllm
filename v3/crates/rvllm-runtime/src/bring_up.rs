@@ -62,6 +62,7 @@ pub struct FusedModules {
     pub rmsnorm_mod: LoadedModule,
     pub rope_mod: LoadedModule,
     pub silu_mod: LoadedModule,
+    pub gelu_mod: Option<LoadedModule>,
     pub argmax_mod: LoadedModule,
     pub add_bias_mod: LoadedModule,
     pub fn_rmsnorm: KernelFn,
@@ -69,6 +70,7 @@ pub struct FusedModules {
     pub fn_quantize: KernelFn,
     pub fn_rope_cache_fp8kv: KernelFn,
     pub fn_silu_mul: KernelFn,
+    pub fn_gelu_mul: Option<KernelFn>,
     pub fn_argmax: KernelFn,
     pub fn_add_bias_f16: KernelFn,
 }
@@ -286,7 +288,7 @@ impl Bringup {
         let block_size: u32 = std::env::var("RVLLM_BLOCK_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(64);
+            .unwrap_or(32);
         // max_blocks_per_seq × num_seqs must stay within num_blocks_total
         // so every block_tables entry points at a real page. At 1024
         // pages and N=512, that caps max_blocks_per_seq at 2. Clamp so
@@ -337,7 +339,7 @@ impl Bringup {
 
         let cutlass_ws_bytes: usize = 16 * 1024 * 1024;
         let cutlass_ws = arena.region("cutlass_ws", cutlass_ws_bytes, 256)?;
-        let fa3_ws = arena.region("fa3_ws", 64 * 1024 * 1024, 256)?;
+        let fa3_ws = arena.region("fa3_ws", 16 * 1024 * 1024, 256)?;
 
         let residual = arena.region("residual", (max_tokens * hidden * 2) as usize, 16)?;
         // Zero the residual so layer 0's rmsnorm doesn't read stale NaN
@@ -454,6 +456,8 @@ impl Bringup {
             fused_add_rmsnorm: self.fused_modules.fn_add_rmsnorm,
             fused_rope_cache_fp8kv: self.fused_modules.fn_rope_cache_fp8kv,
             fused_silu_mul: self.fused_modules.fn_silu_mul,
+            fused_gelu_mul: self.fused_modules.fn_gelu_mul,
+            mlp_activation: self.arch.mlp_activation(),
             quantize_fp8_per_token: self.fused_modules.fn_quantize,
             add_bias_f16: self.fused_modules.fn_add_bias_f16,
         };
@@ -573,7 +577,7 @@ impl Bringup {
                 rvllm_fused::FusedRmsnormFp8QuantLaunch {
                     num_tokens: num_seqs,
                     hidden,
-                    eps: 1e-6,
+                    eps: arch.rms_norm_eps,
                 }
                 .launch(
                     self.fused_modules.fn_rmsnorm,
@@ -886,7 +890,7 @@ impl Bringup {
         let block_size: u32 = std::env::var("RVLLM_BLOCK_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(64);
+            .unwrap_or(32);
         let num_blocks_total: u32 = std::env::var("RVLLM_NUM_BLOCKS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -933,7 +937,7 @@ impl Bringup {
 
         let cutlass_ws_bytes: usize = 16 * 1024 * 1024;
         let cutlass_ws = arena.region("cutlass_ws", cutlass_ws_bytes, 256)?;
-        let fa3_ws = arena.region("fa3_ws", 64 * 1024 * 1024, 256)?;
+        let fa3_ws = arena.region("fa3_ws", 16 * 1024 * 1024, 256)?;
 
         // Metadata BEFORE residual so embedding_gather can't corrupt them.
         let positions = arena.region("positions", (max_tokens * 4) as usize, 16)?;
@@ -999,6 +1003,8 @@ impl Bringup {
             fused_add_rmsnorm: self.fused_modules.fn_add_rmsnorm,
             fused_rope_cache_fp8kv: self.fused_modules.fn_rope_cache_fp8kv,
             fused_silu_mul: self.fused_modules.fn_silu_mul,
+            fused_gelu_mul: self.fused_modules.fn_gelu_mul,
+            mlp_activation: self.arch.mlp_activation(),
             quantize_fp8_per_token: self.fused_modules.fn_quantize,
             add_bias_f16: self.fused_modules.fn_add_bias_f16,
         };
@@ -1338,7 +1344,7 @@ fn compute_nll_f16(logits_f16: &[u16], target: usize) -> f64 {
 
 #[cfg(feature = "cuda")]
 #[inline(always)]
-fn f16_to_f32(bits: u16) -> f32 {
+pub fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
     let exp = ((bits >> 10) & 0x1f) as u32;
     let mant = (bits & 0x3ff) as u32;
@@ -1365,6 +1371,17 @@ fn load_fused(loader: &KernelLoader) -> Result<FusedModules> {
     let argmax_mod = loader.load_ptx("argmax")?;
     let add_bias_mod = loader.load_ptx("add_bias_f16")?;
 
+    // GELU kernel is optional -- only needed for Gemma 4 and similar.
+    // If the PTX isn't in the manifest, we get None and fall through
+    // to a hard error at dispatch time if the model actually needs it.
+    let (gelu_mod, fn_gelu_mul) = match loader.load_ptx("fused_gelu_mul_fp8_quant") {
+        Ok(m) => {
+            let f = m.get_function("fused_gelu_mul_fp8_quant_kernel")?;
+            (Some(m), Some(f))
+        }
+        Err(_) => (None, None),
+    };
+
     let fn_rmsnorm = rmsnorm_mod.get_function("fused_rmsnorm_fp8_quant_kernel")?;
     let fn_add_rmsnorm = rmsnorm_mod.get_function("fused_add_rmsnorm_fp8_quant_kernel")?;
     let fn_quantize = rmsnorm_mod.get_function("quantize_fp8_per_token_kernel")?;
@@ -1377,6 +1394,7 @@ fn load_fused(loader: &KernelLoader) -> Result<FusedModules> {
         rmsnorm_mod,
         rope_mod,
         silu_mod,
+        gelu_mod,
         argmax_mod,
         add_bias_mod,
         fn_rmsnorm,
@@ -1384,6 +1402,7 @@ fn load_fused(loader: &KernelLoader) -> Result<FusedModules> {
         fn_quantize,
         fn_rope_cache_fp8kv,
         fn_silu_mul,
+        fn_gelu_mul,
         fn_argmax,
         fn_add_bias_f16,
     })

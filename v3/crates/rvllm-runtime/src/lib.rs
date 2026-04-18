@@ -12,6 +12,8 @@
 pub mod bring_up;
 pub mod engine;
 pub mod layer_exec;
+pub mod gemma4_bring_up;
+pub mod gemma4_layer_exec;
 pub mod sched_state;
 pub mod scheduler;
 
