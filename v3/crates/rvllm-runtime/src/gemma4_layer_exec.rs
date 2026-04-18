@@ -186,6 +186,23 @@ pub unsafe fn gemma4_forward(
             }
         };
     }
+    #[cfg(feature = "cuda")]
+    macro_rules! probe_amax {
+        ($label:expr, $ptr:expr, $n:expr) => {
+            if dbg_layer >= 0 {
+                cudarc::driver::sys::cuStreamSynchronize(stream as _);
+                let count = $n as usize;
+                let mut buf = vec![0u16; count];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(buf.as_mut_ptr() as *mut _, $ptr, count * 2);
+                let mut amax: f32 = 0.0;
+                for &x in &buf {
+                    let v = crate::bring_up::f16_to_f32(x).abs();
+                    if v > amax { amax = v; }
+                }
+                eprintln!("    [L{} {}] amax={:.4}", dbg_layer, $label, amax);
+            }
+        };
+    }
 
     // 1. input_layernorm -> FP8 quant
     FusedRmsnormFp8QuantLaunch {
@@ -436,6 +453,8 @@ pub unsafe fn gemma4_forward(
 
     #[cfg(feature = "cuda")]
     probe!("step12_delta_f16", scratch.delta_f16, dims.hidden);
+    #[cfg(feature = "cuda")]
+    probe_amax!("step12_raw_delta_amax", scratch.delta_f16, dims.hidden);
 
     // 13. post_feedforward_layernorm on the DELTA (not residual).
     // HF: hidden_states = post_ff_norm(mlp_output); residual += hidden_states
@@ -450,6 +469,11 @@ pub unsafe fn gemma4_forward(
         weights.post_ff_norm_gamma,
         stream,
     )?;
+
+    #[cfg(feature = "cuda")]
+    probe!("step13_normed_delta", scratch.delta_f16, dims.hidden);
+    #[cfg(feature = "cuda")]
+    probe_amax!("step13_normed_delta_amax", scratch.delta_f16, dims.hidden);
 
     // 13b. residual += normed delta
     gemma4_launcher::VectorAddF16Launch {
