@@ -3,6 +3,7 @@ pub mod buffer;
 pub mod client;
 pub mod device;
 pub mod ffi;
+pub mod mlir_parser;
 pub mod module;
 
 pub use rvllm_core::prelude::{LLMError, Result};

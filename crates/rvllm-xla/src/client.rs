@@ -15,6 +15,7 @@ pub struct PjrtClientInner {
     fns: PjrtApiFns,
     client: *mut PjrtClient,
     devices: Vec<*mut PjrtDevice>,
+    compile_options: Option<Vec<u8>>,
 }
 
 unsafe impl Send for PjrtClientInner {}
@@ -70,10 +71,25 @@ impl PjrtClientHandle {
         let fns = unsafe { PjrtApiFns::from_api_ptr(api_ptr) };
 
         info!(
-            major = unsafe { (*api_ptr).pjrt_api_version_major },
-            minor = unsafe { (*api_ptr).pjrt_api_version_minor },
+            version = unsafe { (*api_ptr).pjrt_api_version },
+            struct_size = struct_size,
             "loaded PJRT API from libtpu.so"
         );
+
+        unsafe {
+            let mut init_args = PJRT_Plugin_Initialize_Args {
+                struct_size: std::mem::size_of::<PJRT_Plugin_Initialize_Args>(),
+                extension_start: ptr::null_mut(),
+            };
+            let err = (fns.plugin_initialize)(&mut init_args);
+            if !err.is_null() {
+                let msg = extract_error_message(&fns, err);
+                return Err(LLMError::GpuError(format!(
+                    "PJRT_Plugin_Initialize failed: {msg}"
+                )));
+            }
+        }
+        info!("PJRT plugin initialized");
 
         let client = unsafe {
             let mut args = PJRT_Client_Create_Args {
@@ -86,6 +102,8 @@ impl PjrtClientHandle {
                 kv_put_callback: ptr::null(),
                 kv_put_user_arg: ptr::null_mut(),
                 client: ptr::null_mut(),
+                kv_try_get_callback: ptr::null(),
+                kv_try_get_user_arg: ptr::null_mut(),
             };
             let err = (fns.client_create)(&mut args);
             if !err.is_null() {
@@ -129,6 +147,7 @@ impl PjrtClientHandle {
                 fns,
                 client,
                 devices,
+                compile_options: None,
             }),
         })
     }
@@ -138,8 +157,23 @@ impl PjrtClientHandle {
     }
 
     pub fn compile(&self, mlir_text: &str) -> Result<CompiledExecutable> {
+        self.compile_bytes(mlir_text.as_bytes())
+    }
+
+    pub fn compile_bytecode(&self, bytecode: &[u8]) -> Result<CompiledExecutable> {
+        self.compile_bytes(bytecode)
+    }
+
+    pub fn set_compile_options(&mut self, opts: Vec<u8>) {
+        // Store compile options for use in all subsequent compiles.
+        // Must be a serialized xla::CompileOptionsProto.
+        std::sync::Arc::get_mut(&mut self.inner)
+            .expect("cannot set compile options with shared refs")
+            .compile_options = Some(opts);
+    }
+
+    fn compile_bytes(&self, code: &[u8]) -> Result<CompiledExecutable> {
         let format = b"mlir";
-        let code = mlir_text.as_bytes();
 
         let program = PJRT_Program {
             struct_size: std::mem::size_of::<PJRT_Program>(),
@@ -150,14 +184,17 @@ impl PjrtClientHandle {
             format_size: format.len(),
         };
 
+        let default_opts: [u8; 6] = [0x22, 0x04, 0x18, 0x01, 0x20, 0x01];
+        let opts_bytes = self.inner.compile_options.as_deref().unwrap_or(&default_opts);
+
         let exe = unsafe {
             let mut args = PJRT_Client_Compile_Args {
                 struct_size: std::mem::size_of::<PJRT_Client_Compile_Args>(),
                 extension_start: ptr::null_mut(),
                 client: self.inner.client,
                 program: &program,
-                compile_options: ptr::null(),
-                compile_options_size: 0,
+                compile_options: opts_bytes.as_ptr(),
+                compile_options_size: opts_bytes.len(),
                 executable: ptr::null_mut(),
             };
             let err = (self.inner.fns.client_compile)(&mut args);
@@ -208,21 +245,31 @@ impl PjrtClientHandle {
                 device,
                 memory: ptr::null_mut(),
                 buffer: ptr::null_mut(),
+                _layout: ptr::null_mut(),
                 done_with_host_buffer: ptr::null_mut(),
             };
+            eprintln!("    PJRT_BufferFromHost: struct_size={}, data_len={}, dtype={:?}, ndims={}, device={:?}",
+                args.struct_size, data.len(), dtype, shape.len(), args.device);
             let err = (self.inner.fns.client_buffer_from_host)(&mut args);
+            eprintln!("    PJRT_BufferFromHost returned, err={:?}", err);
             if !err.is_null() {
                 let msg = extract_error_message(&self.inner.fns, err);
                 return Err(LLMError::GpuError(format!(
                     "PJRT_Client_BufferFromHostBuffer failed: {msg}"
                 )));
             }
-            assert!(!args.buffer.is_null());
-
-            // Wait for transfer to complete before returning
-            if !args.done_with_host_buffer.is_null() {
-                self.await_event(args.done_with_host_buffer)?;
+            eprintln!("    buffer={:?} event={:?}", args.buffer, args.done_with_host_buffer);
+            if args.buffer.is_null() {
+                return Err(LLMError::GpuError(
+                    "PJRT_Client_BufferFromHostBuffer returned null buffer".into(),
+                ));
             }
+
+            // Skip event await — ImmutableUntilTransferCompletes means
+            // PJRT keeps a reference to host buffer until done; the event
+            // signals when the host buffer can be freed, but we don't free
+            // it until the PjrtBufferHandle is dropped.
+            // TODO: fix Event_Await fn ptr offset and re-enable
 
             args.buffer
         };
@@ -269,7 +316,10 @@ impl PjrtClientHandle {
                 device_complete_events: ptr::null_mut(),
                 execute_device: ptr::null_mut(),
             };
+            eprintln!("    Execute: struct_size={}, exe={:?}, num_args={}, num_devices={}",
+                args.struct_size, exe.raw, input_ptrs.len(), args.num_devices);
             let err = (self.inner.fns.loaded_executable_execute)(&mut args);
+            eprintln!("    Execute returned, err={:?}", err);
             if !err.is_null() {
                 let msg = extract_error_message(&self.inner.fns, err);
                 return Err(LLMError::GpuError(format!(

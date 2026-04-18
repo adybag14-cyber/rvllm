@@ -71,6 +71,8 @@ pub struct PJRT_Client_Create_Args {
     pub kv_put_callback: *const c_void,
     pub kv_put_user_arg: *mut c_void,
     pub client: *mut PjrtClient,
+    pub kv_try_get_callback: *const c_void,
+    pub kv_try_get_user_arg: *mut c_void,
 }
 
 // --- PJRT_Client_Devices ---
@@ -125,6 +127,7 @@ pub struct PJRT_Client_BufferFromHostBuffer_Args {
     pub host_buffer_semantics: PjrtHostBufferSemantics,
     pub device: *mut PjrtDevice,
     pub memory: *mut c_void,
+    pub _layout: *mut c_void,
     pub buffer: *mut PjrtBuffer,
     pub done_with_host_buffer: *mut PjrtEvent,
 }
@@ -197,6 +200,14 @@ pub struct PJRT_Event_Destroy_Args {
 
 // --- Function pointer types ---
 
+#[repr(C)]
+pub struct PJRT_Plugin_Initialize_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut c_void,
+}
+
+pub type PjrtPluginInitializeFn =
+    unsafe extern "C" fn(*mut PJRT_Plugin_Initialize_Args) -> *mut PjrtError;
 pub type PjrtErrorDestroyFn =
     unsafe extern "C" fn(*mut PJRT_Error_Destroy_Args);
 pub type PjrtErrorMessageFn =
@@ -236,10 +247,10 @@ pub type PjrtEventDestroyFn =
 pub struct PJRT_Api {
     pub struct_size: usize,
     pub extension_start: *mut c_void,
-    pub pjrt_api_version_major: i32,
-    pub pjrt_api_version_minor: i32,
-    // Followed by function pointers in order. We read them by offset.
-    // The first function pointer is PJRT_Error_Destroy at offset 24 on 64-bit.
+    pub pjrt_api_version: usize,
+    _padding0: usize,
+    _padding1: usize,
+    // Function pointers follow at offset 40.
 }
 
 // GetPjrtApi is the symbol exported by libtpu.so
@@ -273,7 +284,7 @@ pub type GetPjrtApiFn = unsafe extern "C" fn() -> *const PJRT_Api;
 // 21: PJRT_Client_DefaultDeviceAssignment
 // 22: PJRT_Client_BufferFromHostBuffer
 
-const HEADER_BYTES: usize = 24; // 8 + 8 + 4 + 4
+const HEADER_BYTES: usize = 40; // struct_size(8) + extension_start(8) + version(8) + padding(16)
 const PTR_SIZE: usize = 8;
 
 const fn fn_offset(index: usize) -> usize {
@@ -282,6 +293,7 @@ const fn fn_offset(index: usize) -> usize {
 
 pub const OFFSET_ERROR_DESTROY: usize = fn_offset(0);
 pub const OFFSET_ERROR_MESSAGE: usize = fn_offset(1);
+pub const OFFSET_PLUGIN_INITIALIZE: usize = fn_offset(3);
 pub const OFFSET_EVENT_DESTROY: usize = fn_offset(5);
 pub const OFFSET_EVENT_AWAIT: usize = fn_offset(8);
 pub const OFFSET_CLIENT_CREATE: usize = fn_offset(10);
@@ -332,6 +344,7 @@ pub const OFFSET_BUFFER_DESTROY: usize = fn_offset(48);
 pub const OFFSET_BUFFER_TO_HOST: usize = fn_offset(60);
 
 pub struct PjrtApiFns {
+    pub plugin_initialize: PjrtPluginInitializeFn,
     pub error_destroy: PjrtErrorDestroyFn,
     pub error_message: PjrtErrorMessageFn,
     pub event_destroy: PjrtEventDestroyFn,
@@ -349,6 +362,7 @@ impl PjrtApiFns {
     pub unsafe fn from_api_ptr(api: *const PJRT_Api) -> Self {
         let base = api as *const u8;
         Self {
+            plugin_initialize: read_fn_ptr(base, OFFSET_PLUGIN_INITIALIZE),
             error_destroy: read_fn_ptr(base, OFFSET_ERROR_DESTROY),
             error_message: read_fn_ptr(base, OFFSET_ERROR_MESSAGE),
             event_destroy: read_fn_ptr(base, OFFSET_EVENT_DESTROY),
