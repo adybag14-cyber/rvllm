@@ -157,7 +157,7 @@ def one_layer(carry, xs):
 
     h = o_out
     h = rms_norm(h, xs['ln2'])
-    x = residual + h * xs['ls']
+    x = residual + h
 
     residual = x
     h = rms_norm(x, xs['ln3'])
@@ -166,7 +166,7 @@ def one_layer(carry, xs):
     h = jax.nn.gelu(gate, approximate=True) * up
     h = int8_matmul(h, xs['dw'], xs['dw_s'])
     h = rms_norm(h, xs['ln4'])
-    x = residual + h * xs['ls']
+    x = (residual + h) * xs['ls']
 
     return (x, pos, ctx, cos_s, sin_s, cos_g, sin_g), {'kc': kc, 'vc': vc}
 
@@ -236,7 +236,6 @@ def quantize_int8_perchannel(arr_bf16):
     return w_int8, scale.squeeze(-1).astype(ml_dtypes.bfloat16)
 
 def int8_matmul(x, w_int8, scale):
-    """x @ (w_int8 * scale).T with fused int8 read."""
     return (x @ w_int8.astype(jnp.bfloat16).T) * scale
 
 def load_model(model_dir, mesh, max_ctx):
