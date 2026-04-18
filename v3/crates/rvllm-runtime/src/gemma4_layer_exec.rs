@@ -245,6 +245,25 @@ pub unsafe fn gemma4_forward(
     gemma4_launcher::Bf16ToF16SatLaunch { n: dims.num_tokens * qkv_rows }
         .launch(kernels.f32_to_f16_sat, scratch.q_out, scratch.gemm_f32_tmp, stream)?;
 
+    #[cfg(feature = "cuda")]
+    probe!("step2_q_proj", scratch.q_out, dims.hidden);
+    #[cfg(feature = "cuda")]
+    {
+        if dbg_layer >= 0 {
+            let k_offset = q_dim as u64 * 2;
+            let v_offset = (q_dim + dims.num_kv_heads * dims.head_dim) as u64 * 2;
+            cudarc::driver::sys::cuStreamSynchronize(stream as _);
+            let mut sk = [0u16; 4];
+            cudarc::driver::sys::cuMemcpyDtoH_v2(sk.as_mut_ptr() as *mut _, scratch.q_out + k_offset, 8);
+            let kv: Vec<f32> = sk.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect();
+            eprintln!("    [L{} step2_k_proj] first4={:.4?}", dbg_layer, kv);
+            let mut sv = [0u16; 4];
+            cudarc::driver::sys::cuMemcpyDtoH_v2(sv.as_mut_ptr() as *mut _, scratch.q_out + v_offset, 8);
+            let vv: Vec<f32> = sv.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect();
+            eprintln!("    [L{} step2_v_proj] first4={:.4?}", dbg_layer, vv);
+        }
+    }
+
     // 2b. V-norm: parameter-free RMS normalization on V heads.
     gemma4_launcher::VnormF16Launch {
         num_tokens: dims.num_tokens,
@@ -275,6 +294,11 @@ pub unsafe fn gemma4_forward(
         weights.k_norm_gamma,
         stream,
     )?;
+
+    #[cfg(feature = "cuda")]
+    probe!("step3_q_norm", scratch.q_normed, dims.hidden);
+    #[cfg(feature = "cuda")]
+    probe!("step3_k_norm", scratch.k_normed, dims.hidden);
 
     // 4. Partial RoPE + FP8 quantize Q + paged KV cache write
     // Only the first `rotary_dim` elements of each head get rotation;
@@ -342,6 +366,9 @@ pub unsafe fn gemma4_forward(
         scratch.kv_scale_ptr,
         stream,
     )?;
+
+    #[cfg(feature = "cuda")]
+    probe!("step5_attn_out", scratch.attn_out, q_dim);
 
     // 6. quantize attn_out -> fp8 per-token
     rvllm_fused::QuantizeFp8PerTokenLaunch {
