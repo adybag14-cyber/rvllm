@@ -1014,55 +1014,47 @@ impl Gemma4Bringup {
         let mut total_nll: f64 = 0.0;
         let mut n_evaluated: usize = 0;
 
+        // Build a graph-capturable forward: embed + all layers + lm_head.
+        // No debug probes (they break capture).
+        let ppl_forward = || -> Result<()> {
+            rvllm_fused::EmbeddingGatherLaunch { num_tokens: 1, hidden, vocab }
+                .launch(fn_embed, residual_ptr, self.model.embedding.offset_bytes, token_ids_region.device_ptr(), stream)?;
+            one_step()
+        };
+
+        let use_graph = std::env::var("RVLLM_NO_GRAPH").ok().as_deref() != Some("1");
+        let ppl_graph = if use_graph {
+            // Dry run to populate KV cache slot 0
+            let tok_i32 = [token_ids[0] as i32];
+            token_ids_region.copy_from_host(bytemuck_cast_i32(&tok_i32))?;
+            set_step_meta(0)?;
+            ppl_forward()?;
+            self.stream.fence()?;
+
+            let g = rvllm_graph::CapturedGraph::capture(
+                num_seqs,
+                max_blocks_per_seq,
+                rvllm_metadata::MetadataLayout::compute(num_seqs, max_blocks_per_seq).hash(),
+                rvllm_graph::GraphFingerprint([0u8; 32]),
+                stream,
+                || ppl_forward(),
+            )?;
+            self.stream.fence()?;
+            Some(g)
+        } else {
+            None
+        };
+
         for (t, &tok_id) in token_ids.iter().enumerate() {
             let tok_i32 = [tok_id as i32];
             token_ids_region.copy_from_host(bytemuck_cast_i32(&tok_i32))?;
-            rvllm_fused::EmbeddingGatherLaunch {
-                num_tokens: 1,
-                hidden,
-                vocab,
-            }
-            .launch(
-                fn_embed,
-                residual_ptr,
-                self.model.embedding.offset_bytes,
-                token_ids_region.device_ptr(),
-                stream,
-            )?;
-
-            if t == 0 {
-                cudarc::driver::sys::cuStreamSynchronize(stream as _);
-                let mut emb = [0u16; 4];
-                cudarc::driver::sys::cuMemcpyDtoH_v2(emb.as_mut_ptr() as *mut _, residual_ptr, 8);
-                let vals: Vec<f32> = emb.iter().map(|&x| f16_to_f32(x)).collect();
-                eprintln!("  [ppl] embed first4={:.4?} (token_id={})", vals, tok_id);
-                // Read directly from embedding table for same token
-                let embed_offset =
-                    self.model.embedding.offset_bytes + (tok_id as u64) * (hidden as u64) * 2;
-                let mut raw_emb = [0u16; 4];
-                cudarc::driver::sys::cuMemcpyDtoH_v2(
-                    raw_emb.as_mut_ptr() as *mut _,
-                    embed_offset,
-                    8,
-                );
-                let raw_vals: Vec<f32> = raw_emb.iter().map(|&x| f16_to_f32(x)).collect();
-                eprintln!("  [ppl] embed_table[{}] first4={:.4?}", tok_id, raw_vals);
-                // Also check row 0
-                let mut row0 = [0u16; 4];
-                cudarc::driver::sys::cuMemcpyDtoH_v2(
-                    row0.as_mut_ptr() as *mut _,
-                    self.model.embedding.offset_bytes,
-                    8,
-                );
-                let r0: Vec<f32> = row0.iter().map(|&x| f16_to_f32(x)).collect();
-                eprintln!(
-                    "  [ppl] embed_table[0] first4={:.4?} (should be scaled)",
-                    r0
-                );
-            }
-
             set_step_meta(t as i32)?;
-            one_step()?;
+
+            if let Some(ref graph) = ppl_graph {
+                graph.replay(stream)?;
+            } else {
+                ppl_forward()?;
+            }
 
             if t + 1 < token_ids.len() {
                 dtoh_async_sync(
