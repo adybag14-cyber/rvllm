@@ -1191,7 +1191,8 @@ impl Gemma4Bringup {
         let gemm_f32_tmp = arena.region("gen_gemm_f32", (gemm_f32_max_n * 4) as usize, 16)?;
 
         let sliding_blocks = ((arch.sliding_window_size as u32 + block_size - 1) / block_size).min(num_blocks_total);
-        let kv_bytes_per_elem: u32 = 1;
+        let use_f16_kv = std::env::var("RVLLM_F16_KV").map_or(true, |v| v != "0");
+        let kv_bytes_per_elem: u32 = if use_f16_kv { 2 } else { 1 };
         let mut kv_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
         let mut kv_total_bytes: u64 = 0;
         for l in 0..arch.num_hidden_layers {
@@ -1272,7 +1273,7 @@ impl Gemma4Bringup {
                     max_blocks_per_seq: layer_blocks, num_blocks_total: layer_blocks,
                     attn_scale: 1.0, rms_eps: arch.rms_norm_eps,
                     layer_type: lt, sliding_window: arch.sliding_window_size as u32,
-                    f16_kv: false,
+                    f16_kv: use_f16_kv,
                 };
                 let w = crate::gemma4_layer_exec::Gemma4LayerWeightPtrs {
                     attn_norm_gamma: layer.input_layernorm.offset_bytes,
