@@ -69,7 +69,9 @@ fn run() -> Result<(), String> {
     let encoding = tokenizer
         .encode(text.as_str(), false)
         .map_err(|e| format!("tokenize: {e}"))?;
-    let all_ids: Vec<u32> = encoding.get_ids().to_vec();
+    let all_ids: Vec<u32> = std::iter::once(2u32) // BOS
+        .chain(encoding.get_ids().iter().copied())
+        .collect();
     eprintln!("total tokens: {}", all_ids.len());
 
     let chunk_len: usize = std::env::var("RVLLM_PPL_CHUNK")
