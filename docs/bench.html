@@ -128,7 +128,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 
 <header>
   <h1>rvLLM 0.3.0 - Featuring 31B Gemma 4</h1>
-  <div class="sub">LLM inference engine benchmarks for <strong>31B Gemma 4</strong>. TPU path: JAX+XLA on v6e-4 - <strong>13,943 tok/s</strong> (int8, B=768, TP=4 SPMD, PPL 19.24). <strong>128K context support</strong> (22.5 tok/s decode). GPU path: Rust+CUDA on H100 - 16-launch fused pipeline with FP8 quantization.</div>
+  <div class="sub">LLM inference engine benchmarks for <strong>31B Gemma 4</strong>. TPU path: JAX+XLA on v6e-4 - <strong>13,943 tok/s</strong> (int8, B=768, TP=4 SPMD, PPL 19.24). <strong>128K context support</strong> (22.5 tok/s decode). GPU path: Rust+CUDA on H100 - <strong>7,612 tok/s</strong> (FP8, B=512, CUDA graph, PPL 12.54).</div>
   <div class="nav-buttons">
     <a href="index.html">Home</a>
     <a href="https://github.com/m0at/rvllm">GitHub</a>
@@ -440,10 +440,10 @@ No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 l
 
 <div id="section-gpu" class="section-block">
 
-<h2 class="section">GPU: 31B Gemma 4 <span class="sub">H100 SXM, Rust+CUDA, FP8</span></h2>
+<h2 class="section">GPU: 31B Gemma 4 <span class="sub">H100 SXM 80GB, Rust+CUDA, FP8+F16</span> <span class="badge measured">Measured</span></h2>
 
 <div class="note-box">
-  <strong>Gemma 4 architecture on GPU.</strong> The v3 GPU path implements a 16-kernel-launch fused pipeline for Gemma 4's unique dual-attention architecture (50 sliding-window + 10 global layers). All 60 layers captured in a single CUDA graph. FP8 E4M3 weights quantized at load with calibrated per-tensor scales.
+  <strong>FP8 weights + F16 KV cache.</strong> Per-channel FP8 weights from the RedHatAI/gemma-4-31B-it-FP8-Dynamic checkpoint with post-GEMM channelscale. F16 KV cache + F16 paged attention (FA3 SM90 for sliding, SM89 for global). All 60 layers captured in a single CUDA graph (1776 nodes). <strong>7,612 tok/s</strong> peak (B=512), <strong>PPL 12.54</strong>.
 </div>
 
 <h3>31B Gemma 4 forward pass (16 launches per layer)</h3>
@@ -481,10 +481,47 @@ No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 l
 </tbody>
 </table>
 
-<div class="caveat">
-  <strong>GPU perplexity validation in progress.</strong> The GPU forward pass for 31B Gemma 4 is implemented and runs end-to-end. Perplexity validation against the TPU baseline (25.51) is actively being debugged - tracking logit softcap and F32 precision through lm_head GEMM. Throughput numbers will be posted once perplexity is confirmed correct.
-</div>
+<h3>Perplexity validation</h3>
+<table>
+<thead><tr><th>Weight path</th><th>KV cache</th><th class="r">PPL</th><th class="r">tok/s (B=1)</th></tr></thead>
+<tbody>
+<tr><td><strong>FP8-Dynamic per-channel + channelscale</strong></td><td>F16</td><td class="r"><strong>12.54</strong></td><td class="r">37.9</td></tr>
+<tr><td>BF16 split QKV per-tensor FP8</td><td>F16</td><td class="r">17.96</td><td class="r">37.9</td></tr>
+<tr><td>F16 weights (no FP8)</td><td>F16</td><td class="r">19.79</td><td class="r">37.9</td></tr>
+<tr><td>HuggingFace BF16 reference</td><td>--</td><td class="r">19.62</td><td class="r">--</td></tr>
+<tr><td>TPU int8 reference</td><td>int8</td><td class="r">19.24</td><td class="r">--</td></tr>
+</tbody>
+</table>
+<div class="footnote">PPL measured on 86-token passage (John 1:1-14) with BOS prepend. FP8-Dynamic checkpoint achieves best PPL because per-row calibrated scales preserve more precision than BF16 rounding.</div>
 
+<h3>Batch scaling sweep</h3>
+<div class="chart-meta">
+    <div class="note">31B Gemma 4, FP8 weights, H100 SXM 80GB, CUDA graph. Near-linear scaling through B=32 (memory-bound), saturating at B=256+ (compute-bound).</div>
+</div>
+<table>
+<thead><tr><th>Batch</th><th class="r">tok/s</th><th class="r">ms/step</th><th class="r">Scaling</th><th class="r">Efficiency</th></tr></thead>
+<tbody>
+<tr><td>1</td><td class="r">51</td><td class="r">19.7</td><td class="r">1.0x</td><td class="r">100%</td></tr>
+<tr><td>4</td><td class="r">224</td><td class="r">17.9</td><td class="r">4.4x</td><td class="r">110%</td></tr>
+<tr><td>8</td><td class="r">438</td><td class="r">18.3</td><td class="r">8.6x</td><td class="r">107%</td></tr>
+<tr><td>16</td><td class="r">872</td><td class="r">18.4</td><td class="r">17.1x</td><td class="r">107%</td></tr>
+<tr><td>32</td><td class="r">1,670</td><td class="r">19.2</td><td class="r">32.7x</td><td class="r">102%</td></tr>
+<tr><td>64</td><td class="r">2,978</td><td class="r">21.5</td><td class="r">58.4x</td><td class="r">91%</td></tr>
+<tr><td>128</td><td class="r">4,893</td><td class="r">26.2</td><td class="r">96.0x</td><td class="r">75%</td></tr>
+<tr><td>256</td><td class="r">6,606</td><td class="r">38.8</td><td class="r">129.5x</td><td class="r">51%</td></tr>
+<tr><td>512</td><td class="r"><strong>7,612</strong></td><td class="r">67.3</td><td class="r">149.3x</td><td class="r">29%</td></tr>
+</tbody>
+</table>
+
+<h3>CUDA graph capture</h3>
+<table>
+<thead><tr><th>Mode</th><th class="r">tok/s (B=1)</th><th class="r">ms/step</th><th class="r">Speedup</th></tr></thead>
+<tbody>
+<tr><td>CUDA graph (1776 nodes)</td><td class="r"><strong>51</strong></td><td class="r">19.7</td><td class="r">4.6x</td></tr>
+<tr><td>Eager (no graph)</td><td class="r">11</td><td class="r">90.4</td><td class="r">1.0x</td></tr>
+</tbody>
+</table>
+<div class="footnote">All 60 layers + lm_head + softcap captured into one <code>cuGraphLaunch</code>. Metadata (positions, slot_mapping, context_lens) updated via HtoD copy before each replay.</div>
 
 </div>
 

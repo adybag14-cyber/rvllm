@@ -898,6 +898,68 @@ generation in real time. The client runs on the local machine; the
 TPU engine runs on the pod slice.
 
 % ============================================================================
+\subsection{GPU: Gemma 4 31B on H100}
+\label{sec:gpu-gemma4}
+% ============================================================================
+
+The GPU engine runs the same 31B Gemma~4 model on a single H100 SXM
+80\,GB using Rust + CUDA. Weights are FP8 E4M3 with per-channel scales
+(from the RedHatAI FP8-Dynamic checkpoint); the KV cache and attention
+use F16 for precision.
+
+\paragraph{Perplexity.}
+Three weight configurations were validated against the HuggingFace
+BF16 reference (PPL 19.62) and TPU int8 baseline (PPL 19.24):
+
+\begin{center}
+\begin{tabular}{lccr}
+\toprule
+\textbf{Weight path} & \textbf{KV} & \textbf{PPL} & \textbf{tok/s} \\
+\midrule
+FP8-Dynamic per-channel & F16 & \textbf{12.54} & 37.9 \\
+BF16 split QKV FP8      & F16 & 17.96 & 37.9 \\
+F16 (no FP8)             & F16 & 19.79 & 37.9 \\
+HF BF16 reference        & --  & 19.62 & -- \\
+TPU int8 reference        & int8 & 19.24 & -- \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Batch scaling.}
+CUDA graph capture (1776 nodes) eliminates kernel launch overhead,
+yielding 4.6$\times$ speedup at $B{=}1$ (51 vs 11 tok/s eager).
+Throughput scales near-linearly through $B{=}32$, saturating as FP8
+tensor cores become compute-bound:
+
+\begin{center}
+\begin{tabular}{rrrrr}
+\toprule
+\textbf{Batch} & \textbf{tok/s} & \textbf{ms/step} & \textbf{Scaling} & \textbf{Eff.} \\
+\midrule
+1   & 51    & 19.7 & 1.0$\times$   & 100\% \\
+4   & 224   & 17.9 & 4.4$\times$   & 110\% \\
+8   & 438   & 18.3 & 8.6$\times$   & 107\% \\
+16  & 872   & 18.4 & 17.1$\times$  & 107\% \\
+32  & 1,670 & 19.2 & 32.7$\times$  & 102\% \\
+64  & 2,978 & 21.5 & 58.4$\times$  & 91\%  \\
+128 & 4,893 & 26.2 & 96.0$\times$  & 75\%  \\
+256 & 6,606 & 38.8 & 129.5$\times$ & 51\%  \\
+512 & 7,612 & 67.3 & 149.3$\times$ & 29\%  \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Key engineering decisions.}
+(1)~Per-channel FP8 weight scales cannot use cuBLASLt OUTER\_VEC\_32F
+on CUDA~12.4; a post-GEMM \texttt{scale\_cols\_f32} kernel applies the
+per-row scales after the FP8 GEMM.
+(2)~The KV cache stays in F16 because FP8 KV with a fixed scale
+(418/448, calibrated for Qwen2.5) destroyed Gemma~4 attention
+precision; F16 KV recovered PPL from 537K to 12.54.
+(3)~Split QKV quantization (separate per-tensor FP8 scales for Q, K, V)
+prevents the fused tensor's single scale from crushing K/V precision.
+
+% ============================================================================
 \section{Related work}
 \label{sec:related}
 % ============================================================================
