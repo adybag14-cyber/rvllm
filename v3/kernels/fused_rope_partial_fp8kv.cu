@@ -44,26 +44,27 @@ __global__ void fused_rope_partial_fp8kv_kernel(
 
     const int pos = positions[token_idx];
 
+    // Split-half RoPE: pair (x[i], x[i + half_head]) for each frequency i.
+    // HF: rotate_half splits last dim in two halves and swaps with negation.
+    // cos/sin table has half_rotary entries per position.
+
     // Q head processing
     if (head_idx < num_heads) {
         int q_base = (token_idx * num_heads + head_idx) * head_dim;
 
         if (tid < half_rotary) {
-            // Rotary dims: apply RoPE
             float cos_val = __half2float(cos_table[pos * half_rotary + tid]);
             float sin_val = __half2float(sin_table[pos * half_rotary + tid]);
-            float q0 = __half2float(q_in[q_base + 2 * tid]);
-            float q1 = __half2float(q_in[q_base + 2 * tid + 1]);
-            float q0r = q0 * cos_val - q1 * sin_val;
-            float q1r = q0 * sin_val + q1 * cos_val;
-            q_fp8_out[q_base + 2 * tid]     = __nv_fp8_e4m3(q0r * q_scale_inv);
-            q_fp8_out[q_base + 2 * tid + 1] = __nv_fp8_e4m3(q1r * q_scale_inv);
+            float q_lo = __half2float(q_in[q_base + tid]);
+            float q_hi = __half2float(q_in[q_base + tid + half_head]);
+            q_fp8_out[q_base + tid]             = __nv_fp8_e4m3((q_lo * cos_val - q_hi * sin_val) * q_scale_inv);
+            q_fp8_out[q_base + tid + half_head] = __nv_fp8_e4m3((q_lo * sin_val + q_hi * cos_val) * q_scale_inv);
         } else {
-            // Pass-through dims: just quantize
-            float q0 = __half2float(q_in[q_base + 2 * tid]);
-            float q1 = __half2float(q_in[q_base + 2 * tid + 1]);
-            q_fp8_out[q_base + 2 * tid]     = __nv_fp8_e4m3(q0 * q_scale_inv);
-            q_fp8_out[q_base + 2 * tid + 1] = __nv_fp8_e4m3(q1 * q_scale_inv);
+            // Pass-through dims (beyond rotary_dim, for partial rotation)
+            float q_lo = __half2float(q_in[q_base + tid]);
+            float q_hi = __half2float(q_in[q_base + tid + half_head]);
+            q_fp8_out[q_base + tid]             = __nv_fp8_e4m3(q_lo * q_scale_inv);
+            q_fp8_out[q_base + tid + half_head] = __nv_fp8_e4m3(q_hi * q_scale_inv);
         }
     }
 
@@ -78,25 +79,23 @@ __global__ void fused_rope_partial_fp8kv_kernel(
             if (tid < half_rotary) {
                 float cos_val = __half2float(cos_table[pos * half_rotary + tid]);
                 float sin_val = __half2float(sin_table[pos * half_rotary + tid]);
-                float k0 = __half2float(k_in[k_base + 2 * tid]);
-                float k1 = __half2float(k_in[k_base + 2 * tid + 1]);
-                float k0r = k0 * cos_val - k1 * sin_val;
-                float k1r = k0 * sin_val + k1 * cos_val;
-                key_cache[cache_offset + 2 * tid]     = __nv_fp8_e4m3(k0r * kv_scale_inv);
-                key_cache[cache_offset + 2 * tid + 1] = __nv_fp8_e4m3(k1r * kv_scale_inv);
+                float k_lo = __half2float(k_in[k_base + tid]);
+                float k_hi = __half2float(k_in[k_base + tid + half_head]);
+                key_cache[cache_offset + tid]             = __nv_fp8_e4m3((k_lo * cos_val - k_hi * sin_val) * kv_scale_inv);
+                key_cache[cache_offset + tid + half_head] = __nv_fp8_e4m3((k_lo * sin_val + k_hi * cos_val) * kv_scale_inv);
             } else {
-                float k0 = __half2float(k_in[k_base + 2 * tid]);
-                float k1 = __half2float(k_in[k_base + 2 * tid + 1]);
-                key_cache[cache_offset + 2 * tid]     = __nv_fp8_e4m3(k0 * kv_scale_inv);
-                key_cache[cache_offset + 2 * tid + 1] = __nv_fp8_e4m3(k1 * kv_scale_inv);
+                float k_lo = __half2float(k_in[k_base + tid]);
+                float k_hi = __half2float(k_in[k_base + tid + half_head]);
+                key_cache[cache_offset + tid]             = __nv_fp8_e4m3(k_lo * kv_scale_inv);
+                key_cache[cache_offset + tid + half_head] = __nv_fp8_e4m3(k_hi * kv_scale_inv);
             }
 
             // V: no rotation, just quantize to cache
             int v_base = (token_idx * num_kv_heads + head_idx) * head_dim;
-            float v0 = __half2float(v_in[v_base + 2 * tid]);
-            float v1 = __half2float(v_in[v_base + 2 * tid + 1]);
-            value_cache[cache_offset + 2 * tid]     = __nv_fp8_e4m3(v0 * kv_scale_inv);
-            value_cache[cache_offset + 2 * tid + 1] = __nv_fp8_e4m3(v1 * kv_scale_inv);
+            float v_lo = __half2float(v_in[v_base + tid]);
+            float v_hi = __half2float(v_in[v_base + tid + half_head]);
+            value_cache[cache_offset + tid]             = __nv_fp8_e4m3(v_lo * kv_scale_inv);
+            value_cache[cache_offset + tid + half_head] = __nv_fp8_e4m3(v_hi * kv_scale_inv);
         }
     }
 }

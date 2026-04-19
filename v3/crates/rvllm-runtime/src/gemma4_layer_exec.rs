@@ -351,8 +351,6 @@ pub unsafe fn gemma4_forward(
     probe!("step3_k_norm", scratch.k_normed, dims.hidden);
 
     // 4. Partial RoPE + FP8 quantize Q + paged KV cache write
-    // Only the first `rotary_dim` elements of each head get rotation;
-    // the rest pass through unchanged.
     gemma4_launcher::FusedRopePartialFp8KvLaunch {
         num_tokens: dims.num_tokens,
         num_heads: dims.num_heads,
