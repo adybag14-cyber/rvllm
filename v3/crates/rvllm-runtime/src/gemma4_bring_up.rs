@@ -47,6 +47,7 @@ pub struct Gemma4FusedModules {
     pub f32_to_f16_sat_mod: LoadedModule,
     pub scale_cols_f32_mod: LoadedModule,
     pub compute_qkv_scales_mod: LoadedModule,
+    pub fused_gelu_mul_f16_mod: LoadedModule,
     pub fn_rmsnorm: KernelFn,
     pub fn_rmsnorm_fp8_quant: KernelFn,
     pub fn_quantize: KernelFn,
@@ -65,6 +66,7 @@ pub struct Gemma4FusedModules {
     pub fn_f32_to_f16_sat: KernelFn,
     pub fn_scale_cols_f32: KernelFn,
     pub fn_compute_qkv_scales: KernelFn,
+    pub fn_fused_gelu_mul_f16: KernelFn,
 }
 
 pub struct Gemma4Bringup {
@@ -1136,6 +1138,7 @@ impl Gemma4Bringup {
             f32_to_f16_sat: self.fused.fn_f32_to_f16_sat,
             scale_cols_f32: self.fused.fn_scale_cols_f32,
             compute_qkv_scales: self.fused.fn_compute_qkv_scales,
+            fused_gelu_mul_f16: self.fused.fn_fused_gelu_mul_f16,
         }
     }
 }
@@ -1188,6 +1191,9 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
     let compute_qkv_scales_mod = loader.load_ptx("compute_qkv_scales")?;
     let fn_compute_qkv_scales = compute_qkv_scales_mod.get_function("compute_qkv_scales_kernel")?;
 
+    let fused_gelu_mul_f16_mod = loader.load_ptx("fused_gelu_mul_f16")?;
+    let fn_fused_gelu_mul_f16 = fused_gelu_mul_f16_mod.get_function("fused_gelu_mul_f16_kernel")?;
+
     Ok(Gemma4FusedModules {
         rmsnorm_mod,
         rmsnorm_inplace_mod,
@@ -1206,6 +1212,7 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
         f32_to_f16_sat_mod,
         scale_cols_f32_mod,
         compute_qkv_scales_mod,
+        fused_gelu_mul_f16_mod,
         fn_rmsnorm,
         fn_rmsnorm_fp8_quant,
         fn_quantize,
@@ -1224,5 +1231,6 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
         fn_f32_to_f16_sat,
         fn_scale_cols_f32,
         fn_compute_qkv_scales,
+        fn_fused_gelu_mul_f16,
     })
 }

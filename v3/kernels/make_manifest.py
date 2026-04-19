@@ -30,6 +30,7 @@ NAME_TO_FILE = {
     "vnorm_f16": "vnorm_f16.ptx",
     "scale_cols_f32": "scale_cols_f32.ptx",
     "compute_qkv_scales": "compute_qkv_scales.ptx",
+    "fused_gelu_mul_f16": "fused_gelu_mul_f16.ptx",
     "vector_add_f16": "vector_add_f16.ptx",
     "bf16_to_f16_sat": "bf16_to_f16_sat.ptx",
     "f32_to_bf16": "f32_to_bf16.ptx",

@@ -19,7 +19,7 @@ pub struct F16Weight {
 
 /// An FP8-quantized weight tensor with its per-tensor scale.
 /// `scale_ptr` is the device pointer of the uploaded f32 scale scalar.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Fp8Weight {
     pub offset_bytes: u64,
     pub scale_ptr: u64,

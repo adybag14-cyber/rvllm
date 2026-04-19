@@ -149,6 +149,7 @@ pub struct Gemma4LayerKernels {
     pub f32_to_f16_sat: KernelFn,
     pub scale_cols_f32: KernelFn,
     pub compute_qkv_scales: KernelFn,
+    pub fused_gelu_mul_f16: KernelFn,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -533,41 +534,53 @@ pub unsafe fn gemma4_forward(
     #[cfg(feature = "cuda")]
     probe!("step10_gate_up_out", scratch.gate_up_out, dims.intermediate);
 
-    // 11. GELU(tanh)(gate) * up -> FP8
-    gemma4_launcher::FusedGeluMulFp8QuantLaunch {
-        num_tokens: dims.num_tokens,
-        intermediate: dims.intermediate,
-    }
-    .launch(
-        kernels.fused_gelu_mul,
-        scratch.mlp_out_fp8,
-        scratch.mlp_out_scale,
-        scratch.gate_up_out,
-        stream,
-    )?;
-
+    // 11-12. GELU*up + down_proj
     #[cfg(feature = "cuda")]
-    probe_f32!("step11_mlp_out_scale", scratch.mlp_out_scale);
-
-    // 12. Down proj -> F32 tmp -> BF16 delta buffer
-    // (F16 bypass not supported here -- GELU*mul outputs FP8, so down_proj stays FP8)
-    #[cfg(feature = "cuda")]
-    probe_f32!("step12_down_wscale", weights.down_scale);
-    #[cfg(feature = "cuda")]
-    if weights.down_chscale != 0 {
-        cublaslt.fp8_gemm_f32(
-            scratch.mlp_out_fp8, weights.down_fp8, scratch.gemm_f32_tmp,
-            dims.num_tokens as i32, dims.hidden as i32, dims.intermediate as i32,
-            scratch.mlp_out_scale, weights.down_scale, stream,
-        )?;
-        launch_scale_cols_f32(kernels.scale_cols_f32, scratch.gemm_f32_tmp,
-            weights.down_chscale, dims.num_tokens, dims.hidden, stream)?;
+    if weights.down_f16 != 0 {
+        // F16 path: GELU output to separate buffer (can't alias gate_up_out)
+        {
+            let mut out = scratch.gate_up_fp8; // use gate_up_fp8 scratch as f16 gelu output
+            let mut inp = scratch.gate_up_out;
+            let mut inter = dims.intermediate as i32;
+            let args = [
+                (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut inp) as *mut u64 as *mut core::ffi::c_void,
+                (&mut inter) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block = (dims.intermediate.min(1024), 1, 1);
+            let grid = (dims.num_tokens, 1, 1);
+            rvllm_fused::launch_raw(kernels.fused_gelu_mul_f16, grid, block, 0, stream, &args)?;
+        }
+        // F16 GEMM for down_proj (reads from gate_up_fp8 where GELU output was stored)
+        cublaslt.f16_gemm_f32(scratch.gate_up_fp8, weights.down_f16, scratch.gemm_f32_tmp,
+            dims.num_tokens as i32, dims.hidden as i32, dims.intermediate as i32, stream)?;
     } else {
-        cublaslt.fp8_gemm_f32(
-            scratch.mlp_out_fp8, weights.down_fp8, scratch.gemm_f32_tmp,
-            dims.num_tokens as i32, dims.hidden as i32, dims.intermediate as i32,
-            scratch.mlp_out_scale, weights.down_scale, stream,
+        // FP8 path
+        gemma4_launcher::FusedGeluMulFp8QuantLaunch {
+            num_tokens: dims.num_tokens,
+            intermediate: dims.intermediate,
+        }.launch(
+            kernels.fused_gelu_mul,
+            scratch.mlp_out_fp8,
+            scratch.mlp_out_scale,
+            scratch.gate_up_out,
+            stream,
         )?;
+        if weights.down_chscale != 0 {
+            cublaslt.fp8_gemm_f32(
+                scratch.mlp_out_fp8, weights.down_fp8, scratch.gemm_f32_tmp,
+                dims.num_tokens as i32, dims.hidden as i32, dims.intermediate as i32,
+                scratch.mlp_out_scale, weights.down_scale, stream,
+            )?;
+            launch_scale_cols_f32(kernels.scale_cols_f32, scratch.gemm_f32_tmp,
+                weights.down_chscale, dims.num_tokens, dims.hidden, stream)?;
+        } else {
+            cublaslt.fp8_gemm_f32(
+                scratch.mlp_out_fp8, weights.down_fp8, scratch.gemm_f32_tmp,
+                dims.num_tokens as i32, dims.hidden as i32, dims.intermediate as i32,
+                scratch.mlp_out_scale, weights.down_scale, stream,
+            )?;
+        }
     }
     #[cfg(feature = "cuda")]
     gemma4_launcher::Bf16ToF16SatLaunch { n: dims.num_tokens * dims.hidden }

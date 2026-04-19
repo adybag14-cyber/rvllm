@@ -313,119 +313,108 @@ pub fn load_gemma4_model(
 
             (qkv, o_proj, gate_up, down_proj)
         } else {
-            let qkv_f16 = concat_tensors(
-                &[&q_tensor, &k_tensor, &v_tensor],
-                &shards,
-                model_dir,
-            )?;
-            let qkv = upload_fp8(
-                arena,
-                "qkv",
-                &qkv_f16,
-                &[qkv_rows, arch.hidden_size],
-                &ln("self_attn.qkv.weight"),
-                model_dir,
-            )?;
+            let f16_only = std::env::var("RVLLM_F16_ONLY").map_or(false, |v| v == "1");
 
-            let o_proj = upload_fp8_from(
-                arena,
-                "o_proj",
-                &must_get(&ln("self_attn.o_proj.weight"))?,
-                &shards,
-                model_dir,
-            )?;
-
-            let gate_up_f16 = concat_tensors(
-                &[
-                    &must_get(&ln("mlp.gate_proj.weight"))?,
-                    &must_get(&ln("mlp.up_proj.weight"))?,
-                ],
-                &shards,
-                model_dir,
-            )?;
-            let gate_up = upload_fp8(
-                arena,
-                "gate_up",
-                &gate_up_f16,
-                &[2 * arch.intermediate_size, arch.hidden_size],
-                &ln("mlp.gate_up.weight"),
-                model_dir,
-            )?;
-
-            let down_proj = upload_fp8_from(
-                arena,
-                "down_proj",
-                &must_get(&ln("mlp.down_proj.weight"))?,
-                &shards,
-                model_dir,
-            )?;
-
-            (qkv, o_proj, gate_up, down_proj)
+            if f16_only {
+                let dummy = Fp8Weight {
+                    offset_bytes: 0, scale_ptr: 0, shape: vec![],
+                    scale: 0.0, clamp_ppm: 0.0, dtype: DType::Fp8E4M3, channelscale_ptr: None,
+                };
+                (dummy.clone(), dummy.clone(), dummy.clone(), dummy.clone())
+            } else {
+                let qkv_f16_bytes = concat_tensors(
+                    &[&q_tensor, &k_tensor, &v_tensor],
+                    &shards,
+                    model_dir,
+                )?;
+                let qkv = upload_fp8(
+                    arena, "qkv", &qkv_f16_bytes,
+                    &[qkv_rows, arch.hidden_size],
+                    &ln("self_attn.qkv.weight"), model_dir,
+                )?;
+                let o_proj = upload_fp8_from(
+                    arena, "o_proj",
+                    &must_get(&ln("self_attn.o_proj.weight"))?,
+                    &shards, model_dir,
+                )?;
+                let gate_up_f16_bytes = concat_tensors(
+                    &[
+                        &must_get(&ln("mlp.gate_proj.weight"))?,
+                        &must_get(&ln("mlp.up_proj.weight"))?,
+                    ],
+                    &shards, model_dir,
+                )?;
+                let gate_up = upload_fp8(
+                    arena, "gate_up", &gate_up_f16_bytes,
+                    &[2 * arch.intermediate_size, arch.hidden_size],
+                    &ln("mlp.gate_up.weight"), model_dir,
+                )?;
+                let down_proj = upload_fp8_from(
+                    arena, "down_proj",
+                    &must_get(&ln("mlp.down_proj.weight"))?,
+                    &shards, model_dir,
+                )?;
+                (qkv, o_proj, gate_up, down_proj)
+            }
         };
 
-        let f16_max = std::env::var("RVLLM_F16_LAYERS")
-            .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+        let f16_max = if std::env::var("RVLLM_F16_ONLY").map_or(false, |v| v == "1") {
+            arch.num_hidden_layers
+        } else {
+            std::env::var("RVLLM_F16_LAYERS")
+                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0)
+        };
+        let f16_only = std::env::var("RVLLM_F16_ONLY").map_or(false, |v| v == "1");
         let (qkv_f16_w, o_proj_f16_w, gate_up_f16_w, down_proj_f16_w) = if l < f16_max {
-            let dequant_fp8_to_f16 = |parts: &[&(usize, TensorEntry)],
-                                       scale_parts: &[Option<&(usize, TensorEntry)>]| -> Vec<u8> {
-                let mut out = Vec::new();
-                for (i, &(si, ref entry)) in parts.iter().enumerate() {
-                    let raw = &shards[*si].bytes()[entry.file_offset as usize..(entry.file_offset + entry.nbytes) as usize];
-                    let rows = entry.shape[0];
-                    let cols = entry.nbytes as usize / rows;
-                    let ch_scales = if let Some(se) = scale_parts.get(i).and_then(|x| x.as_ref()) {
-                        read_channelscale_bf16(se, &shards)
-                    } else {
-                        vec![1.0 / 448.0; rows]
-                    };
-                    for r in 0..rows {
-                        let rs = ch_scales[r];
-                        for c in 0..cols {
-                            let fp8_f = fp8_e4m3_to_f32(raw[r * cols + c]);
-                            let dequant = fp8_f * rs;
-                            let h = half::f16::from_f32(dequant);
-                            out.extend_from_slice(&h.to_le_bytes());
+            // Upload F16 weights directly (BF16->F16 for BF16 checkpoints, FP8->dequant->F16 for FP8)
+            let upload_concat_f16 = |parts: &[&(usize, TensorEntry)], name: &str, shape: Vec<usize>| -> Result<F16Weight> {
+                if f16_only || !fp8_prequant {
+                    let buf = concat_tensors(parts, &shards, model_dir)?;
+                    let r = arena.region(Box::leak(format!("{name}_L{l}").into_boxed_str()), buf.len(), 16)?;
+                    unsafe { r.copy_from_host(&buf)? };
+                    Ok(F16Weight { offset_bytes: r.device_ptr(), shape })
+                } else {
+                    // FP8 dequant with per-channel scales
+                    let mut out = Vec::new();
+                    for &(si, ref entry) in parts.iter() {
+                        let raw = &shards[*si].bytes()[entry.file_offset as usize..(entry.file_offset + entry.nbytes) as usize];
+                        let rows = entry.shape[0];
+                        let cols = entry.nbytes as usize / rows;
+                        let scale_name = format!("{}_scale", entry.name);
+                        let ch_scales = if let Some(se) = get_tensor(&scale_name) {
+                            read_channelscale_bf16(&se, &shards)
+                        } else {
+                            vec![1.0 / 448.0; rows]
+                        };
+                        for r in 0..rows {
+                            let rs = ch_scales[r];
+                            for c in 0..cols {
+                                out.extend_from_slice(&f16::from_f32(fp8_e4m3_to_f32(raw[r * cols + c]) * rs).to_le_bytes());
+                            }
                         }
                     }
+                    let r = arena.region(Box::leak(format!("{name}_L{l}").into_boxed_str()), out.len(), 16)?;
+                    unsafe { r.copy_from_host(&out)? };
+                    Ok(F16Weight { offset_bytes: r.device_ptr(), shape })
                 }
-                out
             };
 
-            let q_scale = get_tensor(&ln("self_attn.q_proj.weight_scale"));
-            let k_scale = get_tensor(&ln("self_attn.k_proj.weight_scale"));
-            let v_scale = if has_v { get_tensor(&ln("self_attn.v_proj.weight_scale")) } else { k_scale.clone() };
-            let qkv_buf = dequant_fp8_to_f16(
-                &[&q_tensor, &k_tensor, &v_tensor],
-                &[q_scale.as_ref(), k_scale.as_ref(), v_scale.as_ref()],
-            );
-            let qkv_r = arena.region(Box::leak(format!("qkv_f16_L{l}").into_boxed_str()), qkv_buf.len(), 16)?;
-            unsafe { qkv_r.copy_from_host(&qkv_buf)? };
-            let qkv_w = F16Weight { offset_bytes: qkv_r.device_ptr(), shape: vec![qkv_rows, arch.hidden_size] };
-
+            let qkv_w = upload_concat_f16(
+                &[&q_tensor, &k_tensor, &v_tensor], "qkv_f16",
+                vec![qkv_rows, arch.hidden_size],
+            )?;
             let o_entry = must_get(&ln("self_attn.o_proj.weight"))?;
-            let o_scale_e = get_tensor(&ln("self_attn.o_proj.weight_scale"));
-            let o_buf = dequant_fp8_to_f16(&[&o_entry], &[o_scale_e.as_ref()]);
-            let o_r = arena.region(Box::leak(format!("o_f16_L{l}").into_boxed_str()), o_buf.len(), 16)?;
-            unsafe { o_r.copy_from_host(&o_buf)? };
-            let o_w = F16Weight { offset_bytes: o_r.device_ptr(), shape: o_entry.1.shape.clone() };
-
+            let o_w = upload_concat_f16(&[&o_entry], "o_f16", o_entry.1.shape.clone())?;
             let gate_e = must_get(&ln("mlp.gate_proj.weight"))?;
             let up_e = must_get(&ln("mlp.up_proj.weight"))?;
-            let gate_s = get_tensor(&ln("mlp.gate_proj.weight_scale"));
-            let up_s = get_tensor(&ln("mlp.up_proj.weight_scale"));
-            let gu_buf = dequant_fp8_to_f16(&[&gate_e, &up_e], &[gate_s.as_ref(), up_s.as_ref()]);
-            let gu_r = arena.region(Box::leak(format!("gu_f16_L{l}").into_boxed_str()), gu_buf.len(), 16)?;
-            unsafe { gu_r.copy_from_host(&gu_buf)? };
-            let gu_w = F16Weight { offset_bytes: gu_r.device_ptr(), shape: vec![2 * arch.intermediate_size, arch.hidden_size] };
-
+            let gu_w = upload_concat_f16(
+                &[&gate_e, &up_e], "gu_f16",
+                vec![2 * arch.intermediate_size, arch.hidden_size],
+            )?;
             let d_entry = must_get(&ln("mlp.down_proj.weight"))?;
-            let d_scale_e = get_tensor(&ln("mlp.down_proj.weight_scale"));
-            let d_buf = dequant_fp8_to_f16(&[&d_entry], &[d_scale_e.as_ref()]);
-            let d_r = arena.region(Box::leak(format!("d_f16_L{l}").into_boxed_str()), d_buf.len(), 16)?;
-            unsafe { d_r.copy_from_host(&d_buf)? };
-            let d_w = F16Weight { offset_bytes: d_r.device_ptr(), shape: d_entry.1.shape.clone() };
+            let d_w = upload_concat_f16(&[&d_entry], "d_f16", d_entry.1.shape.clone())?;
 
-            if l == 0 { eprintln!("[loader] RVLLM_F16_LAYERS={f16_max}: dequant FP8->F16 weights for layers 0..{f16_max}"); }
+            if l == 0 { eprintln!("[loader] F16 weights for layers 0..{f16_max}"); }
             (Some(qkv_w), Some(o_w), Some(gu_w), Some(d_w))
         } else {
             (None, None, None, None)
