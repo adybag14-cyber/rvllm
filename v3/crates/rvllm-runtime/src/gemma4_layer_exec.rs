@@ -177,12 +177,13 @@ pub unsafe fn gemma4_forward(
     scratch: &Gemma4LayerScratch,
     meta: &Gemma4MetadataPtrs,
     cublaslt: &CublasLt,
+    cutlass: &CutlassLib,
     sliding_attention: &Fa3Kernels,
     global_attention: &Fa3Kernels,
     residual: u64,
     stream: u64,
 ) -> Result<()> {
-    gemma4_forward_phase(dims, kernels, weights, scratch, meta, cublaslt,
+    gemma4_forward_phase(dims, kernels, weights, scratch, meta, cublaslt, cutlass,
         sliding_attention, global_attention, residual, stream, Gemma4Phase::Decode)
 }
 
@@ -194,6 +195,7 @@ pub unsafe fn gemma4_forward_phase(
     scratch: &Gemma4LayerScratch,
     meta: &Gemma4MetadataPtrs,
     cublaslt: &CublasLt,
+    cutlass: &CutlassLib,
     sliding_attention: &Fa3Kernels,
     global_attention: &Fa3Kernels,
     residual: u64,
@@ -357,14 +359,13 @@ pub unsafe fn gemma4_forward_phase(
             stream,
         )?;
     } else if weights.qkv_chscale != 0 {
-        fp8_gemm_f32_with_channelscale_fallback(
-            cublaslt, kernels.scale_cols_f32,
-            scratch.hidden_fp8, weights.qkv_fp8, scratch.gemm_f32_tmp,
+        cutlass.launch_fp8_gemm_channelscale(
+            scratch.q_out, scratch.hidden_fp8, weights.qkv_fp8,
+            scratch.hidden_scale, weights.qkv_chscale,
             dims.num_tokens as i32, qkv_rows as i32, dims.hidden as i32,
-            scratch.hidden_scale, weights.qkv_scale, weights.qkv_chscale, stream,
+            scratch.cutlass_workspace, scratch.cutlass_workspace_bytes,
+            stream,
         )?;
-        gemma4_launcher::Bf16ToF16SatLaunch { n: dims.num_tokens * qkv_rows }
-            .launch(kernels.f32_to_f16_sat, scratch.q_out, scratch.gemm_f32_tmp, stream)?;
     } else {
         cublaslt.fp8_gemm(
             scratch.hidden_fp8, weights.qkv_fp8, scratch.q_out,
@@ -634,14 +635,13 @@ pub unsafe fn gemma4_forward_phase(
             stream,
         )?;
     } else if weights.gate_up_chscale != 0 {
-        fp8_gemm_f32_with_channelscale_fallback(
-            cublaslt, kernels.scale_cols_f32,
-            scratch.hidden_fp8, weights.gate_up_fp8, scratch.gemm_f32_tmp,
+        cutlass.launch_fp8_gemm_channelscale(
+            scratch.gate_up_out, scratch.hidden_fp8, weights.gate_up_fp8,
+            scratch.hidden_scale, weights.gate_up_chscale,
             dims.num_tokens as i32, (2 * dims.intermediate) as i32, dims.hidden as i32,
-            scratch.hidden_scale, weights.gate_up_scale, weights.gate_up_chscale, stream,
+            scratch.cutlass_workspace, scratch.cutlass_workspace_bytes,
+            stream,
         )?;
-        gemma4_launcher::Bf16ToF16SatLaunch { n: dims.num_tokens * 2 * dims.intermediate }
-            .launch(kernels.f32_to_f16_sat, scratch.gate_up_out, scratch.gemm_f32_tmp, stream)?;
     } else {
         cublaslt.fp8_gemm(
             scratch.hidden_fp8, weights.gate_up_fp8, scratch.gate_up_out,

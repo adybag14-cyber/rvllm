@@ -52,6 +52,25 @@ pub type Fp8GemmResidualFn = unsafe extern "C" fn(
 #[cfg(feature = "cuda")]
 pub type WorkspaceSizeFn = unsafe extern "C" fn(m: i32, n: i32, k: i32) -> usize;
 
+#[cfg(feature = "cuda")]
+#[allow(clippy::type_complexity)]
+pub type Fp8GemmChannelscaleFn = unsafe extern "C" fn(
+    output: *mut c_void,
+    a: *const c_void,
+    b: *const c_void,
+    row_scale: *const c_void,
+    col_scale: *const c_void,
+    m: i32,
+    n: i32,
+    k: i32,
+    workspace: *mut c_void,
+    workspace_size: usize,
+    stream: *mut c_void,
+) -> i32;
+
+#[cfg(feature = "cuda")]
+pub type ChannelscaleWorkspaceFn = unsafe extern "C" fn(m: i32, n: i32, k: i32) -> usize;
+
 /// Resolved CUTLASS .so + variant fn-pointer table.
 #[derive(Debug)]
 pub struct CutlassLib {
@@ -69,6 +88,10 @@ pub struct CutlassLib {
     pub fp8_gemm_residual: std::collections::BTreeMap<VariantId, Fp8GemmResidualFn>,
     #[cfg(feature = "cuda")]
     pub fp8_gemm_residual_ws: std::collections::BTreeMap<VariantId, WorkspaceSizeFn>,
+    #[cfg(feature = "cuda")]
+    pub fp8_gemm_channelscale: Option<Fp8GemmChannelscaleFn>,
+    #[cfg(feature = "cuda")]
+    pub fp8_gemm_channelscale_ws: Option<ChannelscaleWorkspaceFn>,
 }
 
 #[cfg(feature = "cuda")]
@@ -120,6 +143,13 @@ impl CutlassLib {
             }
         }
 
+        let fp8_gemm_channelscale: Option<Fp8GemmChannelscaleFn> = unsafe {
+            lib.get(b"cutlass_fp8_gemm_channelscale\0").ok().map(|s| *s)
+        };
+        let fp8_gemm_channelscale_ws: Option<ChannelscaleWorkspaceFn> = unsafe {
+            lib.get(b"cutlass_fp8_gemm_channelscale_workspace\0").ok().map(|s| *s)
+        };
+
         Ok(Self {
             so_path: path,
             _lib: lib,
@@ -127,6 +157,8 @@ impl CutlassLib {
             fp8_gemm_ws,
             fp8_gemm_residual,
             fp8_gemm_residual_ws,
+            fp8_gemm_channelscale,
+            fp8_gemm_channelscale_ws,
         })
     }
 
@@ -242,6 +274,54 @@ impl CutlassLib {
                     kernel: "fp8_gemm_residual",
                     stream,
                 },
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_fp8_gemm_channelscale(
+        &self,
+        output: u64,
+        a: u64,
+        b: u64,
+        row_scale: u64,
+        col_scale: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        workspace: u64,
+        workspace_size: usize,
+        stream: u64,
+    ) -> Result<()> {
+        let f = self.fp8_gemm_channelscale.ok_or_else(|| {
+            RvllmError::cutlass(
+                CutlassError::KernelLaunchFailed {
+                    variant: 0,
+                    cuda: rvllm_core::CudaErrorKind::Other,
+                },
+                CutlassCtx { kernel: "fp8_gemm_channelscale (missing from .so)", stream },
+            )
+        })?;
+        let rc = f(
+            output as *mut c_void,
+            a as *const c_void,
+            b as *const c_void,
+            row_scale as *const c_void,
+            col_scale as *const c_void,
+            m, n, k,
+            workspace as *mut c_void,
+            workspace_size,
+            stream as *mut c_void,
+        );
+        if rc != 0 {
+            return Err(RvllmError::cutlass(
+                CutlassError::KernelLaunchFailed {
+                    variant: 0,
+                    cuda: rvllm_core::CudaErrorKind::LaunchFailed,
+                },
+                CutlassCtx { kernel: "fp8_gemm_channelscale", stream },
             ));
         }
         Ok(())

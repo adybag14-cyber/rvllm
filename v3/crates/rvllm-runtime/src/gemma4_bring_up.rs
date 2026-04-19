@@ -499,6 +499,7 @@ impl Gemma4Bringup {
                     &scratch,
                     &meta,
                     &self.cublaslt,
+                    &self.cutlass,
                     &self.sliding_attention,
                     &self.global_attention,
                     residual_ptr,
@@ -882,6 +883,7 @@ impl Gemma4Bringup {
                     &scratch,
                     &meta,
                     &self.cublaslt,
+                    &self.cutlass,
                     &self.sliding_attention,
                     &self.global_attention,
                     residual_ptr,
@@ -1334,7 +1336,7 @@ impl Gemma4Bringup {
                 };
                 crate::gemma4_layer_exec::gemma4_forward(
                     dims, &kernels, &w, &scratch, &meta,
-                    &self.cublaslt, &self.sliding_attention, &self.global_attention,
+                    &self.cublaslt, &self.cutlass, &self.sliding_attention, &self.global_attention,
                     residual_ptr, stream,
                 )?;
             }
