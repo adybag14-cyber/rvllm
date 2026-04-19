@@ -243,24 +243,23 @@ impl Gemma4Bringup {
             .region("gemm_f32_tmp", (num_seqs * gemm_f32_max_n * 4) as usize, 16)
             .unwrap();
 
-        // Uniform KV dim across layer types (sliding 16*256=4096, global 4*512=2048 but
-        // k_eq_v doubles it back). Use max for allocation.
         let kv_bytes_per_elem: u32 = 1; // bench path always FP8
-        let kv_elem_per_layer = 2 * num_blocks_total * block_size * max_nkvh * max_hd;
-        let kv_cache = arena
-            .region(
-                "kv_cache",
-                (arch.num_hidden_layers as u64 * kv_elem_per_layer as u64) as usize,
-                256,
-            )
-            .unwrap();
+        let sliding_blocks = ((arch.sliding_window_size as u32 + block_size - 1) / block_size).min(num_blocks_total);
+
+        let mut kv_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
+        let mut kv_total_bytes: u64 = 0;
+        for l in 0..arch.num_hidden_layers {
+            kv_layer_offsets.push(kv_total_bytes);
+            let layer_blocks = if arch.layer_types[l] == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention { num_blocks_total } else { sliding_blocks };
+            let nkvh_l = arch.num_kv_heads_for_layer(l) as u32;
+            let hd_l = arch.head_dim_for_layer(l) as u32;
+            let layer_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh_l as u64 * hd_l as u64;
+            kv_total_bytes += layer_elems * kv_bytes_per_elem as u64;
+        }
+        let kv_cache = arena.region("kv_cache", kv_total_bytes as usize, 256).unwrap();
         #[cfg(feature = "cuda")]
         {
-            cudarc::driver::sys::cuMemsetD8_v2(
-                kv_cache.device_ptr(),
-                0,
-                (arch.num_hidden_layers as u64 * kv_elem_per_layer as u64) as usize,
-            );
+            cudarc::driver::sys::cuMemsetD8_v2(kv_cache.device_ptr(), 0, kv_total_bytes as usize);
         }
 
         let q_scale_region = arena.region("q_scale", 4, 4).unwrap();
@@ -383,6 +382,7 @@ impl Gemma4Bringup {
                 let q_dim = (arch.num_attention_heads as u32) * hd;
                 let kv_dim = nkvh * hd;
                 let qkv_rows = q_dim + 2 * kv_dim;
+                let layer_blocks = if lt == Gemma4LayerType::GlobalAttention { num_blocks_total } else { sliding_blocks };
 
                 let dims = Gemma4LayerDims {
                     num_tokens: num_seqs,
@@ -393,8 +393,8 @@ impl Gemma4Bringup {
                     rotary_dim: arch.rotary_dim_for_layer(layer_idx) as u32,
                     intermediate: inter,
                     block_size,
-                    max_blocks_per_seq,
-                    num_blocks_total,
+                    max_blocks_per_seq: layer_blocks,
+                    num_blocks_total: layer_blocks,
                     attn_scale: 1.0,
                     rms_eps: arch.rms_norm_eps,
                     layer_type: lt,
@@ -404,8 +404,11 @@ impl Gemma4Bringup {
 
                 let k_out = q_base + (num_seqs as u64) * (q_dim as u64) * 2;
                 let v_out = k_out + (num_seqs as u64) * (kv_dim as u64) * 2;
-                let kv_layer_bytes = (kv_elem_per_layer as u64) * (kv_bytes_per_elem as u64);
-                let layer_kv_base = kv_cache.device_ptr() + (layer_idx as u64) * kv_layer_bytes;
+                let is_global = lt == Gemma4LayerType::GlobalAttention;
+                let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
+                let layer_kv_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
+                let kv_layer_bytes = layer_kv_elems * kv_bytes_per_elem as u64;
+                let layer_kv_base = kv_cache.device_ptr() + kv_layer_offsets[layer_idx];
 
                 let (cos, sin) = match lt {
                     Gemma4LayerType::SlidingAttention => (
@@ -659,11 +662,28 @@ impl Gemma4Bringup {
         let f16_only = std::env::var("RVLLM_F16_ONLY").map_or(false, |v| v == "1");
         let use_f16_kv = f16_only || std::env::var("RVLLM_F16_KV").map_or(true, |v| v != "0");
         let kv_bytes_per_elem: u32 = if use_f16_kv { 2 } else { 1 };
-        let kv_elem_per_layer = 2 * num_blocks_total * block_size * max_nkvh * max_hd;
-        let kv_cache_bytes =
-            arch.num_hidden_layers as u64 * kv_elem_per_layer as u64 * kv_bytes_per_elem as u64;
-        let kv_cache = arena.region("kv_cache", kv_cache_bytes as usize, 256)?;
-        cudarc::driver::sys::cuMemsetD8_v2(kv_cache.device_ptr(), 0, kv_cache_bytes as usize);
+
+        // Per-layer KV budget: sliding layers cap at sliding_window/block_size blocks,
+        // global layers use full num_blocks_total. Saves ~5x KV memory for long context.
+        let sliding_blocks = ((arch.sliding_window_size as u32 + block_size - 1) / block_size).min(num_blocks_total);
+
+
+        let mut kv_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
+        let mut kv_total_bytes: u64 = 0;
+        for l in 0..arch.num_hidden_layers {
+            kv_layer_offsets.push(kv_total_bytes);
+            let is_global = arch.layer_types[l] == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
+            let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
+            let nkvh = arch.num_kv_heads_for_layer(l) as u32;
+            let hd = arch.head_dim_for_layer(l) as u32;
+            let layer_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
+            kv_total_bytes += layer_elems * kv_bytes_per_elem as u64;
+        }
+        eprintln!("[ppl] KV cache: {:.1} MB (sliding={} blocks, global={} blocks, {} bytes/elem)",
+            kv_total_bytes as f64 / 1e6, sliding_blocks, num_blocks_total, kv_bytes_per_elem);
+
+        let kv_cache = arena.region("kv_cache", kv_total_bytes as usize, 256)?;
+        cudarc::driver::sys::cuMemsetD8_v2(kv_cache.device_ptr(), 0, kv_total_bytes as usize);
 
         let q_scale_region = arena.region("q_scale", 4, 4)?;
         let kv_scale_region = arena.region("kv_scale", 4, 4)?;
@@ -746,6 +766,7 @@ impl Gemma4Bringup {
                 let nkvh = arch.num_kv_heads_for_layer(layer_idx) as u32;
                 let q_dim = (arch.num_attention_heads as u32) * hd;
                 let kv_dim = nkvh * hd;
+                let layer_blocks = if lt == Gemma4LayerType::GlobalAttention { num_blocks_total } else { sliding_blocks };
 
                 let dims = Gemma4LayerDims {
                     num_tokens: num_seqs,
@@ -756,8 +777,8 @@ impl Gemma4Bringup {
                     rotary_dim: arch.rotary_dim_for_layer(layer_idx) as u32,
                     intermediate: inter,
                     block_size,
-                    max_blocks_per_seq,
-                    num_blocks_total,
+                    max_blocks_per_seq: layer_blocks,
+                    num_blocks_total: layer_blocks,
                     attn_scale: 1.0,
                     rms_eps: arch.rms_norm_eps,
                     layer_type: lt,
@@ -767,8 +788,11 @@ impl Gemma4Bringup {
 
                 let k_out = q_base + (num_seqs as u64) * (q_dim as u64) * 2;
                 let v_out = k_out + (num_seqs as u64) * (kv_dim as u64) * 2;
-                let kv_layer_bytes = (kv_elem_per_layer as u64) * (kv_bytes_per_elem as u64);
-                let layer_kv_base = kv_cache.device_ptr() + (layer_idx as u64) * kv_layer_bytes;
+                let is_global = lt == Gemma4LayerType::GlobalAttention;
+                let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
+                let layer_kv_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
+                let kv_layer_bytes = layer_kv_elems * kv_bytes_per_elem as u64;
+                let layer_kv_base = kv_cache.device_ptr() + kv_layer_offsets[layer_idx];
                 let (cos, sin) = match lt {
                     Gemma4LayerType::SlidingAttention => (
                         self.model.rope_cos_sliding.offset_bytes,
@@ -1168,17 +1192,21 @@ impl Gemma4Bringup {
         let gemm_f32_max_n = std::cmp::max(max_qkv_rows, 2 * inter);
         let gemm_f32_tmp = arena.region("gen_gemm_f32", (gemm_f32_max_n * 4) as usize, 16)?;
 
-        let kv_elem_per_layer = 2 * num_blocks_total * block_size * max_nkvh * max_hd;
-        let kv_cache = arena.region(
-            "gen_kv",
-            (arch.num_hidden_layers as u64 * kv_elem_per_layer as u64) as usize,
-            256,
-        )?;
-        cudarc::driver::sys::cuMemsetD8_v2(
-            kv_cache.device_ptr(),
-            0,
-            (arch.num_hidden_layers as u64 * kv_elem_per_layer as u64) as usize,
-        );
+        let sliding_blocks = ((arch.sliding_window_size as u32 + block_size - 1) / block_size).min(num_blocks_total);
+        let kv_bytes_per_elem: u32 = 1; // generate path uses FP8 KV
+        let mut kv_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
+        let mut kv_total_bytes: u64 = 0;
+        for l in 0..arch.num_hidden_layers {
+            kv_layer_offsets.push(kv_total_bytes);
+            let is_global = arch.layer_types[l] == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
+            let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
+            let nkvh = arch.num_kv_heads_for_layer(l) as u32;
+            let hd = arch.head_dim_for_layer(l) as u32;
+            let layer_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
+            kv_total_bytes += layer_elems * kv_bytes_per_elem as u64;
+        }
+        let kv_cache = arena.region("gen_kv", kv_total_bytes as usize, 256)?;
+        cudarc::driver::sys::cuMemsetD8_v2(kv_cache.device_ptr(), 0, kv_total_bytes as usize);
 
         let q_scale_region = arena.region("gen_q_scale", 4, 4)?;
         let kv_scale_region = arena.region("gen_kv_scale", 4, 4)?;
@@ -1260,6 +1288,7 @@ impl Gemma4Bringup {
                 let nkvh = arch.num_kv_heads_for_layer(layer_idx) as u32;
                 let q_dim = (arch.num_attention_heads as u32) * hd;
                 let kv_dim = nkvh * hd;
+                let layer_blocks = if lt == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention { num_blocks_total } else { num_blocks_total.min(((arch.sliding_window_size as u32 + block_size - 1) / block_size)) };
 
                 let dims = crate::gemma4_layer_exec::Gemma4LayerDims {
                     num_tokens: 1,
@@ -1270,8 +1299,8 @@ impl Gemma4Bringup {
                     rotary_dim: arch.rotary_dim_for_layer(layer_idx) as u32,
                     intermediate: inter,
                     block_size,
-                    max_blocks_per_seq,
-                    num_blocks_total,
+                    max_blocks_per_seq: layer_blocks,
+                    num_blocks_total: layer_blocks,
                     attn_scale: 1.0,
                     rms_eps: arch.rms_norm_eps,
                     layer_type: lt,
@@ -1280,8 +1309,8 @@ impl Gemma4Bringup {
                 };
                 let k_out = q_base + (q_dim as u64) * 2;
                 let v_out = k_out + (kv_dim as u64) * 2;
-                let layer_kv_base =
-                    kv_cache.device_ptr() + (layer_idx as u64) * (kv_elem_per_layer as u64);
+                let layer_kv_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
+                let layer_kv_base = kv_cache.device_ptr() + kv_layer_offsets[layer_idx];
                 let (cos, sin) = match lt {
                     Gemma4LayerType::SlidingAttention => (
                         self.model.rope_cos_sliding.offset_bytes,
@@ -1327,7 +1356,7 @@ impl Gemma4Bringup {
                     k_normed: k_normed.device_ptr(),
                     q_fp8: q_fp8.device_ptr(),
                     k_cache: layer_kv_base,
-                    v_cache: layer_kv_base + (kv_elem_per_layer / 2) as u64,
+                    v_cache: layer_kv_base + (layer_kv_elems / 2) * kv_bytes_per_elem as u64,
                     q_scale_ptr: q_scale_region.device_ptr(),
                     kv_scale_ptr: kv_scale_region.device_ptr(),
                     attn_out: attn_out.device_ptr(),
