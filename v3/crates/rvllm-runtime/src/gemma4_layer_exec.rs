@@ -587,7 +587,7 @@ pub unsafe fn gemma4_forward_phase(
         gemma4_launcher::FusedNormAddResidualLaunch {
             num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
         }.launch(kernels.fused_norm_add_residual, scratch.gemm_f32_tmp,
-            weights.post_attn_norm_gamma, residual, stream)?;
+            weights.post_attn_norm_gamma, residual, 0, stream)?;
     } else if weights.o_chscale != 0 {
         cublaslt.fp8_gemm_f32(
             scratch.attn_out_fp8, weights.o_fp8, scratch.gemm_f32_tmp,
@@ -597,7 +597,7 @@ pub unsafe fn gemma4_forward_phase(
         gemma4_launcher::FusedNormAddResidualF16Launch {
             num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
         }.launch(kernels.fused_norm_add_residual_f16, scratch.gemm_f32_tmp,
-            weights.o_chscale, weights.post_attn_norm_gamma, residual, stream)?;
+            weights.o_chscale, weights.post_attn_norm_gamma, residual, 0, stream)?;
     } else {
         cublaslt.fp8_gemm_f32(
             scratch.attn_out_fp8, weights.o_fp8, scratch.gemm_f32_tmp,
@@ -607,7 +607,7 @@ pub unsafe fn gemma4_forward_phase(
         gemma4_launcher::FusedNormAddResidualLaunch {
             num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
         }.launch(kernels.fused_norm_add_residual, scratch.gemm_f32_tmp,
-            weights.post_attn_norm_gamma, residual, stream)?;
+            weights.post_attn_norm_gamma, residual, 0, stream)?;
     }
 
     #[cfg(feature = "cuda")]
@@ -771,7 +771,8 @@ pub unsafe fn gemma4_forward_phase(
             gemma4_launcher::FusedNormAddResidualF16Launch {
                 num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
             }.launch(kernels.fused_norm_add_residual_f16, scratch.gemm_f32_tmp,
-                weights.down_chscale, weights.post_ff_norm_gamma, residual, stream)?;
+                weights.down_chscale, weights.post_ff_norm_gamma, residual,
+                weights.layer_scalar_ptr, stream)?;
         } else {
             cublaslt.fp8_gemm_f32(
                 scratch.mlp_out_fp8, weights.down_fp8, scratch.gemm_f32_tmp,
@@ -781,24 +782,10 @@ pub unsafe fn gemma4_forward_phase(
             gemma4_launcher::FusedNormAddResidualLaunch {
                 num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
             }.launch(kernels.fused_norm_add_residual, scratch.gemm_f32_tmp,
-                weights.post_ff_norm_gamma, residual, stream)?;
+                weights.post_ff_norm_gamma, residual,
+                weights.layer_scalar_ptr, stream)?;
         }
     }
-
-    #[cfg(feature = "cuda")]
-    probe!("after_step13_residual", residual, dims.hidden);
-
-    // 14. residual *= layer_scalar (once per layer, after both sub-blocks)
-    gemma4_launcher::ResidualScaleF16Launch {
-        num_tokens: dims.num_tokens,
-        hidden: dims.hidden,
-    }
-    .launch(
-        kernels.residual_scale_f16,
-        residual,
-        weights.layer_scalar_ptr,
-        stream,
-    )?;
 
     #[cfg(feature = "cuda")]
     probe!("after_step14_residual", residual, dims.hidden);

@@ -439,23 +439,26 @@ impl FusedNormAddResidualLaunch {
         gemm_out: u64,
         gamma: u64,
         residual: u64,
+        layer_scalar: u64,
         stream: u64,
     ) -> Result<()> {
         let mut gemm_out = gemm_out;
         let mut gamma = gamma;
         let mut residual = residual;
+        let mut layer_scalar = layer_scalar;
         let mut hidden = self.hidden as i32;
         let mut eps = self.eps;
         let args = [
             (&mut gemm_out) as *mut u64 as *mut core::ffi::c_void,
             (&mut gamma) as *mut u64 as *mut core::ffi::c_void,
             (&mut residual) as *mut u64 as *mut core::ffi::c_void,
+            (&mut layer_scalar) as *mut u64 as *mut core::ffi::c_void,
             (&mut hidden) as *mut i32 as *mut core::ffi::c_void,
             (&mut eps) as *mut f32 as *mut core::ffi::c_void,
         ];
         let block = (self.hidden.min(1024), 1, 1);
         let grid = (self.num_tokens, 1, 1);
-        let smem = self.hidden * 4; // cache bf16-rounded f32 values
+        let smem = self.hidden * 4;
         launch_raw(kernel, grid, block, smem, stream, &args)
     }
 }
@@ -479,12 +482,14 @@ impl FusedNormAddResidualF16Launch {
         channelscale: u64,
         gamma: u64,
         residual: u64,
+        layer_scalar: u64,
         stream: u64,
     ) -> Result<()> {
         let mut gemm_out_f16 = gemm_out_f16;
         let mut channelscale = channelscale;
         let mut gamma = gamma;
         let mut residual = residual;
+        let mut layer_scalar = layer_scalar;
         let mut hidden = self.hidden as i32;
         let mut eps = self.eps;
         let args = [
@@ -492,6 +497,7 @@ impl FusedNormAddResidualF16Launch {
             (&mut channelscale) as *mut u64 as *mut core::ffi::c_void,
             (&mut gamma) as *mut u64 as *mut core::ffi::c_void,
             (&mut residual) as *mut u64 as *mut core::ffi::c_void,
+            (&mut layer_scalar) as *mut u64 as *mut core::ffi::c_void,
             (&mut hidden) as *mut i32 as *mut core::ffi::c_void,
             (&mut eps) as *mut f32 as *mut core::ffi::c_void,
         ];
