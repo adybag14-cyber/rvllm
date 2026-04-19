@@ -311,7 +311,7 @@ Reference: [EAGLE-3 paper](https://arxiv.org/abs/2503.01840), [EAGLE-3 SPEC](tpu
 
 ## GPU: 31B Gemma 4 on H100
 
-Rust + CUDA on H100 SXM 80GB. FP8 weights with per-channel scales, F16 KV cache, F16 paged attention. All 60 layers captured in a single CUDA graph (1776 nodes). **7,612 tok/s** peak (B=512), **PPL 12.54** (better than HF BF16 19.62).
+Rust + CUDA on H100 SXM 80GB. FP8 weights with per-channel scales, F16 KV cache, F16 paged attention. All 60 layers captured in a single CUDA graph (~1400 nodes). **7,943 tok/s** peak (B=512), **PPL 13.53**. Per-layer KV cache sizing enables 128K context on a single GPU.
 
 ### Gemma 4 architecture
 
@@ -334,74 +334,84 @@ Other Gemma 4 specifics:
 - **GELU(tanh)** activation (not SiLU)
 - **Tied embeddings**: lm_head = embed_tokens.T
 
-### Gemma 4 forward pass (16 launches per layer)
+### Gemma 4 forward pass (13 launches per layer)
 
 ```
 For each layer in 0..60:
   1.  fused_rmsnorm_fp8_quant           input layernorm + FP8 quantize
   2.  fp8_gemm                          fused Q||K||V projection
-  3.  fused_qk_rmsnorm                  per-head RMSNorm on Q and K
-  4.  fused_rope_partial_fp8kv          partial RoPE + FP8 quant + paged KV write
-  5.  paged_decode / paged_prefill      FA3 attention (head_dim=256 sliding, 512 global)
-  6.  quantize_fp8_per_token            attn output to FP8
-  7.  fp8_gemm_residual                 O projection + residual add
-  8.  fused_rmsnorm                     post-attention layernorm
-  9.  residual_scale_f16                multiply by layer scalar
+  2b. f32_to_f16_sat                    GEMM F32 output to F16
+  3.  vnorm_f16                         parameter-free RMSNorm on V
+  4.  fused_qk_rmsnorm                  per-head RMSNorm on Q and K
+  5.  fused_rope_partial_f16kv          partial RoPE + F16 KV cache write
+  6.  paged_decode (FA3)                attention (head_dim=256 sliding, 512 global)
+  7.  quantize_fp8_per_token            attn output to FP8
+  8.  fp8_gemm                          O projection
+  9.  fused_norm_add_residual           channelscale + rmsnorm + residual add
   10. fused_rmsnorm_fp8_quant           pre-FFN layernorm + FP8 quantize
   11. fp8_gemm                          fused gate||up projection
+  11b.f32_to_f16_sat                    GEMM F32 output to F16
   12. fused_gelu_mul_fp8_quant          GELU(tanh)(gate) * up to FP8
-  13. fp8_gemm_residual                 down projection + residual add
-  14. fused_rmsnorm                     post-FFN layernorm
-  15. residual_scale_f16                multiply by layer scalar
-  16. implicit residual carry
+  13. fp8_gemm                          down projection
+  14. fused_norm_add_residual           channelscale + rmsnorm + residual add + layer_scalar
 
 Sampling tail:
-  quantize_fp8_per_token              hidden to FP8
-  fp8_gemm                            lm_head
+  fused_rmsnorm                       final layernorm
+  f16_gemm_f32                        lm_head
   logit_softcap                       30 * tanh(logits / 30)
   argmax_kernel                       token selection
 ```
 
-16 launches per layer x 60 layers + sampling tail = ~963 launches per step, all captured into one `cuGraphLaunch`.
+~13 launches per layer (down from 16 via kernel fusion). All captured into one `cuGraphLaunch` (~1400 nodes).
 
 ### GPU perplexity
 
 | Weight path | KV cache | PPL | tok/s (B=1, graph) |
 |---|---|---|---|
-| FP8-Dynamic per-channel + channelscale | F16 | **12.54** | 37.9 |
+| FP8-Dynamic per-channel + fused channelscale | F16 | **13.53** | 39.6 |
 | BF16 split QKV per-tensor FP8 | F16 | 17.96 | 37.9 |
 | F16 weights (no FP8) | F16 | 19.79 | 37.9 |
 | HuggingFace BF16 reference | -- | 19.62 | -- |
 | TPU int8 reference | int8 | 19.24 | -- |
 
-The FP8-Dynamic checkpoint (RedHatAI/gemma-4-31B-it-FP8-Dynamic) with native per-channel weight scales + F16 KV cache achieves the best PPL (12.54) because the checkpoint was quantized with calibrated per-row scales that preserve more precision than BF16 rounding.
+The FP8-Dynamic checkpoint (RedHatAI/gemma-4-31B-it-FP8-Dynamic) with native per-channel weight scales + F16 KV cache. Channelscale is fused into the post-norm kernel, applying the per-channel rescaling in F32 precision before RMSNorm + residual add.
 
 ### GPU batch scaling
 
 | Batch | tok/s | ms/step | Efficiency |
 |---|---|---|---|
-| 1 | 51 | 19.7 | baseline |
-| 4 | 224 | 17.9 | 110% |
-| 8 | 438 | 18.3 | 107% |
-| 16 | 872 | 18.4 | 107% |
-| 32 | 1,670 | 19.2 | 102% |
-| 64 | 2,978 | 21.5 | 91% |
-| 128 | 4,893 | 26.2 | 75% |
-| 256 | 6,606 | 38.8 | 51% |
-| 512 | 7,612 | 67.3 | 29% |
+| 1 | 52 | 19.2 | baseline |
+| 4 | 229 | 17.5 | 110% |
+| 8 | 452 | 17.7 | 109% |
+| 16 | 900 | 17.8 | 108% |
+| 32 | 1,723 | 18.6 | 104% |
+| 64 | 3,097 | 20.7 | 93% |
+| 128 | 5,114 | 25.0 | 77% |
+| 256 | 6,897 | 37.1 | 52% |
+| 512 | 7,943 | 64.5 | 30% |
 
-H100 SXM 80GB, FP8 weights, CUDA graph. Near-linear scaling through B=32 (memory-bound), saturating at B=256+ as FP8 tensor cores become compute-bound.
+H100 SXM 80GB, FP8 weights, F16 KV cache, CUDA graph. Near-linear scaling through B=32 (memory-bound), saturating at B=256+ as FP8 tensor cores become compute-bound. Per-layer KV cache sizing (sliding layers capped at 32 blocks) enables 128K context on a single 80GB GPU.
 
 ### CUDA graph capture
 
-All 60 layers + lm_head captured into a single `cuGraphLaunch` (1776 nodes). Eliminates per-kernel launch overhead.
+All 60 layers + lm_head captured into a single `cuGraphLaunch` (~1400 nodes, down from 1776 pre-fusion). Eliminates per-kernel launch overhead.
 
 | Mode | tok/s (B=1) | ms/step |
 |---|---|---|
-| CUDA graph | 51 | 19.7 |
-| Eager (no graph) | 11 | 90.4 |
+| CUDA graph | 52 | 19.2 |
+| Eager (no graph) | 11 | ~91 |
 
-4.6x speedup from graph capture at batch=1.
+~4.7x speedup from graph capture at batch=1.
+
+### Kernel fusion summary
+
+Three rounds of fusion reduced graph nodes from 1776 to ~1400 (~21% reduction):
+
+| Fusion | Kernels eliminated | Nodes saved |
+|---|---|---|
+| f32_to_bf16 + rmsnorm + vector_add -> fused_norm_add_residual | 3 -> 1 (x2/layer) | 240 |
+| scale_cols_f32 fused into norm+add kernel | 1 -> 0 (x4/layer) | 120 |
+| residual_scale_f16 fused into post-ff norm+add | 1 -> 0 (x1/layer) | 60 |
 
 ### Kernels
 
@@ -417,11 +427,12 @@ Every kernel has a known purpose, a pinned variant, and a workspace contract. No
 |---|---|
 | `fused_rmsnorm_fp8_quant` | layernorm + FP8 quantize in one launch |
 | `fused_qk_rmsnorm` | per-head RMSNorm on Q and K |
-| `fused_rope_partial_fp8kv` | partial RoPE + FP8 quant + paged KV write |
+| `fused_rope_partial_f16kv` | partial RoPE + F16 KV cache write |
 | `fused_gelu_mul_fp8_quant` | GELU(tanh)(gate) * up to FP8 |
+| `fused_norm_add_residual` | GEMM output -> RMSNorm -> residual add (+ optional layer_scalar) |
+| `fused_norm_add_residual_f16` | same + fused per-channel weight rescaling |
 | `logit_softcap` | 30 * tanh(logits / 30) |
 | `quantize_fp8_per_token` | activation to FP8 with per-token scale |
-| `residual_scale_f16` | multiply by layer scalar |
 | `argmax` | f32 logits to i32 token |
 
 No fallbacks. Missing kernel .so = engine refuses to start.

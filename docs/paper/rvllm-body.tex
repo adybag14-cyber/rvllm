@@ -960,7 +960,8 @@ TPU engine runs on the pod slice.
 The GPU engine runs the same 31B Gemma~4 model on a single H100 SXM
 80\,GB using Rust + CUDA. Weights are FP8 E4M3 with per-channel scales
 (from the RedHatAI FP8-Dynamic checkpoint); the KV cache and attention
-use F16 for precision.
+use F16 for precision. Three rounds of kernel fusion reduced CUDA graph
+nodes from 1776 to ${\sim}$1400 (21\% reduction).
 
 \paragraph{Perplexity.}
 Three weight configurations were validated against the HuggingFace
@@ -971,7 +972,7 @@ BF16 reference (PPL 19.62) and TPU int8 baseline (PPL 19.24):
 \toprule
 \textbf{Weight path} & \textbf{KV} & \textbf{PPL} & \textbf{tok/s} \\
 \midrule
-FP8-Dynamic per-channel & F16 & \textbf{12.54} & 37.9 \\
+FP8-Dynamic + fused channelscale & F16 & \textbf{13.53} & 39.6 \\
 BF16 split QKV FP8      & F16 & 17.96 & 37.9 \\
 F16 (no FP8)             & F16 & 19.79 & 37.9 \\
 HF BF16 reference        & --  & 19.62 & -- \\
@@ -981,8 +982,8 @@ TPU int8 reference        & int8 & 19.24 & -- \\
 \end{center}
 
 \paragraph{Batch scaling.}
-CUDA graph capture (1776 nodes) eliminates kernel launch overhead,
-yielding 4.6$\times$ speedup at $B{=}1$ (51 vs 11 tok/s eager).
+CUDA graph capture (${\sim}$1400 nodes) eliminates kernel launch overhead,
+yielding ${\sim}$4.7$\times$ speedup at $B{=}1$ (52 vs 11 tok/s eager).
 Throughput scales near-linearly through $B{=}32$, saturating as FP8
 tensor cores become compute-bound:
 
@@ -991,28 +992,37 @@ tensor cores become compute-bound:
 \toprule
 \textbf{Batch} & \textbf{tok/s} & \textbf{ms/step} & \textbf{Scaling} & \textbf{Eff.} \\
 \midrule
-1   & 51    & 19.7 & 1.0$\times$   & 100\% \\
-4   & 224   & 17.9 & 4.4$\times$   & 110\% \\
-8   & 438   & 18.3 & 8.6$\times$   & 107\% \\
-16  & 872   & 18.4 & 17.1$\times$  & 107\% \\
-32  & 1,670 & 19.2 & 32.7$\times$  & 102\% \\
-64  & 2,978 & 21.5 & 58.4$\times$  & 91\%  \\
-128 & 4,893 & 26.2 & 96.0$\times$  & 75\%  \\
-256 & 6,606 & 38.8 & 129.5$\times$ & 51\%  \\
-512 & 7,612 & 67.3 & 149.3$\times$ & 29\%  \\
+1   & 52    & 19.2 & 1.0$\times$   & 100\% \\
+4   & 229   & 17.5 & 4.4$\times$   & 110\% \\
+8   & 452   & 17.7 & 8.7$\times$   & 109\% \\
+16  & 900   & 17.8 & 17.3$\times$  & 108\% \\
+32  & 1,723 & 18.6 & 33.1$\times$  & 104\% \\
+64  & 3,097 & 20.7 & 59.6$\times$  & 93\%  \\
+128 & 5,114 & 25.0 & 98.3$\times$  & 77\%  \\
+256 & 6,897 & 37.1 & 132.6$\times$ & 52\%  \\
+512 & 7,943 & 64.5 & 152.8$\times$ & 30\%  \\
 \bottomrule
 \end{tabular}
 \end{center}
 
+\paragraph{Kernel fusion.}
+Three fusion passes reduced graph nodes from 1776 to ${\sim}$1400:
+(1)~\texttt{f32\_to\_bf16} + \texttt{rmsnorm\_inplace} + \texttt{vector\_add}
+fused into \texttt{fused\_norm\_add\_residual} ($-$240 nodes);
+(2)~\texttt{scale\_cols\_f32} fused into the norm+add kernel as
+\texttt{fused\_norm\_add\_residual\_f16} with channelscale in F32 ($-$120 nodes);
+(3)~\texttt{residual\_scale\_f16} fused into the post-FF norm+add ($-$60 nodes).
+
 \paragraph{Key engineering decisions.}
-(1)~Per-channel FP8 weight scales cannot use cuBLASLt OUTER\_VEC\_32F
-on CUDA~12.4; a post-GEMM \texttt{scale\_cols\_f32} kernel applies the
-per-row scales after the FP8 GEMM.
+(1)~Per-channel FP8 weight scales are fused into the post-GEMM
+norm+residual kernel, applying channelscale in F32 before RMSNorm.
+This avoids the separate \texttt{scale\_cols\_f32} pass and preserves
+precision (channelscale before BF16 truncation).
 (2)~The KV cache stays in F16 because FP8 KV with a fixed scale
-(418/448, calibrated for Qwen2.5) destroyed Gemma~4 attention
-precision; F16 KV recovered PPL from 537K to 12.54.
-(3)~Split QKV quantization (separate per-tensor FP8 scales for Q, K, V)
-prevents the fused tensor's single scale from crushing K/V precision.
+destroyed Gemma~4 attention precision; F16 KV is critical for quality.
+(3)~Per-layer KV cache sizing: sliding layers (50/60) use only 32 blocks
+(1024 tokens / 32 = 32), while global layers get the full block budget.
+This reduces KV memory ${\sim}$5$\times$ and enables 128K context on a single 80\,GB GPU.
 
 % ============================================================================
 \section{Related work}

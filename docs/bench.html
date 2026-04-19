@@ -488,27 +488,25 @@ No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 l
 <h2 class="section">GPU: 31B Gemma 4 <span class="sub">H100 SXM 80GB, Rust+CUDA, FP8+F16</span> <span class="badge measured">Measured</span></h2>
 
 <div class="note-box">
-  <strong>FP8 weights + F16 KV cache.</strong> Per-channel FP8 weights from the RedHatAI/gemma-4-31B-it-FP8-Dynamic checkpoint with post-GEMM channelscale. F16 KV cache + F16 paged attention (FA3 SM90 for sliding, SM89 for global). All 60 layers captured in a single CUDA graph (1776 nodes). <strong>7,612 tok/s</strong> peak (B=512), <strong>PPL 12.54</strong>.
+  <strong>FP8 weights + F16 KV cache.</strong> Per-channel FP8 weights from the RedHatAI/gemma-4-31B-it-FP8-Dynamic checkpoint with channelscale fused into post-norm kernels. F16 KV cache + F16 paged attention (FA3 SM90 for sliding, SM89 for global). All 60 layers captured in a single CUDA graph (~1400 nodes). <strong>7,943 tok/s</strong> peak (B=512), <strong>PPL 13.53</strong>. Per-layer KV cache sizing enables 128K context.
 </div>
 
-<h3>31B Gemma 4 forward pass (16 launches per layer)</h3>
+<h3>31B Gemma 4 forward pass (~13 launches per layer)</h3>
 <div class="gpu-pipeline">
   <span class="step-num">1.</span><span class="step-desc"><code>fused_rmsnorm_fp8_quant</code> - input layernorm + FP8 quantize</span>
-  <span class="step-num">2.</span><span class="step-desc"><code>fp8_gemm</code> - fused Q||K||V projection</span>
-  <span class="step-num">3.</span><span class="step-desc"><code>fused_qk_rmsnorm</code> - per-head RMSNorm on Q and K</span>
-  <span class="step-num">4.</span><span class="step-desc"><code>fused_rope_partial_fp8kv</code> - partial RoPE + FP8 quant + paged KV write</span>
-  <span class="step-num">5.</span><span class="step-desc"><code>paged_decode / paged_prefill</code> - FA3 attention (head_dim=256 sliding, 512 global)</span>
-  <span class="step-num">6.</span><span class="step-desc"><code>quantize_fp8_per_token</code> - attn output to FP8</span>
-  <span class="step-num">7.</span><span class="step-desc"><code>fp8_gemm_residual</code> - O projection + residual add</span>
-  <span class="step-num">8.</span><span class="step-desc"><code>fused_rmsnorm</code> - post-attention layernorm</span>
-  <span class="step-num">9.</span><span class="step-desc"><code>residual_scale_f16</code> - multiply by layer scalar</span>
+  <span class="step-num">2.</span><span class="step-desc"><code>fp8_gemm</code> + <code>f32_to_f16_sat</code> - fused Q||K||V projection</span>
+  <span class="step-num">3.</span><span class="step-desc"><code>vnorm_f16</code> - parameter-free RMSNorm on V</span>
+  <span class="step-num">4.</span><span class="step-desc"><code>fused_qk_rmsnorm</code> - per-head RMSNorm on Q and K</span>
+  <span class="step-num">5.</span><span class="step-desc"><code>fused_rope_partial_f16kv</code> - partial RoPE + F16 KV cache write</span>
+  <span class="step-num">6.</span><span class="step-desc"><code>paged_decode</code> (FA3) - attention (head_dim=256 sliding, 512 global)</span>
+  <span class="step-num">7.</span><span class="step-desc"><code>quantize_fp8_per_token</code> - attn output to FP8</span>
+  <span class="step-num">8.</span><span class="step-desc"><code>fp8_gemm</code> - O projection</span>
+  <span class="step-num">9.</span><span class="step-desc"><code>fused_norm_add_residual</code> - channelscale + rmsnorm + residual add</span>
   <span class="step-num">10.</span><span class="step-desc"><code>fused_rmsnorm_fp8_quant</code> - pre-FFN layernorm + FP8 quantize</span>
-  <span class="step-num">11.</span><span class="step-desc"><code>fp8_gemm</code> - fused gate||up projection</span>
+  <span class="step-num">11.</span><span class="step-desc"><code>fp8_gemm</code> + <code>f32_to_f16_sat</code> - gate||up projection</span>
   <span class="step-num">12.</span><span class="step-desc"><code>fused_gelu_mul_fp8_quant</code> - GELU(tanh)(gate) * up to FP8</span>
-  <span class="step-num">13.</span><span class="step-desc"><code>fp8_gemm_residual</code> - down projection + residual add</span>
-  <span class="step-num">14.</span><span class="step-desc"><code>fused_rmsnorm</code> - post-FFN layernorm</span>
-  <span class="step-num">15.</span><span class="step-desc"><code>residual_scale_f16</code> - multiply by layer scalar</span>
-  <span class="step-num">16.</span><span class="step-desc">implicit residual carry to next layer</span>
+  <span class="step-num">13.</span><span class="step-desc"><code>fp8_gemm</code> - down projection</span>
+  <span class="step-num">14.</span><span class="step-desc"><code>fused_norm_add_residual</code> - channelscale + rmsnorm + residual add + layer_scalar</span>
 </div>
 
 <h3>Gemma 4 architecture details</h3>
@@ -530,7 +528,7 @@ No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 l
 <table>
 <thead><tr><th>Weight path</th><th>KV cache</th><th class="r">PPL</th><th class="r">tok/s (B=1)</th></tr></thead>
 <tbody>
-<tr><td><strong>FP8-Dynamic per-channel + channelscale</strong></td><td>F16</td><td class="r"><strong>12.54</strong></td><td class="r">37.9</td></tr>
+<tr><td><strong>FP8-Dynamic per-channel + fused channelscale</strong></td><td>F16</td><td class="r"><strong>13.53</strong></td><td class="r">39.6</td></tr>
 <tr><td>BF16 split QKV per-tensor FP8</td><td>F16</td><td class="r">17.96</td><td class="r">37.9</td></tr>
 <tr><td>F16 weights (no FP8)</td><td>F16</td><td class="r">19.79</td><td class="r">37.9</td></tr>
 <tr><td>HuggingFace BF16 reference</td><td>--</td><td class="r">19.62</td><td class="r">--</td></tr>
@@ -546,15 +544,15 @@ No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 l
 <table>
 <thead><tr><th>Batch</th><th class="r">tok/s</th><th class="r">ms/step</th><th class="r">Scaling</th><th class="r">Efficiency</th></tr></thead>
 <tbody>
-<tr><td>1</td><td class="r">51</td><td class="r">19.7</td><td class="r">1.0x</td><td class="r">100%</td></tr>
-<tr><td>4</td><td class="r">224</td><td class="r">17.9</td><td class="r">4.4x</td><td class="r">110%</td></tr>
-<tr><td>8</td><td class="r">438</td><td class="r">18.3</td><td class="r">8.6x</td><td class="r">107%</td></tr>
-<tr><td>16</td><td class="r">872</td><td class="r">18.4</td><td class="r">17.1x</td><td class="r">107%</td></tr>
-<tr><td>32</td><td class="r">1,670</td><td class="r">19.2</td><td class="r">32.7x</td><td class="r">102%</td></tr>
-<tr><td>64</td><td class="r">2,978</td><td class="r">21.5</td><td class="r">58.4x</td><td class="r">91%</td></tr>
-<tr><td>128</td><td class="r">4,893</td><td class="r">26.2</td><td class="r">96.0x</td><td class="r">75%</td></tr>
-<tr><td>256</td><td class="r">6,606</td><td class="r">38.8</td><td class="r">129.5x</td><td class="r">51%</td></tr>
-<tr><td>512</td><td class="r"><strong>7,612</strong></td><td class="r">67.3</td><td class="r">149.3x</td><td class="r">29%</td></tr>
+<tr><td>1</td><td class="r">52</td><td class="r">19.2</td><td class="r">1.0x</td><td class="r">100%</td></tr>
+<tr><td>4</td><td class="r">229</td><td class="r">17.5</td><td class="r">4.4x</td><td class="r">110%</td></tr>
+<tr><td>8</td><td class="r">452</td><td class="r">17.7</td><td class="r">8.7x</td><td class="r">109%</td></tr>
+<tr><td>16</td><td class="r">900</td><td class="r">17.8</td><td class="r">17.3x</td><td class="r">108%</td></tr>
+<tr><td>32</td><td class="r">1,723</td><td class="r">18.6</td><td class="r">33.1x</td><td class="r">104%</td></tr>
+<tr><td>64</td><td class="r">3,097</td><td class="r">20.7</td><td class="r">59.6x</td><td class="r">93%</td></tr>
+<tr><td>128</td><td class="r">5,114</td><td class="r">25.0</td><td class="r">98.3x</td><td class="r">77%</td></tr>
+<tr><td>256</td><td class="r">6,897</td><td class="r">37.1</td><td class="r">132.6x</td><td class="r">52%</td></tr>
+<tr><td>512</td><td class="r"><strong>7,943</strong></td><td class="r">64.5</td><td class="r">152.8x</td><td class="r">30%</td></tr>
 </tbody>
 </table>
 
@@ -562,8 +560,8 @@ No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 l
 <table>
 <thead><tr><th>Mode</th><th class="r">tok/s (B=1)</th><th class="r">ms/step</th><th class="r">Speedup</th></tr></thead>
 <tbody>
-<tr><td>CUDA graph (1776 nodes)</td><td class="r"><strong>51</strong></td><td class="r">19.7</td><td class="r">4.6x</td></tr>
-<tr><td>Eager (no graph)</td><td class="r">11</td><td class="r">90.4</td><td class="r">1.0x</td></tr>
+<tr><td>CUDA graph (~1400 nodes)</td><td class="r"><strong>52</strong></td><td class="r">19.2</td><td class="r">~4.7x</td></tr>
+<tr><td>Eager (no graph)</td><td class="r">11</td><td class="r">~91</td><td class="r">1.0x</td></tr>
 </tbody>
 </table>
 <div class="footnote">All 60 layers + lm_head + softcap captured into one <code>cuGraphLaunch</code>. Metadata (positions, slot_mapping, context_lens) updated via HtoD copy before each replay.</div>
