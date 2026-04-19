@@ -320,6 +320,12 @@ def main():
     parser.add_argument('--resume', default=None, help='Resume from checkpoint dir')
     args = parser.parse_args()
 
+    cache_dir = os.path.expanduser("~/.jax_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    jax.config.update("jax_compilation_cache_dir", cache_dir)
+    jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
+    print(f"XLA cache: {cache_dir}", file=sys.stderr)
+
     mesh = make_mesh()
     print(f"mesh: {mesh} ({len(jax.devices())} devices)", file=sys.stderr)
 
@@ -366,13 +372,14 @@ def main():
     print(f"draft head: {total_params:,} params ({total_params * 2 / 1e6:.0f} MB bf16)", file=sys.stderr)
 
     prefill_jit = jax.jit(prefill_features)
+    rep = NamedSharding(mesh, P())
 
     # All arrays use fixed shapes to avoid JIT recompilation.
     # Tokens always padded to max_seq; positions always positions_per_seq.
     print("compiling prefill...", file=sys.stderr, flush=True)
     t0 = time.time()
     test_padded, _ = pad_sequence(train_data[0], args.max_seq)
-    test_tok = jnp.array(test_padded, dtype=jnp.int32)
+    test_tok = jax.device_put(jnp.array(test_padded, dtype=jnp.int32), rep)
     _fl, _fm, _fh = prefill_jit(test_tok, embed, final_norm, weights,
                                  zero_kc, zero_vc, cos_s, sin_s, cos_g, sin_g)
     _fl.block_until_ready()
@@ -387,7 +394,7 @@ def main():
     t0 = time.time()
     test_fl, test_fm, test_fh = prefill_jit(test_tok, embed, final_norm, weights,
                                              zero_kc, zero_vc, cos_s, sin_s, cos_g, sin_g)
-    test_pos = jnp.zeros(args.positions_per_seq, dtype=jnp.int32)
+    test_pos = jax.device_put(jnp.zeros(args.positions_per_seq, dtype=jnp.int32), rep)
     test_loss, test_grads = loss_grad_fn(dw, test_tok, test_fl, test_fm, test_fh, test_pos)
     test_loss.block_until_ready()
     print(f"training compiled: {time.time()-t0:.1f}s, initial loss: {float(test_loss):.3f}", file=sys.stderr)
@@ -424,14 +431,15 @@ def main():
                 if seq_len < K_DRAFT + 2:
                     continue
 
-                tokens = jnp.array(padded, dtype=jnp.int32)
+                tokens = jax.device_put(jnp.array(padded, dtype=jnp.int32), rep)
                 fl, fm, fh = prefill_jit(tokens, embed, final_norm, weights,
                                           zero_kc, zero_vc, cos_s, sin_s, cos_g, sin_g)
 
                 max_start = max(seq_len - K_DRAFT - 1, 1)
                 pos_key = jax.random.PRNGKey(global_step * 1000 + int(idx))
-                positions = jax.random.randint(pos_key, shape=(args.positions_per_seq,),
-                                               minval=0, maxval=max_start)
+                positions = jax.device_put(
+                    jax.random.randint(pos_key, shape=(args.positions_per_seq,),
+                                       minval=0, maxval=max_start), rep)
 
                 loss, grads = loss_grad_fn(dw, tokens, fl, fm, fh, positions)
 

@@ -1058,6 +1058,12 @@ def main():
         print("ERROR: specify --draft-dir or --random-draft", file=sys.stderr)
         sys.exit(1)
 
+    cache_dir = os.path.expanduser("~/.jax_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    jax.config.update("jax_compilation_cache_dir", cache_dir)
+    jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
+    print(f"XLA cache: {cache_dir}", file=sys.stderr)
+
     mesh = make_mesh()
     print(f"mesh: {mesh} ({len(jax.devices())} devices)", file=sys.stderr)
 
