@@ -334,15 +334,14 @@ Other Gemma 4 specifics:
 - **GELU(tanh)** activation (not SiLU)
 - **Tied embeddings**: lm_head = embed_tokens.T
 
-### Gemma 4 forward pass (13 launches per layer)
+### Gemma 4 forward pass (17 launches per layer)
 
 ```
 For each layer in 0..60:
   1.  fused_rmsnorm_fp8_quant           input layernorm + FP8 quantize
   2.  fp8_gemm                          fused Q||K||V projection
   2b. f32_to_f16_sat                    GEMM F32 output to F16
-  3.  vnorm_f16                         parameter-free RMSNorm on V
-  4.  fused_qk_rmsnorm                  per-head RMSNorm on Q and K
+  3.  fused_qkv_rmsnorm                 Q/K norm (learned gamma) + V norm (parameter-free)
   5.  fused_rope_partial_f16kv          partial RoPE + F16 KV cache write
   6.  paged_decode (FA3)                attention (head_dim=256 sliding, 512 global)
   7.  quantize_fp8_per_token            attn output to FP8
@@ -362,7 +361,7 @@ Sampling tail:
   argmax_kernel                       token selection
 ```
 
-~13 launches per layer (down from 16 via kernel fusion). All captured into one `cuGraphLaunch` (~1400 nodes).
+17 launches per layer (down from 25 via kernel fusion). All captured into one `cuGraphLaunch` (~1350 nodes).
 
 ### GPU perplexity
 
@@ -428,6 +427,7 @@ Three rounds of fusion reduced graph nodes from 1776 to ~1400 (~21% reduction):
 | f32_to_bf16 + rmsnorm + vector_add -> fused_norm_add_residual | 3 -> 1 (x2/layer) | 240 |
 | scale_cols_f32 fused into norm+add kernel | 1 -> 0 (x4/layer) | 120 |
 | residual_scale_f16 fused into post-ff norm+add | 1 -> 0 (x1/layer) | 60 |
+| vnorm_f16 fused into qk_rmsnorm -> fused_qkv_rmsnorm | 2 -> 1 (x1/layer) | 60 |
 
 ### Kernels
 

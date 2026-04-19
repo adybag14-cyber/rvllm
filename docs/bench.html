@@ -194,7 +194,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
   </div>
   <div class="pill">
     <div class="label">Kernel fusion</div>
-    <strong>1776 -> ~1400 nodes</strong>
+    <strong>1776 -> ~1350 nodes</strong>
     <div class="caption">21% reduction, 3 fusion passes</div>
   </div>
 </div>
@@ -510,16 +510,15 @@ No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 l
 <h2 class="section">GPU: 31B Gemma 4 <span class="sub">H100 SXM 80GB, Rust+CUDA, FP8+F16</span> <span class="badge measured">Measured</span></h2>
 
 <div class="note-box">
-  <strong>FP8 weights + F16 KV cache.</strong> Per-channel FP8 weights from the RedHatAI/gemma-4-31B-it-FP8-Dynamic checkpoint with channelscale fused into post-norm kernels. F16 KV cache + F16 paged attention (FA3 SM90 for sliding, SM89 for global). All 60 layers captured in a single CUDA graph (~1400 nodes). <strong>7,943 tok/s</strong> peak (B=512), <strong>PPL 13.53</strong>. Per-layer KV cache sizing enables 128K context.
+  <strong>FP8 weights + F16 KV cache.</strong> Per-channel FP8 weights from the RedHatAI/gemma-4-31B-it-FP8-Dynamic checkpoint with channelscale fused into post-norm kernels. F16 KV cache + F16 paged attention (FA3 SM90 for sliding, SM89 for global). All 60 layers captured in a single CUDA graph (~1350 nodes). <strong>7,943 tok/s</strong> peak (B=512), <strong>PPL 13.53</strong>. Per-layer KV cache sizing enables 128K context.
 </div>
 
-<h3>31B Gemma 4 forward pass (~13 launches per layer)</h3>
+<h3>31B Gemma 4 forward pass (17 launches per layer)</h3>
 <div class="gpu-pipeline">
   <span class="step-num">1.</span><span class="step-desc"><code>fused_rmsnorm_fp8_quant</code> - input layernorm + FP8 quantize</span>
   <span class="step-num">2.</span><span class="step-desc"><code>fp8_gemm</code> + <code>f32_to_f16_sat</code> - fused Q||K||V projection</span>
-  <span class="step-num">3.</span><span class="step-desc"><code>vnorm_f16</code> - parameter-free RMSNorm on V</span>
-  <span class="step-num">4.</span><span class="step-desc"><code>fused_qk_rmsnorm</code> - per-head RMSNorm on Q and K</span>
-  <span class="step-num">5.</span><span class="step-desc"><code>fused_rope_partial_f16kv</code> - partial RoPE + F16 KV cache write</span>
+  <span class="step-num">3.</span><span class="step-desc"><code>fused_qkv_rmsnorm</code> - Q/K norm (learned gamma) + V norm (parameter-free)</span>
+  <span class="step-num">4.</span><span class="step-desc"><code>fused_rope_partial_f16kv</code> - partial RoPE + F16 KV cache write</span>
   <span class="step-num">6.</span><span class="step-desc"><code>paged_decode</code> (FA3) - attention (head_dim=256 sliding, 512 global)</span>
   <span class="step-num">7.</span><span class="step-desc"><code>quantize_fp8_per_token</code> - attn output to FP8</span>
   <span class="step-num">8.</span><span class="step-desc"><code>fp8_gemm</code> - O projection</span>
@@ -602,7 +601,7 @@ No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 l
 <table>
 <thead><tr><th>Mode</th><th class="r">tok/s (B=1)</th><th class="r">ms/step</th><th class="r">Speedup</th></tr></thead>
 <tbody>
-<tr><td>CUDA graph (~1400 nodes)</td><td class="r"><strong>52</strong></td><td class="r">19.2</td><td class="r">~4.7x</td></tr>
+<tr><td>CUDA graph (~1350 nodes)</td><td class="r"><strong>52</strong></td><td class="r">19.2</td><td class="r">~4.7x</td></tr>
 <tr><td>Eager (no graph)</td><td class="r">11</td><td class="r">~91</td><td class="r">1.0x</td></tr>
 </tbody>
 </table>
@@ -631,7 +630,7 @@ Batch sizes: 1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 256, 512, 768. Peak: 3,848 tok
 <strong>GPU pipeline</strong> (v3 codebase, Rust + CUDA):<br>
 Hardware: H100 SXM 80 GB.<br>
 Model: 31B Gemma 4, FP8 E4M3 weights (per-channel scale), F16 KV cache.<br>
-Forward: ~13 kernel launches per layer (post-fusion), 60 layers + lm_head + argmax = ~1400 nodes, captured in a single <code>cuGraphLaunch</code>.<br>
+Forward: ~13 kernel launches per layer (post-fusion), 60 layers + lm_head + argmax = ~1350 nodes, captured in a single <code>cuGraphLaunch</code>.<br>
 Kernels: cuBLASLt FP8 GEMMs (SM90), FlashAttention-3, custom fused ops (RMSNorm+quant, RoPE+KV, GELU*mul+quant, norm+channelscale+residual+scalar, logit softcap).<br>
 Per-layer KV: sliding layers capped at 32 blocks (1024 tokens), global layers get full context. Enables 128K on single 80GB GPU.<br>
 </div>
