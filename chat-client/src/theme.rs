@@ -14,6 +14,18 @@ pub const BORDER: Color32 = Color32::from_rgb(50, 50, 65);
 pub const SUCCESS: Color32 = Color32::from_rgb(52, 211, 153);
 pub const ERROR: Color32 = Color32::from_rgb(248, 113, 113);
 
+// Pane accent colors
+pub const GPU_ACCENT: Color32 = Color32::from_rgb(70, 130, 230);
+pub const GPU_BORDER: Color32 = Color32::from_rgb(45, 80, 140);
+pub const GPU_HEADER_BG: Color32 = Color32::from_rgb(18, 25, 42);
+
+pub const TPU_ACCENT: Color32 = Color32::from_rgb(52, 211, 153);
+pub const TPU_BORDER: Color32 = Color32::from_rgb(30, 110, 80);
+pub const TPU_HEADER_BG: Color32 = Color32::from_rgb(16, 30, 24);
+
+pub const RACE_TIMER: Color32 = Color32::from_rgb(255, 200, 60);
+pub const WINNER_GOLD: Color32 = Color32::from_rgb(255, 215, 0);
+
 pub fn apply_theme(ctx: &egui::Context) {
     let mut style = Style::default();
 
