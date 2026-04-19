@@ -549,19 +549,30 @@ impl Gemma4Bringup {
 
         // Timed
         let no_graph = std::env::var("RVLLM_NO_GRAPH").ok().as_deref() == Some("1");
-        let t0 = std::time::Instant::now();
-        if no_graph {
+        let elapsed = if no_graph {
+            let t0 = std::time::Instant::now();
             for _ in 0..iters {
                 one_step().unwrap();
             }
+            self.stream.fence().unwrap();
+            t0.elapsed()
         } else {
-            // Graph capture not yet wired for Gemma4 — run eager
+            let graph = rvllm_graph::CapturedGraph::capture(
+                num_seqs,
+                max_blocks_per_seq,
+                rvllm_metadata::MetadataLayout::compute(num_seqs, max_blocks_per_seq).hash(),
+                rvllm_graph::GraphFingerprint([0u8; 32]),
+                stream,
+                || one_step(),
+            ).unwrap();
+            self.stream.fence().unwrap();
+            let t0 = std::time::Instant::now();
             for _ in 0..iters {
-                one_step().unwrap();
+                graph.replay(stream).unwrap();
             }
-        }
-        self.stream.fence().unwrap();
-        let elapsed = t0.elapsed();
+            self.stream.fence().unwrap();
+            t0.elapsed()
+        };
 
         crate::bring_up::BenchResult {
             ns_per_step: elapsed.as_nanos() / iters.max(1) as u128,

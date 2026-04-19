@@ -123,11 +123,8 @@ impl Bringup {
         // can try any of them without re-bringup. If a symbol is
         // missing from the .so the load path returns typed err — that's
         // expected for a sweep run against a .so without some variant.
-        let mut variants: std::collections::BTreeSet<_> = policy
-            .entries
-            .values()
-            .map(|e| e.variant)
-            .collect();
+        let mut variants: std::collections::BTreeSet<_> =
+            policy.entries.values().map(|e| e.variant).collect();
         for v in 0..16u32 {
             variants.insert(rvllm_cutlass::VariantId(v));
         }
@@ -139,8 +136,7 @@ impl Bringup {
 
         // cuBLASLt workspace: 32 MiB is recommended for Hopper FP8.
         let cublaslt_ws_bytes: usize = 32 * 1024 * 1024;
-        let cublaslt_ws_region =
-            arena.region("cublaslt_ws", cublaslt_ws_bytes, 256)?;
+        let cublaslt_ws_region = arena.region("cublaslt_ws", cublaslt_ws_bytes, 256)?;
         let cublaslt = CublasLt::new(cublaslt_ws_region.device_ptr(), cublaslt_ws_bytes)?;
         // Keep offset for audit; Region lifetime is tied to arena
         // which lives as long as Bringup.
@@ -235,8 +231,7 @@ impl Bringup {
         // one multi-query FA3 prefill over `prefill_len` tokens per seq
         // before the decode loop, instead of 16 eager decode steps.
         // Scratch must fit max(num_seqs, num_seqs * prefill_len) tokens.
-        let real_prefill: bool =
-            std::env::var("RVLLM_REAL_PREFILL").ok().as_deref() == Some("1");
+        let real_prefill: bool = std::env::var("RVLLM_REAL_PREFILL").ok().as_deref() == Some("1");
         let prefill_len: u32 = std::env::var("RVLLM_PREFILL_LEN")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -272,8 +267,7 @@ impl Bringup {
         let attn_out = arena.region("attn_out", (max_tokens * q_dim * 2) as usize, 16)?;
         let attn_out_fp8 = arena.region("attn_out_fp8", (max_tokens * q_dim) as usize, 16)?;
         let attn_out_scale = arena.region("attn_out_scale", (max_tokens * 4) as usize, 16)?;
-        let gate_up_out =
-            arena.region("gate_up_out", (max_tokens * 2 * inter * 2) as usize, 16)?;
+        let gate_up_out = arena.region("gate_up_out", (max_tokens * 2 * inter * 2) as usize, 16)?;
         let gate_up_fp8 = arena.region("gate_up_fp8", (max_tokens * 2 * inter) as usize, 16)?;
         let gate_up_scale = arena.region("gate_up_scale", (max_tokens * 4) as usize, 16)?;
         let mlp_out_fp8 = arena.region("mlp_out_fp8", (max_tokens * inter) as usize, 16)?;
@@ -555,8 +549,14 @@ impl Bringup {
                             residual_ptr,
                             16,
                         );
-                        let nan_count = sample.iter().filter(|&&v| (v & 0x7C00) == 0x7C00 && (v & 0x03FF) != 0).count();
-                        let inf_count = sample.iter().filter(|&&v| v == 0x7C00 || v == 0xFC00).count();
+                        let nan_count = sample
+                            .iter()
+                            .filter(|&&v| (v & 0x7C00) == 0x7C00 && (v & 0x03FF) != 0)
+                            .count();
+                        let inf_count = sample
+                            .iter()
+                            .filter(|&&v| v == 0x7C00 || v == 0xFC00)
+                            .count();
                         if nan_count > 0 || inf_count > 0 {
                             eprintln!("[NaN] layer {layer_idx}: {nan_count} NaN, {inf_count} Inf in residual[0..8] = {:04X?}", sample);
                         }
@@ -630,8 +630,7 @@ impl Bringup {
             .unwrap_or(16);
         #[allow(non_snake_case)]
         let FAUX_PREFILL_STEPS = faux_prefill_steps;
-        let measure_ttft: bool =
-            std::env::var("RVLLM_TTFT").ok().as_deref() == Some("1");
+        let measure_ttft: bool = std::env::var("RVLLM_TTFT").ok().as_deref() == Some("1");
 
         // Pinned host buffer so we can DtoH the sampled tokens without
         // implicit host-side blocking (needed for a tight TTFT reading).
@@ -657,11 +656,7 @@ impl Bringup {
         // per-token positions + per-token slot_mapping + per-seq
         // context_lens = prefill_len.
         let cu_seqlens_q_region = if real_prefill {
-            Some(arena.region(
-                "cu_seqlens_q",
-                ((num_seqs as usize + 1) * 4) as usize,
-                16,
-            )?)
+            Some(arena.region("cu_seqlens_q", ((num_seqs as usize + 1) * 4) as usize, 16)?)
         } else {
             None
         };
@@ -812,8 +807,14 @@ impl Bringup {
             )?;
             self.stream.fence()?;
             let first5: Vec<f32> = logits_host[..5].iter().map(|&b| f16_to_f32(b)).collect();
-            let nan_count = logits_host.iter().filter(|&&b| f16_to_f32(b).is_nan()).count();
-            eprintln!("[LOGITS] nan={}/{} first5={:?}", nan_count, logits_elems, &first5);
+            let nan_count = logits_host
+                .iter()
+                .filter(|&&b| f16_to_f32(b).is_nan())
+                .count();
+            eprintln!(
+                "[LOGITS] nan={}/{} first5={:?}",
+                nan_count, logits_elems, &first5
+            );
         }
 
         Ok(BenchResult {
@@ -910,8 +911,7 @@ impl Bringup {
         let attn_out = arena.region("attn_out", (max_tokens * q_dim * 2) as usize, 16)?;
         let attn_out_fp8 = arena.region("attn_out_fp8", (max_tokens * q_dim) as usize, 16)?;
         let attn_out_scale = arena.region("attn_out_scale", (max_tokens * 4) as usize, 16)?;
-        let gate_up_out =
-            arena.region("gate_up_out", (max_tokens * 2 * inter * 2) as usize, 16)?;
+        let gate_up_out = arena.region("gate_up_out", (max_tokens * 2 * inter * 2) as usize, 16)?;
         let gate_up_fp8 = arena.region("gate_up_fp8", (max_tokens * 2 * inter) as usize, 16)?;
         let gate_up_scale = arena.region("gate_up_scale", (max_tokens * 4) as usize, 16)?;
         let mlp_out_fp8 = arena.region("mlp_out_fp8", (max_tokens * inter) as usize, 16)?;
@@ -968,16 +968,32 @@ impl Bringup {
         }
 
         let plan_qkv = Fp8GemmPlan::from_policy(
-            &self.policy, num_seqs, qkv_rows, hidden, rvllm_core::DType::Fp8E4M3,
+            &self.policy,
+            num_seqs,
+            qkv_rows,
+            hidden,
+            rvllm_core::DType::Fp8E4M3,
         )?;
         let plan_o = Fp8GemmPlan::from_policy_residual(
-            &self.policy, num_seqs, hidden, q_dim, rvllm_core::DType::Fp8E4M3,
+            &self.policy,
+            num_seqs,
+            hidden,
+            q_dim,
+            rvllm_core::DType::Fp8E4M3,
         )?;
         let plan_gate_up = Fp8GemmPlan::from_policy(
-            &self.policy, num_seqs, 2 * inter, hidden, rvllm_core::DType::Fp8E4M3,
+            &self.policy,
+            num_seqs,
+            2 * inter,
+            hidden,
+            rvllm_core::DType::Fp8E4M3,
         )?;
         let plan_down = Fp8GemmPlan::from_policy_residual(
-            &self.policy, num_seqs, hidden, inter, rvllm_core::DType::Fp8E4M3,
+            &self.policy,
+            num_seqs,
+            hidden,
+            inter,
+            rvllm_core::DType::Fp8E4M3,
         )?;
         let vocab = arch.vocab_size as u32;
 
@@ -1068,9 +1084,17 @@ impl Bringup {
                     context_lens: context_lens.device_ptr(),
                 };
                 layer_exec::forward_phase(
-                    dims, &kernels, &w, &scratch, &meta, &plans,
-                    &self.cutlass, &self.cublaslt, &self.fa3,
-                    residual_ptr, stream,
+                    dims,
+                    &kernels,
+                    &w,
+                    &scratch,
+                    &meta,
+                    &plans,
+                    &self.cutlass,
+                    &self.cublaslt,
+                    &self.fa3,
+                    residual_ptr,
+                    stream,
                     layer_exec::LayerPhase::Decode,
                     self.arch.layer_types[layer_idx],
                 )?;
@@ -1080,33 +1104,41 @@ impl Bringup {
                     let mut s = [0u16; 4];
                     cudarc::driver::sys::cuMemcpyDtoH_v2(s.as_mut_ptr() as *mut _, residual_ptr, 8);
                     let v: Vec<f32> = s.iter().map(|&x| f16_to_f32(x)).collect();
-                    eprintln!("  L{layer_idx}: [{:.4}, {:.4}, {:.4}, {:.4}]", v[0], v[1], v[2], v[3]);
+                    eprintln!(
+                        "  L{layer_idx}: [{:.4}, {:.4}, {:.4}, {:.4}]",
+                        v[0], v[1], v[2], v[3]
+                    );
                     if layer_idx == 0 {
                         // Read back the per-token activation scale and weight scales
                         let mut act_scale_val = [0f32; 1];
                         cudarc::driver::sys::cuMemcpyDtoH_v2(
                             act_scale_val.as_mut_ptr() as *mut _,
-                            hidden_scale.device_ptr(), 4,
+                            hidden_scale.device_ptr(),
+                            4,
                         );
                         let mut wt_qkv_scale = [0f32; 1];
                         cudarc::driver::sys::cuMemcpyDtoH_v2(
                             wt_qkv_scale.as_mut_ptr() as *mut _,
-                            layer.qkv.scale_ptr, 4,
+                            layer.qkv.scale_ptr,
+                            4,
                         );
                         let mut wt_o_scale = [0f32; 1];
                         cudarc::driver::sys::cuMemcpyDtoH_v2(
                             wt_o_scale.as_mut_ptr() as *mut _,
-                            layer.o_proj.scale_ptr, 4,
+                            layer.o_proj.scale_ptr,
+                            4,
                         );
                         let mut wt_gu_scale = [0f32; 1];
                         cudarc::driver::sys::cuMemcpyDtoH_v2(
                             wt_gu_scale.as_mut_ptr() as *mut _,
-                            layer.gate_up.scale_ptr, 4,
+                            layer.gate_up.scale_ptr,
+                            4,
                         );
                         let mut wt_dn_scale = [0f32; 1];
                         cudarc::driver::sys::cuMemcpyDtoH_v2(
                             wt_dn_scale.as_mut_ptr() as *mut _,
-                            layer.down_proj.scale_ptr, 4,
+                            layer.down_proj.scale_ptr,
+                            4,
                         );
                         eprintln!(
                             "  [DBG L0] act_scale(hidden)={:.6e} wt_qkv={:.6e} wt_o={:.6e} wt_gu={:.6e} wt_dn={:.6e}",
@@ -1114,7 +1146,10 @@ impl Bringup {
                         );
                         eprintln!(
                             "  [DBG L0] rust-side scales: qkv={:.6e} o={:.6e} gu={:.6e} dn={:.6e}",
-                            layer.qkv.scale, layer.o_proj.scale, layer.gate_up.scale, layer.down_proj.scale,
+                            layer.qkv.scale,
+                            layer.o_proj.scale,
+                            layer.gate_up.scale,
+                            layer.down_proj.scale,
                         );
                     }
                 }
@@ -1194,22 +1229,30 @@ impl Bringup {
                     cudarc::driver::sys::cuStreamSynchronize(stream as _);
                     let mut emb = [0u16; 8];
                     cudarc::driver::sys::cuMemcpyDtoH_v2(
-                        emb.as_mut_ptr() as *mut _, residual_ptr, 16,
+                        emb.as_mut_ptr() as *mut _,
+                        residual_ptr,
+                        16,
                     );
                     let vals: Vec<f32> = emb.iter().map(|&x| f16_to_f32(x)).collect();
                     let mut amax = 0f32;
                     let n = hidden as usize;
                     let mut all_emb = vec![0u16; n];
                     cudarc::driver::sys::cuMemcpyDtoH_v2(
-                        all_emb.as_mut_ptr() as *mut _, residual_ptr, (n * 2) as _,
+                        all_emb.as_mut_ptr() as *mut _,
+                        residual_ptr,
+                        (n * 2) as _,
                     );
                     for &v in &all_emb {
                         let f = f16_to_f32(v).abs();
-                        if f > amax && !f.is_nan() { amax = f; }
+                        if f > amax && !f.is_nan() {
+                            amax = f;
+                        }
                     }
                     eprintln!(
                         "  [DBG t=0] embed first8={:.4?} amax={:.4} expected_scale={:.6e}",
-                        &vals[..4], amax, amax / 448.0,
+                        &vals[..4],
+                        amax,
+                        amax / 448.0,
                     );
                 }
             }
@@ -1230,12 +1273,31 @@ impl Bringup {
 
                 let target = token_ids[t + 1] as usize;
                 if t == 0 {
-                    let first5: Vec<f32> = logits_host[..5].iter().map(|&b| f16_to_f32(b)).collect();
-                    let max_val = logits_host.iter().map(|&b| f16_to_f32(b)).filter(|v| !v.is_nan()).fold(f32::MIN, f32::max);
-                    let min_val = logits_host.iter().map(|&b| f16_to_f32(b)).filter(|v| !v.is_nan()).fold(f32::MAX, f32::min);
+                    let first5: Vec<f32> =
+                        logits_host[..5].iter().map(|&b| f16_to_f32(b)).collect();
+                    let max_val = logits_host
+                        .iter()
+                        .map(|&b| f16_to_f32(b))
+                        .filter(|v| !v.is_nan())
+                        .fold(f32::MIN, f32::max);
+                    let min_val = logits_host
+                        .iter()
+                        .map(|&b| f16_to_f32(b))
+                        .filter(|v| !v.is_nan())
+                        .fold(f32::MAX, f32::min);
                     let target_logit = f16_to_f32(logits_host[token_ids[t + 1] as usize]);
-                    eprintln!("  [DBG] logits: first5={:?} min={:.1} max={:.1} target[{}]={:.1}", first5, min_val, max_val, token_ids[t+1], target_logit);
-                    let nan_count = logits_host.iter().filter(|&&b| f16_to_f32(b).is_nan()).count();
+                    eprintln!(
+                        "  [DBG] logits: first5={:?} min={:.1} max={:.1} target[{}]={:.1}",
+                        first5,
+                        min_val,
+                        max_val,
+                        token_ids[t + 1],
+                        target_logit
+                    );
+                    let nan_count = logits_host
+                        .iter()
+                        .filter(|&&b| f16_to_f32(b).is_nan())
+                        .count();
                     if nan_count > 0 {
                         eprintln!(
                             "  WARNING: {}/{} logits are NaN (first5={:?}). FP8 precision issue.",
@@ -1251,7 +1313,9 @@ impl Bringup {
                     let running_ppl = (total_nll / n_evaluated as f64).exp();
                     eprintln!(
                         "  step {}/{}: running_ppl={:.4}",
-                        t + 1, token_ids.len(), running_ppl
+                        t + 1,
+                        token_ids.len(),
+                        running_ppl
                     );
                 }
             } else {
@@ -1264,7 +1328,11 @@ impl Bringup {
         } else {
             0.0
         };
-        Ok(PplResult { ppl, total_nll, n_evaluated })
+        Ok(PplResult {
+            ppl,
+            total_nll,
+            n_evaluated,
+        })
     }
 
     #[cfg(not(feature = "cuda"))]
@@ -1273,7 +1341,11 @@ impl Bringup {
         _fn_embed: rvllm_kernels::KernelFn,
         _token_ids: &[u32],
     ) -> Result<PplResult> {
-        Ok(PplResult { ppl: 0.0, total_nll: 0.0, n_evaluated: 0 })
+        Ok(PplResult {
+            ppl: 0.0,
+            total_nll: 0.0,
+            n_evaluated: 0,
+        })
     }
 }
 
@@ -1313,9 +1385,7 @@ fn bytemuck_cast_i32(v: &[i32]) -> &[u8] {
 #[cfg(feature = "cuda")]
 pub(crate) fn dtoh_async_sync(src: u64, dst: *mut i32, bytes: usize, stream: u64) -> Result<()> {
     use cudarc::driver::sys::*;
-    let r = unsafe {
-        cuMemcpyDtoHAsync_v2(dst as *mut _, src, bytes, stream as CUstream)
-    };
+    let r = unsafe { cuMemcpyDtoHAsync_v2(dst as *mut _, src, bytes, stream as CUstream) };
     if r != CUresult::CUDA_SUCCESS {
         return Err(rvllm_core::RvllmError::cuda(
             "cuMemcpyDtoHAsync",
@@ -1331,7 +1401,9 @@ pub(crate) fn compute_nll_f16(logits_f16: &[u16], target: usize) -> f64 {
     let mut max_val: f32 = f32::NEG_INFINITY;
     for &bits in logits_f16.iter() {
         let v = f16_to_f32(bits);
-        if v > max_val { max_val = v; }
+        if v > max_val {
+            max_val = v;
+        }
     }
     let mut sum_exp: f64 = 0.0;
     for &bits in logits_f16.iter() {
@@ -1357,10 +1429,15 @@ pub fn f16_to_f32(bits: u16) -> f32 {
     let exp = ((bits >> 10) & 0x1f) as u32;
     let mant = (bits & 0x3ff) as u32;
     if exp == 0 {
-        if mant == 0 { return f32::from_bits(sign << 31); }
+        if mant == 0 {
+            return f32::from_bits(sign << 31);
+        }
         let mut m = mant;
         let mut e: i32 = 1;
-        while (m & 0x400) == 0 { m <<= 1; e -= 1; }
+        while (m & 0x400) == 0 {
+            m <<= 1;
+            e -= 1;
+        }
         m &= 0x3ff;
         let f32_exp = (127 - 15 + e) as u32;
         return f32::from_bits((sign << 31) | (f32_exp << 23) | (m << 13));

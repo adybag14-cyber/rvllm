@@ -18,8 +18,7 @@
 use rvllm_core::Result;
 use rvllm_cutlass::{CublasLt, CutlassLib, Fp8GemmPlan};
 use rvllm_fused::{
-    ArgmaxLaunch, FusedAddRmsnormFp8QuantLaunch, FusedRopeKvWriteLaunch,
-    FusedSiluMulFp8QuantLaunch,
+    ArgmaxLaunch, FusedAddRmsnormFp8QuantLaunch, FusedRopeKvWriteLaunch, FusedSiluMulFp8QuantLaunch,
 };
 use rvllm_kernels::KernelFn;
 pub use rvllm_loader::{LayerAttnType, MlpActivation};
@@ -77,14 +76,14 @@ pub struct LayerWeights {
 pub struct LayerScratch {
     pub hidden_fp8: u64,
     pub hidden_scale: u64,
-    pub q_out: u64,         // f16, QKV GEMM output (Q half)
-    pub k_out: u64,         // f16, QKV GEMM output (K half)
-    pub v_out: u64,         // f16, QKV GEMM output (V half)
-    pub q_fp8: u64,         // fp8, post-rope Q consumed by FA3 (FP8 KV path)
-    pub k_cache: u64,       // fp8 (1 byte/elem) paged K cache, this layer's base
-    pub v_cache: u64,       // fp8 (1 byte/elem) paged V cache, this layer's base
-    pub q_scale_ptr: u64,   // f32 per-tensor scale for Q (used by rope + FA3)
-    pub kv_scale_ptr: u64,  // f32 per-tensor scale for K and V (shared)
+    pub q_out: u64,        // f16, QKV GEMM output (Q half)
+    pub k_out: u64,        // f16, QKV GEMM output (K half)
+    pub v_out: u64,        // f16, QKV GEMM output (V half)
+    pub q_fp8: u64,        // fp8, post-rope Q consumed by FA3 (FP8 KV path)
+    pub k_cache: u64,      // fp8 (1 byte/elem) paged K cache, this layer's base
+    pub v_cache: u64,      // fp8 (1 byte/elem) paged V cache, this layer's base
+    pub q_scale_ptr: u64,  // f32 per-tensor scale for Q (used by rope + FA3)
+    pub kv_scale_ptr: u64, // f32 per-tensor scale for K and V (shared)
     pub attn_out: u64,
     pub attn_out_fp8: u64,
     pub attn_out_scale: u64,
@@ -124,9 +123,9 @@ pub struct LayerKernels {
 pub struct LayerGemmPlans {
     /// Fused Q||K||V projection: N = (num_heads + 2*num_kv_heads) * head_dim.
     pub qkv: Fp8GemmPlan,
-    pub o: Fp8GemmPlan,        // residual-fused
+    pub o: Fp8GemmPlan, // residual-fused
     pub gate_up: Fp8GemmPlan,
-    pub down: Fp8GemmPlan,     // residual-fused
+    pub down: Fp8GemmPlan, // residual-fused
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -217,15 +216,24 @@ pub unsafe fn forward_phase(
     let dbg_l0 = false;
 
     #[cfg(feature = "cuda")]
-    if dbg_l0 { unsafe {
-        cudarc::driver::sys::cuStreamSynchronize(stream as _);
-        let mut s = [0u16; 4];
-        cudarc::driver::sys::cuMemcpyDtoH_v2(s.as_mut_ptr() as *mut _, residual, 8);
-        let v: Vec<f32> = s.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect();
-        eprintln!("  [L0] input_residual: [{:.6}, {:.6}, {:.6}, {:.6}]", v[0], v[1], v[2], v[3]);
-        let mut sc = [0f32; 1];
-        cudarc::driver::sys::cuMemcpyDtoH_v2(sc.as_mut_ptr() as *mut _, scratch.hidden_scale, 4);
-    }}
+    if dbg_l0 {
+        unsafe {
+            cudarc::driver::sys::cuStreamSynchronize(stream as _);
+            let mut s = [0u16; 4];
+            cudarc::driver::sys::cuMemcpyDtoH_v2(s.as_mut_ptr() as *mut _, residual, 8);
+            let v: Vec<f32> = s.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect();
+            eprintln!(
+                "  [L0] input_residual: [{:.6}, {:.6}, {:.6}, {:.6}]",
+                v[0], v[1], v[2], v[3]
+            );
+            let mut sc = [0f32; 1];
+            cudarc::driver::sys::cuMemcpyDtoH_v2(
+                sc.as_mut_ptr() as *mut _,
+                scratch.hidden_scale,
+                4,
+            );
+        }
+    }
 
     // 2. Fused Q||K||V projection + f16 bias via cuBLASLt (one launch
     //    replaces cutlass_fp8_gemm + add_bias_f16). Output is packed
@@ -266,16 +274,25 @@ pub unsafe fn forward_phase(
     }
 
     #[cfg(feature = "cuda")]
-    if dbg_l0 { unsafe {
-        cudarc::driver::sys::cuStreamSynchronize(stream as _);
-        let mut s = [0u16; 4];
-        cudarc::driver::sys::cuMemcpyDtoH_v2(s.as_mut_ptr() as *mut _, scratch.q_out, 8);
-        let v: Vec<f32> = s.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect();
-        eprintln!("  [L0] after_qkv_gemm(Q[:4]): [{:.6}, {:.6}, {:.6}, {:.6}]", v[0], v[1], v[2], v[3]);
-        let mut sc = [0f32; 1];
-        cudarc::driver::sys::cuMemcpyDtoH_v2(sc.as_mut_ptr() as *mut _, scratch.hidden_scale, 4);
-        eprintln!("  [L0] hidden_scale[0] = {:.6e}", sc[0]);
-    }}
+    if dbg_l0 {
+        unsafe {
+            cudarc::driver::sys::cuStreamSynchronize(stream as _);
+            let mut s = [0u16; 4];
+            cudarc::driver::sys::cuMemcpyDtoH_v2(s.as_mut_ptr() as *mut _, scratch.q_out, 8);
+            let v: Vec<f32> = s.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect();
+            eprintln!(
+                "  [L0] after_qkv_gemm(Q[:4]): [{:.6}, {:.6}, {:.6}, {:.6}]",
+                v[0], v[1], v[2], v[3]
+            );
+            let mut sc = [0f32; 1];
+            cudarc::driver::sys::cuMemcpyDtoH_v2(
+                sc.as_mut_ptr() as *mut _,
+                scratch.hidden_scale,
+                4,
+            );
+            eprintln!("  [L0] hidden_scale[0] = {:.6e}", sc[0]);
+        }
+    }
 
     // 5. RoPE q/k + FP8-quantize Q + write FP8 K/V into paged cache.
     rvllm_fused::FusedRopeCacheFp8KvLaunch {
@@ -374,13 +391,18 @@ pub unsafe fn forward_phase(
     }
 
     #[cfg(feature = "cuda")]
-    if dbg_l0 { unsafe {
-        cudarc::driver::sys::cuStreamSynchronize(stream as _);
-        let mut s = [0u16; 4];
-        cudarc::driver::sys::cuMemcpyDtoH_v2(s.as_mut_ptr() as *mut _, scratch.attn_out, 8);
-        let v: Vec<f32> = s.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect();
-        eprintln!("  [L0] after_fa3(attn_out[:4]): [{:.6}, {:.6}, {:.6}, {:.6}]", v[0], v[1], v[2], v[3]);
-    }}
+    if dbg_l0 {
+        unsafe {
+            cudarc::driver::sys::cuStreamSynchronize(stream as _);
+            let mut s = [0u16; 4];
+            cudarc::driver::sys::cuMemcpyDtoH_v2(s.as_mut_ptr() as *mut _, scratch.attn_out, 8);
+            let v: Vec<f32> = s.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect();
+            eprintln!(
+                "  [L0] after_fa3(attn_out[:4]): [{:.6}, {:.6}, {:.6}, {:.6}]",
+                v[0], v[1], v[2], v[3]
+            );
+        }
+    }
 
     // 7. quantize attn_out -> fp8 (per-token).
     rvllm_fused::QuantizeFp8PerTokenLaunch {
@@ -411,13 +433,18 @@ pub unsafe fn forward_phase(
     )?;
 
     #[cfg(feature = "cuda")]
-    if dbg_l0 { unsafe {
-        cudarc::driver::sys::cuStreamSynchronize(stream as _);
-        let mut s = [0u16; 4];
-        cudarc::driver::sys::cuMemcpyDtoH_v2(s.as_mut_ptr() as *mut _, residual, 8);
-        let v: Vec<f32> = s.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect();
-        eprintln!("  [L0] after_oproj_residual[:4]: [{:.6}, {:.6}, {:.6}, {:.6}]", v[0], v[1], v[2], v[3]);
-    }}
+    if dbg_l0 {
+        unsafe {
+            cudarc::driver::sys::cuStreamSynchronize(stream as _);
+            let mut s = [0u16; 4];
+            cudarc::driver::sys::cuMemcpyDtoH_v2(s.as_mut_ptr() as *mut _, residual, 8);
+            let v: Vec<f32> = s.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect();
+            eprintln!(
+                "  [L0] after_oproj_residual[:4]: [{:.6}, {:.6}, {:.6}, {:.6}]",
+                v[0], v[1], v[2], v[3]
+            );
+        }
+    }
 
     // 9. pre-MLP norm + fp8 quant (norm-only, O-proj epilogue already
     //    added to residual).
@@ -453,7 +480,7 @@ pub unsafe fn forward_phase(
     let act_kernel = match kernels.mlp_activation {
         MlpActivation::SiLU => kernels.fused_silu_mul,
         MlpActivation::GELUTanh => kernels.fused_gelu_mul.expect(
-            "model requires GELU(tanh) activation but fused_gelu_mul_fp8_quant.ptx not loaded"
+            "model requires GELU(tanh) activation but fused_gelu_mul_fp8_quant.ptx not loaded",
         ),
     };
     FusedSiluMulFp8QuantLaunch {

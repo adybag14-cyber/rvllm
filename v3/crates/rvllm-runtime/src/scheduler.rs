@@ -101,7 +101,11 @@ impl Scheduler {
         let mut context_lens = Vec::with_capacity(active.len());
         for r in &active {
             req_ids.push(r.id);
-            last_tokens.push(*r.output_tokens.last().unwrap_or(&r.prompt_tokens[r.prompt_tokens.len() - 1]));
+            last_tokens.push(
+                *r.output_tokens
+                    .last()
+                    .unwrap_or(&r.prompt_tokens[r.prompt_tokens.len() - 1]),
+            );
             positions.push(r.context_len() - 1);
             context_lens.push(r.context_len());
         }
@@ -154,7 +158,9 @@ mod tests {
         }
         // After commit of first prefill round, next schedule is Decode.
         match s.schedule() {
-            BatchPlan::Decode { req_ids, bucket, .. } => {
+            BatchPlan::Decode {
+                req_ids, bucket, ..
+            } => {
                 assert_eq!(req_ids.len(), 2);
                 assert_eq!(bucket, 2);
             }

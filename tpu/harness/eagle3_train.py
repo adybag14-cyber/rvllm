@@ -173,7 +173,7 @@ def ttt_loss(dw, tokens, feat_low, feat_mid, feat_high, positions, embed, cos_s,
     x_prev = jnp.zeros((P_, H), dtype=jnp.bfloat16)
 
     for d in range(K_DRAFT):
-        if d < 2:
+        if d < 3:
             g = g_target
         else:
             g = jax.lax.stop_gradient(x_prev)
