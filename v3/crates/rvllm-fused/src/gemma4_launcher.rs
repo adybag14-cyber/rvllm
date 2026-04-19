@@ -461,6 +461,48 @@ impl FusedNormAddResidualLaunch {
 }
 
 // ---------------------------------------------------------------------------
+// fused_norm_add_residual_f16: scale_cols + rmsnorm + add-to-residual
+// Takes F16 GEMM output + per-channel scale, fuses norm + residual add.
+// ---------------------------------------------------------------------------
+
+pub struct FusedNormAddResidualF16Launch {
+    pub num_tokens: u32,
+    pub hidden: u32,
+    pub eps: f32,
+}
+
+impl FusedNormAddResidualF16Launch {
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        gemm_out_f16: u64,
+        channelscale: u64,
+        gamma: u64,
+        residual: u64,
+        stream: u64,
+    ) -> Result<()> {
+        let mut gemm_out_f16 = gemm_out_f16;
+        let mut channelscale = channelscale;
+        let mut gamma = gamma;
+        let mut residual = residual;
+        let mut hidden = self.hidden as i32;
+        let mut eps = self.eps;
+        let args = [
+            (&mut gemm_out_f16) as *mut u64 as *mut core::ffi::c_void,
+            (&mut channelscale) as *mut u64 as *mut core::ffi::c_void,
+            (&mut gamma) as *mut u64 as *mut core::ffi::c_void,
+            (&mut residual) as *mut u64 as *mut core::ffi::c_void,
+            (&mut hidden) as *mut i32 as *mut core::ffi::c_void,
+            (&mut eps) as *mut f32 as *mut core::ffi::c_void,
+        ];
+        let block = (self.hidden.min(1024), 1, 1);
+        let grid = (self.num_tokens, 1, 1);
+        let smem = self.hidden * 4;
+        launch_raw(kernel, grid, block, smem, stream, &args)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // bf16_to_f16_sat (bf16 -> f16 with saturation clamp)
 // ---------------------------------------------------------------------------
 

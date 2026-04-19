@@ -154,6 +154,7 @@ pub struct Gemma4LayerKernels {
     pub fused_gelu_mul_f16: KernelFn,
     pub fused_rope_partial_f16kv: KernelFn,
     pub fused_norm_add_residual: KernelFn,
+    pub fused_norm_add_residual_f16: KernelFn,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -576,63 +577,38 @@ pub unsafe fn gemma4_forward_phase(
         )?;
     }
 
-    // 7. O proj -> F32 tmp -> BF16 delta buffer
-    #[cfg(feature = "cuda")]
-    probe_f32!("step6_attn_out_scale", scratch.attn_out_scale);
-    #[cfg(feature = "cuda")]
-    probe_f32!("step7_o_wscale", weights.o_scale);
+    // 7-8. O proj + channelscale + post_attn norm + residual add
     #[cfg(feature = "cuda")]
     if weights.o_f16 != 0 {
         cublaslt.f16_gemm_f32(
-            scratch.attn_out,
-            weights.o_f16,
-            scratch.gemm_f32_tmp,
-            dims.num_tokens as i32,
-            dims.hidden as i32,
-            q_dim as i32,
-            stream,
+            scratch.attn_out, weights.o_f16, scratch.gemm_f32_tmp,
+            dims.num_tokens as i32, dims.hidden as i32, q_dim as i32, stream,
         )?;
+        gemma4_launcher::FusedNormAddResidualLaunch {
+            num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
+        }.launch(kernels.fused_norm_add_residual, scratch.gemm_f32_tmp,
+            weights.post_attn_norm_gamma, residual, stream)?;
     } else if weights.o_chscale != 0 {
-        fp8_gemm_f32_with_channelscale_fallback(
-            cublaslt,
-            kernels.scale_cols_f32,
-            scratch.attn_out_fp8,
-            weights.o_fp8,
-            scratch.gemm_f32_tmp,
-            dims.num_tokens as i32,
-            dims.hidden as i32,
-            q_dim as i32,
-            scratch.attn_out_scale,
-            weights.o_scale,
-            weights.o_chscale,
-            stream,
+        cublaslt.fp8_gemm_f32(
+            scratch.attn_out_fp8, weights.o_fp8, scratch.gemm_f32_tmp,
+            dims.num_tokens as i32, dims.hidden as i32, q_dim as i32,
+            scratch.attn_out_scale, weights.o_scale, stream,
         )?;
+        gemma4_launcher::FusedNormAddResidualF16Launch {
+            num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
+        }.launch(kernels.fused_norm_add_residual_f16, scratch.gemm_f32_tmp,
+            weights.o_chscale, weights.post_attn_norm_gamma, residual, stream)?;
     } else {
         cublaslt.fp8_gemm_f32(
-            scratch.attn_out_fp8,
-            weights.o_fp8,
-            scratch.gemm_f32_tmp,
-            dims.num_tokens as i32,
-            dims.hidden as i32,
-            q_dim as i32,
-            scratch.attn_out_scale,
-            weights.o_scale,
-            stream,
+            scratch.attn_out_fp8, weights.o_fp8, scratch.gemm_f32_tmp,
+            dims.num_tokens as i32, dims.hidden as i32, q_dim as i32,
+            scratch.attn_out_scale, weights.o_scale, stream,
         )?;
+        gemma4_launcher::FusedNormAddResidualLaunch {
+            num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
+        }.launch(kernels.fused_norm_add_residual, scratch.gemm_f32_tmp,
+            weights.post_attn_norm_gamma, residual, stream)?;
     }
-    // 7-8. Fused: f32->bf16 + rmsnorm(post_attn) + add to residual
-    gemma4_launcher::FusedNormAddResidualLaunch {
-        num_tokens: dims.num_tokens,
-        hidden: dims.hidden,
-        eps: dims.rms_eps,
-    }
-    .launch(
-        kernels.fused_norm_add_residual,
-        scratch.gemm_f32_tmp,
-        weights.post_attn_norm_gamma,
-        residual,
-        stream,
-    )?;
 
     #[cfg(feature = "cuda")]
     probe!("after_step8_residual", residual, dims.hidden);
@@ -787,47 +763,27 @@ pub unsafe fn gemma4_forward_phase(
             stream,
         )?;
         if weights.down_chscale != 0 {
-            fp8_gemm_f32_with_channelscale_fallback(
-                cublaslt,
-                kernels.scale_cols_f32,
-                scratch.mlp_out_fp8,
-                weights.down_fp8,
-                scratch.gemm_f32_tmp,
-                dims.num_tokens as i32,
-                dims.hidden as i32,
-                dims.intermediate as i32,
-                scratch.mlp_out_scale,
-                weights.down_scale,
-                weights.down_chscale,
-                stream,
+            cublaslt.fp8_gemm_f32(
+                scratch.mlp_out_fp8, weights.down_fp8, scratch.gemm_f32_tmp,
+                dims.num_tokens as i32, dims.hidden as i32, dims.intermediate as i32,
+                scratch.mlp_out_scale, weights.down_scale, stream,
             )?;
+            gemma4_launcher::FusedNormAddResidualF16Launch {
+                num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
+            }.launch(kernels.fused_norm_add_residual_f16, scratch.gemm_f32_tmp,
+                weights.down_chscale, weights.post_ff_norm_gamma, residual, stream)?;
         } else {
             cublaslt.fp8_gemm_f32(
-                scratch.mlp_out_fp8,
-                weights.down_fp8,
-                scratch.gemm_f32_tmp,
-                dims.num_tokens as i32,
-                dims.hidden as i32,
-                dims.intermediate as i32,
-                scratch.mlp_out_scale,
-                weights.down_scale,
-                stream,
+                scratch.mlp_out_fp8, weights.down_fp8, scratch.gemm_f32_tmp,
+                dims.num_tokens as i32, dims.hidden as i32, dims.intermediate as i32,
+                scratch.mlp_out_scale, weights.down_scale, stream,
             )?;
+            gemma4_launcher::FusedNormAddResidualLaunch {
+                num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
+            }.launch(kernels.fused_norm_add_residual, scratch.gemm_f32_tmp,
+                weights.post_ff_norm_gamma, residual, stream)?;
         }
     }
-    // 12-13. Fused: f32->bf16 + rmsnorm(post_ff) + add to residual
-    gemma4_launcher::FusedNormAddResidualLaunch {
-        num_tokens: dims.num_tokens,
-        hidden: dims.hidden,
-        eps: dims.rms_eps,
-    }
-    .launch(
-        kernels.fused_norm_add_residual,
-        scratch.gemm_f32_tmp,
-        weights.post_ff_norm_gamma,
-        residual,
-        stream,
-    )?;
 
     #[cfg(feature = "cuda")]
     probe!("after_step13_residual", residual, dims.hidden);

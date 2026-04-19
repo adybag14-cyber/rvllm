@@ -71,6 +71,8 @@ pub struct Gemma4FusedModules {
     pub fn_fused_gelu_mul_f16: KernelFn,
     pub fn_fused_rope_partial_f16kv: KernelFn,
     pub fn_fused_norm_add_residual: KernelFn,
+    pub fn_fused_norm_add_residual_f16: KernelFn,
+    pub fused_norm_add_residual_f16_mod: LoadedModule,
 }
 
 pub struct Gemma4Bringup {
@@ -1412,6 +1414,7 @@ impl Gemma4Bringup {
             fused_gelu_mul_f16: self.fused.fn_fused_gelu_mul_f16,
             fused_rope_partial_f16kv: self.fused.fn_fused_rope_partial_f16kv,
             fused_norm_add_residual: self.fused.fn_fused_norm_add_residual,
+            fused_norm_add_residual_f16: self.fused.fn_fused_norm_add_residual_f16,
         }
     }
 }
@@ -1473,6 +1476,10 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
     let fn_fused_norm_add_residual =
         fused_norm_add_residual_mod.get_function("fused_norm_add_residual_kernel")?;
 
+    let fused_norm_add_residual_f16_mod = loader.load_ptx("fused_norm_add_residual_f16")?;
+    let fn_fused_norm_add_residual_f16 =
+        fused_norm_add_residual_f16_mod.get_function("fused_norm_add_residual_f16_kernel")?;
+
     Ok(Gemma4FusedModules {
         rmsnorm_mod,
         rmsnorm_inplace_mod,
@@ -1515,5 +1522,7 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
         fn_fused_gelu_mul_f16,
         fn_fused_rope_partial_f16kv,
         fn_fused_norm_add_residual,
+        fn_fused_norm_add_residual_f16,
+        fused_norm_add_residual_f16_mod,
     })
 }
