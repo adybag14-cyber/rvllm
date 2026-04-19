@@ -45,6 +45,11 @@ NUM_EXPERTS = 0
 TOP_K_EXPERTS = 0
 MOE_INTER = 0
 
+# Attention flags (set by load_config)
+K_EQ_V = False          # True => global layers use V = norm(K) instead of real V projection
+NUM_KV_SHARED_LAYERS = 0  # layers at the end that share KV from earlier layers
+KV_SHARED_MAP = {}      # layer_idx -> source_layer_idx for KV sharing
+
 
 def load_config(model_dir):
     """Read config.json, handle text_config nesting, set all model globals."""
@@ -55,6 +60,7 @@ def load_config(model_dir):
     global G_Q, G_KV, G_HD, G_KVH, G_GQA
     global MAX_KVH, LAYER_IS_GLOBAL
     global ENABLE_MOE, NUM_EXPERTS, TOP_K_EXPERTS, MOE_INTER
+    global K_EQ_V, NUM_KV_SHARED_LAYERS, KV_SHARED_MAP
 
     cfg_path = os.path.join(model_dir, 'config.json')
     with open(cfg_path) as f:
@@ -147,6 +153,29 @@ def load_config(model_dir):
         TOP_K_EXPERTS = tc['top_k_experts']
         MOE_INTER = tc['moe_intermediate_size']
 
+    # Attention: K=V flag (global layers use V=norm(K) when True)
+    K_EQ_V = bool(tc.get('attention_k_eq_v', False))
+
+    # KV sharing: last N layers share KV caches from earlier layers
+    NUM_KV_SHARED_LAYERS = int(tc.get('num_kv_shared_layers', 0))
+    KV_SHARED_MAP = {}
+    if NUM_KV_SHARED_LAYERS > 0:
+        # Build layer_types list
+        layer_types = []
+        for i in range(NL):
+            if LAYER_IS_GLOBAL[i]:
+                layer_types.append('global')
+            else:
+                layer_types.append('sliding_attention')
+        first_shared = NL - NUM_KV_SHARED_LAYERS
+        # For each shared layer, find the last non-shared layer of the same type
+        prev_layers = layer_types[:first_shared]
+        for i in range(first_shared, NL):
+            lt = layer_types[i]
+            # Find the last occurrence of this layer type before the shared region
+            src = len(prev_layers) - 1 - prev_layers[::-1].index(lt)
+            KV_SHARED_MAP[i] = src
+
     print(f"config: H={H} NH={NH} NL={NL} INTER={INTER} VOCAB={VOCAB} WINDOW={WINDOW}", file=sys.stderr)
     print(f"  sliding: HD={S_HD} KVH={S_KVH} Q={S_Q} KV={S_KV} GQA={S_GQA}", file=sys.stderr)
     print(f"  global:  HD={G_HD} KVH={G_KVH} Q={G_Q} KV={G_KV} GQA={G_GQA}", file=sys.stderr)
@@ -155,6 +184,9 @@ def load_config(model_dir):
     print(f"  MAX_Q={MAX_Q} MAX_KV={MAX_KV} MAX_NORM_HD={MAX_NORM_HD}", file=sys.stderr)
     if ENABLE_MOE:
         print(f"  MoE: experts={NUM_EXPERTS} top_k={TOP_K_EXPERTS} moe_inter={MOE_INTER}", file=sys.stderr)
+    print(f"  K_EQ_V={K_EQ_V} NUM_KV_SHARED_LAYERS={NUM_KV_SHARED_LAYERS}", file=sys.stderr)
+    if KV_SHARED_MAP:
+        print(f"  KV_SHARED_MAP={KV_SHARED_MAP}", file=sys.stderr)
 
 def make_mesh():
     devs = jax.devices()
@@ -206,33 +238,47 @@ def int8_matmul(x, w_int8, scale):
 
 # -- MoE FFN --
 
-def moe_ffn(x, router_w, router_scale, per_expert_scale, expert_gate_up, expert_down):
+def moe_ffn(x_residual, x_normed, router_w, router_scale, per_expert_scale, expert_gate_up, expert_down):
     """Mixture-of-Experts FFN with top-k routing.
 
+    HF reference: router runs on the residual (with its own internal RMSNorm),
+    experts run on pre_feedforward_layernorm_2'd input.
+
     Args:
-        x: [B, H] input (bf16)
+        x_residual: [B, H] residual (for router input) (bf16)
+        x_normed: [B, H] pre_feedforward_layernorm_2'd input (for experts) (bf16)
         router_w: [NUM_EXPERTS, H] router projection (bf16)
-        router_scale: scalar (bf16)
+        router_scale: [H] RMSNorm scale parameter for router (bf16)
         per_expert_scale: [NUM_EXPERTS] per-expert scale (bf16)
         expert_gate_up: [NUM_EXPERTS, 2*MOE_INTER, H] fused gate+up (bf16)
         expert_down: [NUM_EXPERTS, H, MOE_INTER] down projection (bf16)
     Returns:
         [B, H] MoE output (bf16)
     """
-    # router_scale is [H] -- RMSNorm scale for input before routing
-    x_normed = rms_norm(x, router_scale)               # [B, H]
-    logits = x_normed @ router_w.T                     # [B, NUM_EXPERTS]
-    logits = logits * per_expert_scale                 # per-expert scaling
-    topk_vals, topk_idx = jax.lax.top_k(logits, TOP_K_EXPERTS)  # [B, TOP_K]
-    weights = jax.nn.softmax(topk_vals.astype(jnp.float32), axis=-1).astype(x.dtype)  # [B, TOP_K]
+    # Router: RMSNorm(no_scale) * scale * scalar_root_size on residual
+    scalar_root_size = H ** -0.5
+    r = head_norm_noscale(x_residual)  # RMSNorm without scale
+    r = r * router_scale * scalar_root_size
+    logits = r @ router_w.T                             # [B, NUM_EXPERTS]
 
-    # Unrolled loop over top-k experts (8 iterations, traced at compile time)
-    out = jnp.zeros_like(x)  # [B, H]
+    # Softmax FIRST, then top-k, then renormalize, then per-expert scale
+    probs = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)  # [B, NUM_EXPERTS]
+    topk_vals, topk_idx = jax.lax.top_k(probs, TOP_K_EXPERTS)   # [B, TOP_K]
+    # Renormalize top-k weights
+    weights = (topk_vals / topk_vals.sum(axis=-1, keepdims=True)).astype(x_normed.dtype)  # [B, TOP_K]
+
+    # Per-expert scaling applied to weights
+    for e in range(TOP_K_EXPERTS):
+        idx_e = topk_idx[:, e]
+        weights = weights.at[:, e].set(weights[:, e] * per_expert_scale[idx_e[0]])
+
+    # Experts run on the pre_feedforward_layernorm_2'd input
+    out = jnp.zeros_like(x_normed)  # [B, H]
     for e in range(TOP_K_EXPERTS):
         idx_e = topk_idx[:, e]                          # [B] expert indices
         gu_e = expert_gate_up[idx_e[0]]                 # [2*MOE_INTER, H] (B=1)
         d_e = expert_down[idx_e[0]]                     # [H, MOE_INTER]
-        h_gu = x @ gu_e.T                               # [B, 2*MOE_INTER]
+        h_gu = x_normed @ gu_e.T                        # [B, 2*MOE_INTER]
         gate_e = h_gu[:, :MOE_INTER]
         up_e = h_gu[:, MOE_INTER:]
         h_e = jax.nn.gelu(gate_e, approximate=True) * up_e  # [B, MOE_INTER]
@@ -288,7 +334,11 @@ def _global_attn(q_flat, k_flat, v_flat, qn, kn, cos_g, sin_g, kc, vc, kc_s, vc_
     k_raw = k_flat[:, :G_KV].reshape(B, G_KVH, G_HD)
     q = head_norm(q_flat[:, :G_Q].reshape(B, NH, G_HD), qn)
     k = head_norm(k_raw, kn)
-    v = head_norm_noscale(k_raw)
+    if K_EQ_V:
+        v = head_norm_noscale(k_raw)
+    else:
+        v_raw = v_flat[:, :G_KV].reshape(B, G_KVH, G_HD)
+        v = head_norm_noscale(v_raw)
     c = cos_g[pos][None, None, :]
     s = sin_g[pos][None, None, :]
     q = rope(q, c, s, 128)
@@ -356,20 +406,24 @@ def sliding_one_layer(carry, xs):
 
     if ENABLE_MOE:
         residual = x
-        h_dense = rms_norm(x, xs['ln3'])
+        # Dense FFN
+        h_dense = rms_norm(x, xs['ln3'])          # pre_feedforward_layernorm
         gate = int8_matmul(h_dense, xs['gw'], xs['gw_s'])
         up = int8_matmul(h_dense, xs['uw'], xs['uw_s'])
         h_dense = jax.nn.gelu(gate, approximate=True) * up
         h_dense = int8_matmul(h_dense, xs['dw'], xs['dw_s'])
-        h_dense = rms_norm(h_dense, xs['ln4'])
+        h1 = rms_norm(h_dense, xs['ln4_moe'])     # post_feedforward_layernorm_1
 
-        h_moe = rms_norm(x, xs['ln3_moe'])
-        h_moe = moe_ffn(h_moe, xs['router_w'], xs['router_s'],
+        # MoE FFN: router on residual, experts on pre_feedforward_layernorm_2'd residual
+        h_moe_normed = rms_norm(x, xs['ln3_moe']) # pre_feedforward_layernorm_2
+        h_moe = moe_ffn(x, h_moe_normed, xs['router_w'], xs['router_s'],
                          xs['router_ps'], xs['expert_gu'], xs['expert_dw'])
-        h_moe = rms_norm(h_moe, xs['ln4_moe'])
+        h2 = rms_norm(h_moe, xs['ln4_combine'])   # post_feedforward_layernorm_2
 
-        x = residual + h_dense + h_moe
-        x = rms_norm(x, xs['ln4_combine'])
+        # Combine dense + MoE, then final norm, then residual add
+        combined = h1 + h2
+        combined = rms_norm(combined, xs['ln4'])   # post_feedforward_layernorm (final)
+        x = residual + combined
         x = x * xs['ls']
     else:
         residual = x
@@ -404,20 +458,24 @@ def global_one_layer(x, pos, ctx, cos_g, sin_g, max_ctx, ws):
 
     if ENABLE_MOE:
         residual = x
-        h_dense = rms_norm(x, ws['ln3'])
+        # Dense FFN
+        h_dense = rms_norm(x, ws['ln3'])          # pre_feedforward_layernorm
         gate = int8_matmul(h_dense, ws['gw'], ws['gw_s'])
         up = int8_matmul(h_dense, ws['uw'], ws['uw_s'])
         h_dense = jax.nn.gelu(gate, approximate=True) * up
         h_dense = int8_matmul(h_dense, ws['dw'], ws['dw_s'])
-        h_dense = rms_norm(h_dense, ws['ln4'])
+        h1 = rms_norm(h_dense, ws['ln4_moe'])     # post_feedforward_layernorm_1
 
-        h_moe = rms_norm(x, ws['ln3_moe'])
-        h_moe = moe_ffn(h_moe, ws['router_w'], ws['router_s'],
+        # MoE FFN: router on residual, experts on pre_feedforward_layernorm_2'd residual
+        h_moe_normed = rms_norm(x, ws['ln3_moe']) # pre_feedforward_layernorm_2
+        h_moe = moe_ffn(x, h_moe_normed, ws['router_w'], ws['router_s'],
                          ws['router_ps'], ws['expert_gu'], ws['expert_dw'])
-        h_moe = rms_norm(h_moe, ws['ln4_moe'])
+        h2 = rms_norm(h_moe, ws['ln4_combine'])   # post_feedforward_layernorm_2
 
-        x = residual + h_dense + h_moe
-        x = rms_norm(x, ws['ln4_combine'])
+        # Combine dense + MoE, then final norm, then residual add
+        combined = h1 + h2
+        combined = rms_norm(combined, ws['ln4'])   # post_feedforward_layernorm (final)
+        x = residual + combined
         x = x * ws['ls']
     else:
         residual = x
@@ -627,7 +685,11 @@ def _global_attn_unified(q_flat, k_flat, v_flat, qn, kn, cos_g, sin_g, kc, vc, p
     k_raw = k_flat[:, :G_KV].reshape(B, G_KVH, G_HD)
     q = head_norm(q_flat[:, :G_Q].reshape(B, NH, G_HD), qn)
     k = head_norm(k_raw, kn)
-    v = head_norm_noscale(k_raw)
+    if K_EQ_V:
+        v = head_norm_noscale(k_raw)
+    else:
+        v_raw = v_flat[:, :G_KV].reshape(B, G_KVH, G_HD)
+        v = head_norm_noscale(v_raw)
     c = cos_g[pos][None, None, :]
     s = sin_g[pos][None, None, :]
     q = rope(q, c, s, 128)
@@ -648,9 +710,15 @@ def _global_attn_unified(q_flat, k_flat, v_flat, qn, kn, cos_g, sin_g, kc, vc, p
 
 
 def one_layer_unified(carry, xs):
-    """Single-scan body: one layer with jax.lax.cond for sliding vs global. bf16 KV cache."""
-    x, pos, ctx, cos_s, sin_s, cos_g, sin_g = carry
-    max_ctx = xs['kc'].shape[0]
+    """Single-scan body: one layer with jax.lax.cond for sliding vs global. bf16 KV cache.
+    Full KV cache is in carry to support KV sharing (E4B: layers read from earlier layers' caches)."""
+    x, pos, ctx, cos_s, sin_s, cos_g, sin_g, all_kc, all_vc, layer_idx = carry
+    max_ctx = all_kc.shape[1]
+
+    # For KV-shared layers, read from source layer's cache; otherwise use own cache
+    kv_src = xs['kv_src']  # source layer index (== layer_idx for non-shared layers)
+    kc_layer = all_kc[kv_src]  # [max_ctx, MAX_KV]
+    vc_layer = all_vc[kv_src]  # [max_ctx, MAX_KV]
 
     residual = x
     h = rms_norm(x, xs['ln1'])
@@ -660,6 +728,7 @@ def one_layer_unified(carry, xs):
     v_flat = int8_matmul(h, xs['vw'], xs['vw_s'])
 
     ig = xs['ig']
+    is_shared = (kv_src != layer_idx)
 
     def do_sliding(args):
         q, k, v, qn, kn, kc, vc = args
@@ -671,9 +740,14 @@ def one_layer_unified(carry, xs):
         out, kc2, vc2 = _global_attn_unified(q, k, v, qn, kn, cos_g, sin_g, kc, vc, pos, ctx, max_ctx)
         return out.astype(jnp.bfloat16), kc2, vc2
 
-    attn_out, kc, vc = jax.lax.cond(
+    attn_out, kc_new, vc_new = jax.lax.cond(
         ig, do_global, do_sliding,
-        (q_flat, k_flat, v_flat, xs['qn'], xs['kn'], xs['kc'], xs['vc']))
+        (q_flat, k_flat, v_flat, xs['qn'], xs['kn'], kc_layer, vc_layer))
+
+    # Write updated cache back: shared layers don't write (source already has the cache)
+    # For non-shared layers, write to own slot; for shared, keep cache unchanged
+    all_kc = jnp.where(is_shared, all_kc, all_kc.at[layer_idx].set(kc_new))
+    all_vc = jnp.where(is_shared, all_vc, all_vc.at[layer_idx].set(vc_new))
 
     o_out = int8_matmul(attn_out, xs['ow'], xs['ow_s'])
 
@@ -684,22 +758,23 @@ def one_layer_unified(carry, xs):
     if ENABLE_MOE:
         residual = x
         # Dense FFN
-        h_dense = rms_norm(x, xs['ln3'])
+        h_dense = rms_norm(x, xs['ln3'])          # pre_feedforward_layernorm
         gate = int8_matmul(h_dense, xs['gw'], xs['gw_s'])
         up = int8_matmul(h_dense, xs['uw'], xs['uw_s'])
         h_dense = jax.nn.gelu(gate, approximate=True) * up
         h_dense = int8_matmul(h_dense, xs['dw'], xs['dw_s'])
-        h_dense = rms_norm(h_dense, xs['ln4'])
+        h1 = rms_norm(h_dense, xs['ln4_moe'])     # post_feedforward_layernorm_1
 
-        # MoE FFN
-        h_moe = rms_norm(x, xs['ln3_moe'])
-        h_moe = moe_ffn(h_moe, xs['router_w'], xs['router_s'],
+        # MoE FFN: router on residual, experts on pre_feedforward_layernorm_2'd residual
+        h_moe_normed = rms_norm(x, xs['ln3_moe']) # pre_feedforward_layernorm_2
+        h_moe = moe_ffn(x, h_moe_normed, xs['router_w'], xs['router_s'],
                          xs['router_ps'], xs['expert_gu'], xs['expert_dw'])
-        h_moe = rms_norm(h_moe, xs['ln4_moe'])
+        h2 = rms_norm(h_moe, xs['ln4_combine'])   # post_feedforward_layernorm_2
 
-        # Combine dense + MoE + residual, then post-combine norm
-        x = residual + h_dense + h_moe
-        x = rms_norm(x, xs['ln4_combine'])
+        # Combine dense + MoE, then final norm, then residual add
+        combined = h1 + h2
+        combined = rms_norm(combined, xs['ln4'])   # post_feedforward_layernorm (final)
+        x = residual + combined
         x = x * xs['ls']
     else:
         residual = x
@@ -711,33 +786,39 @@ def one_layer_unified(carry, xs):
         h = rms_norm(h, xs['ln4'])
         x = (residual + h) * xs['ls']
 
-    return (x, pos, ctx, cos_s, sin_s, cos_g, sin_g), {'kc': kc, 'vc': vc}
+    return (x, pos, ctx, cos_s, sin_s, cos_g, sin_g, all_kc, all_vc, layer_idx + 1), None
 
 
 def forward_unified(token_id, pos, ctx, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g):
     x = embed[token_id].reshape(B, H) * jnp.sqrt(jnp.float32(H))
-    init = (x, pos, ctx, cos_s, sin_s, cos_g, sin_g)
-    layer_xs = {**weights, 'kc': caches['kc'], 'vc': caches['vc']}
-    final, scan_out = jax.lax.scan(one_layer_unified, init, layer_xs)
+    all_kc = caches['kc']  # [NL, max_ctx, MAX_KV]
+    all_vc = caches['vc']  # [NL, max_ctx, MAX_KV]
+    init = (x, pos, ctx, cos_s, sin_s, cos_g, sin_g, all_kc, all_vc, jnp.int32(0))
+    final, _ = jax.lax.scan(one_layer_unified, init, weights)
     x = final[0]
+    all_kc = final[7]
+    all_vc = final[8]
     x = rms_norm(x, final_norm)
     logits = x.astype(jnp.float32) @ embed.astype(jnp.float32).T
     logits = SOFTCAP_VAL * jnp.tanh(logits / SOFTCAP_VAL)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
-    new_caches = {'kc': scan_out['kc'], 'vc': scan_out['vc']}
+    new_caches = {'kc': all_kc, 'vc': all_vc}
     return jnp.argmax(logits, axis=-1).astype(jnp.int32), log_probs, new_caches
 
 
 def forward_step_unified(token_id, pos, ctx, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g):
     x = embed[token_id].reshape(B, H) * jnp.sqrt(jnp.float32(H))
-    init = (x, pos, ctx, cos_s, sin_s, cos_g, sin_g)
-    layer_xs = {**weights, 'kc': caches['kc'], 'vc': caches['vc']}
-    final, scan_out = jax.lax.scan(one_layer_unified, init, layer_xs)
+    all_kc = caches['kc']
+    all_vc = caches['vc']
+    init = (x, pos, ctx, cos_s, sin_s, cos_g, sin_g, all_kc, all_vc, jnp.int32(0))
+    final, _ = jax.lax.scan(one_layer_unified, init, weights)
     x = final[0]
+    all_kc = final[7]
+    all_vc = final[8]
     x = rms_norm(x, final_norm)
     logits = x.astype(jnp.float32) @ embed.astype(jnp.float32).T
     logits = SOFTCAP_VAL * jnp.tanh(logits / SOFTCAP_VAL)
-    new_caches = {'kc': scan_out['kc'], 'vc': scan_out['vc']}
+    new_caches = {'kc': all_kc, 'vc': all_vc}
     return jnp.argmax(logits, axis=-1).astype(jnp.int32), new_caches
 
 
@@ -909,10 +990,16 @@ def load_model(model_dir, mesh, max_ctx):
     for i in range(NL):
         lp = f'{prefix}.layers.{i}'
         is_global = LAYER_IS_GLOBAL[i]
+        is_shared = (i in KV_SHARED_MAP)
 
         qw = to_np_bf16(get(f'{lp}.self_attn.q_proj.weight'))
-        kw = to_np_bf16(get(f'{lp}.self_attn.k_proj.weight'))
         ow = to_np_bf16(get(f'{lp}.self_attn.o_proj.weight'))
+
+        # KV-shared layers may not have k_proj/v_proj weights
+        if has(f'{lp}.self_attn.k_proj.weight'):
+            kw = to_np_bf16(get(f'{lp}.self_attn.k_proj.weight'))
+        else:
+            kw = np.zeros((MAX_KV, H), dtype=ml_dtypes.bfloat16)
 
         if has(f'{lp}.self_attn.v_proj.weight'):
             vw = to_np_bf16(get(f'{lp}.self_attn.v_proj.weight'))
@@ -937,7 +1024,11 @@ def load_model(model_dir, mesh, max_ctx):
             target_sc[k+'_s'].append(sc)
 
         target_bf['qn'].append(pad_to(to_np_bf16(get(f'{lp}.self_attn.q_norm.weight')), (MAX_NORM_HD,)))
-        target_bf['kn'].append(pad_to(to_np_bf16(get(f'{lp}.self_attn.k_norm.weight')), (MAX_NORM_HD,)))
+        # KV-shared layers may not have k_norm
+        if has(f'{lp}.self_attn.k_norm.weight'):
+            target_bf['kn'].append(pad_to(to_np_bf16(get(f'{lp}.self_attn.k_norm.weight')), (MAX_NORM_HD,)))
+        else:
+            target_bf['kn'].append(np.zeros((MAX_NORM_HD,), dtype=ml_dtypes.bfloat16))
         target_bf['ln1'].append(to_np_bf16(get(f'{lp}.input_layernorm.weight')))
         target_bf['ln2'].append(to_np_bf16(get(f'{lp}.post_attention_layernorm.weight')))
         target_bf['ln3'].append(to_np_bf16(get(f'{lp}.pre_feedforward_layernorm.weight')))
@@ -1120,10 +1211,16 @@ def load_model_unified(model_dir, mesh, max_ctx):
     for i in range(NL):
         lp = f'{prefix}.layers.{i}'
         is_global = LAYER_IS_GLOBAL[i]
+        is_shared = (i in KV_SHARED_MAP)
 
         qw = to_np_bf16(get(f'{lp}.self_attn.q_proj.weight'))
-        kw = to_np_bf16(get(f'{lp}.self_attn.k_proj.weight'))
         ow = to_np_bf16(get(f'{lp}.self_attn.o_proj.weight'))
+
+        # KV-shared layers may not have k_proj/v_proj weights
+        if has(f'{lp}.self_attn.k_proj.weight'):
+            kw = to_np_bf16(get(f'{lp}.self_attn.k_proj.weight'))
+        else:
+            kw = np.zeros((MAX_KV, H), dtype=ml_dtypes.bfloat16)
 
         if has(f'{lp}.self_attn.v_proj.weight'):
             vw = to_np_bf16(get(f'{lp}.self_attn.v_proj.weight'))
@@ -1143,7 +1240,11 @@ def load_model_unified(model_dir, mesh, max_ctx):
             stacked_sc[k+'_s'].append(sc)
 
         stacked_bf['qn'].append(pad_to(to_np_bf16(get(f'{lp}.self_attn.q_norm.weight')), (MAX_NORM_HD,)))
-        stacked_bf['kn'].append(pad_to(to_np_bf16(get(f'{lp}.self_attn.k_norm.weight')), (MAX_NORM_HD,)))
+        # KV-shared layers may not have k_norm
+        if has(f'{lp}.self_attn.k_norm.weight'):
+            stacked_bf['kn'].append(pad_to(to_np_bf16(get(f'{lp}.self_attn.k_norm.weight')), (MAX_NORM_HD,)))
+        else:
+            stacked_bf['kn'].append(np.zeros((MAX_NORM_HD,), dtype=ml_dtypes.bfloat16))
         stacked_bf['ln1'].append(to_np_bf16(get(f'{lp}.input_layernorm.weight')))
         stacked_bf['ln2'].append(to_np_bf16(get(f'{lp}.post_attention_layernorm.weight')))
         stacked_bf['ln3'].append(to_np_bf16(get(f'{lp}.pre_feedforward_layernorm.weight')))
@@ -1156,7 +1257,7 @@ def load_model_unified(model_dir, mesh, max_ctx):
             stacked_bf['ln4_moe'].append(to_np_bf16(get(f'{lp}.post_feedforward_layernorm_1.weight')))
             stacked_bf['ln4_combine'].append(to_np_bf16(get(f'{lp}.post_feedforward_layernorm_2.weight')))
             stacked_moe['router_w'].append(to_np_bf16(get(f'{lp}.router.proj.weight')))
-            # router.scale is a scalar -- read and wrap as 1-elem array for stacking
+            # router.scale is [H] (or scalar for older checkpoints) -- keep shape for stacking
             rs = to_np_bf16(get(f'{lp}.router.scale'))
             stacked_moe['router_s'].append(rs.reshape(1) if rs.ndim == 0 else rs)
             stacked_moe['router_ps'].append(to_np_bf16(get(f'{lp}.router.per_expert_scale')))
@@ -1192,6 +1293,12 @@ def load_model_unified(model_dir, mesh, max_ctx):
         weights[k] = put(arr, P(None, None))
         print(f"    {k}: {arr.shape} bf16", file=sys.stderr)
     weights['ig'] = jax.device_put(jnp.array(np.array(stacked_ig)), NamedSharding(mesh, P(None)))
+
+    # KV sharing map: kv_src[i] = source layer index for KV cache
+    kv_src_arr = np.array([KV_SHARED_MAP.get(i, i) for i in range(NL)], dtype=np.int32)
+    weights['kv_src'] = jax.device_put(jnp.array(kv_src_arr), NamedSharding(mesh, P(None)))
+    if NUM_KV_SHARED_LAYERS > 0:
+        print(f"    kv_src: {kv_src_arr.tolist()}", file=sys.stderr)
 
     if ENABLE_MOE:
         # MoE weights: shard large expert tensors on hidden dim (last axis)
