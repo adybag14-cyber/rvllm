@@ -11,7 +11,7 @@ Usage:
         --output-dir /path/to/eagle3-head \
         --max-seq 512 --epochs 3 --lr 5e-5 --batch-size 4
 """
-import argparse, json, os, struct, sys, time, math
+import argparse, functools, json, os, struct, sys, time, math
 
 import jax
 import jax.numpy as jnp
@@ -368,6 +368,7 @@ def main():
         dw = init_random_draft(mesh)
 
     m, v, opt_step = init_optimizer(dw)
+    opt_step = jax.device_put(opt_step, NamedSharding(mesh, P()))
     total_params = sum(x.size for x in jax.tree.leaves(dw))
     print(f"draft head: {total_params:,} params ({total_params * 2 / 1e6:.0f} MB bf16)", file=sys.stderr)
 
@@ -386,23 +387,42 @@ def main():
     print(f"prefill compiled: {time.time()-t0:.1f}s, features shape: {_fl.shape}", file=sys.stderr)
     del _fl, _fm, _fh
 
-    loss_grad_fn = jax.jit(jax.value_and_grad(
-        lambda dw_, tokens_, fl_, fm_, fh_, positions_:
-            ttt_loss(dw_, tokens_, fl_, fm_, fh_, positions_, embed, cos_s, sin_s)))
+    def _loss_fn(dw_, tokens_, fl_, fm_, fh_, positions_):
+        return ttt_loss(dw_, tokens_, fl_, fm_, fh_, positions_, embed, cos_s, sin_s)
+
+    dw_sharding = jax.tree.map(lambda x: x.sharding, dw)
+    scalar_sharding = NamedSharding(mesh, P())
+    out_shardings = (dw_sharding, dw_sharding, dw_sharding,
+                     scalar_sharding, scalar_sharding, scalar_sharding)
+
+    @functools.partial(jax.jit, out_shardings=out_shardings)
+    def train_step_fn(dw_, m_, v_, step_, lr_, tokens_, fl_, fm_, fh_, positions_):
+        loss, grads = jax.value_and_grad(_loss_fn)(dw_, tokens_, fl_, fm_, fh_, positions_)
+        grads, grad_norm = clip_grad_norm(grads)
+        dw_, m_, v_, step_ = adamw_step(dw_, grads, m_, v_, step_, lr_)
+        return dw_, m_, v_, step_, loss, grad_norm
+
+    def ensure_sharded(x):
+        if hasattr(x, 'sharding') and not isinstance(x.sharding, type(None)):
+            try:
+                _ = x.sharding.is_fully_replicated
+                return x
+            except AttributeError:
+                pass
+        return jax.device_put(x, rep)
 
     print("compiling training step...", file=sys.stderr, flush=True)
     t0 = time.time()
     test_fl, test_fm, test_fh = prefill_jit(test_tok, embed, final_norm, weights,
                                              zero_kc, zero_vc, cos_s, sin_s, cos_g, sin_g)
+    test_fl, test_fm, test_fh = ensure_sharded(test_fl), ensure_sharded(test_fm), ensure_sharded(test_fh)
     test_pos = jax.device_put(jnp.zeros(args.positions_per_seq, dtype=jnp.int32), rep)
-    test_loss, test_grads = loss_grad_fn(dw, test_tok, test_fl, test_fm, test_fh, test_pos)
-    test_loss.block_until_ready()
+    test_lr = jax.device_put(jnp.float32(args.lr), rep)
+    dw, m, v, opt_step, test_loss, test_gn = train_step_fn(
+        dw, m, v, opt_step, test_lr, test_tok, test_fl, test_fm, test_fh, test_pos)
+    jax.block_until_ready(test_loss)
     print(f"training compiled: {time.time()-t0:.1f}s, initial loss: {float(test_loss):.3f}", file=sys.stderr)
-    del test_fl, test_fm, test_fh, test_loss, test_grads
-
-    update_fn = jax.jit(lambda dw_, grads_, m_, v_, step_, lr_:
-                        adamw_step(dw_, grads_, m_, v_, step_, lr_))
-    clip_fn = jax.jit(clip_grad_norm)
+    del test_fl, test_fm, test_fh, test_loss, test_gn
 
     # ── training loop ──
 
@@ -418,61 +438,42 @@ def main():
         epoch_steps = 0
         t_epoch = time.time()
 
-        for batch_start in range(0, len(train_data), args.batch_size):
-            batch_end = min(batch_start + args.batch_size, len(train_data))
-            batch_indices = indices[batch_start:batch_end]
-
-            batch_loss_sum = 0.0
-            batch_grad_sum = None
-
-            for idx in batch_indices:
-                seq = train_data[idx]
-                padded, seq_len = pad_sequence(seq, args.max_seq)
-                if seq_len < K_DRAFT + 2:
-                    continue
-
-                tokens = jax.device_put(jnp.array(padded, dtype=jnp.int32), rep)
-                fl, fm, fh = prefill_jit(tokens, embed, final_norm, weights,
-                                          zero_kc, zero_vc, cos_s, sin_s, cos_g, sin_g)
-
-                max_start = max(seq_len - K_DRAFT - 1, 1)
-                pos_key = jax.random.PRNGKey(global_step * 1000 + int(idx))
-                positions = jax.device_put(
-                    jax.random.randint(pos_key, shape=(args.positions_per_seq,),
-                                       minval=0, maxval=max_start), rep)
-
-                loss, grads = loss_grad_fn(dw, tokens, fl, fm, fh, positions)
-
-                batch_loss_sum += float(loss)
-                if batch_grad_sum is None:
-                    batch_grad_sum = grads
-                else:
-                    batch_grad_sum = jax.tree.map(lambda a, b: a + b, batch_grad_sum, grads)
-
-            if batch_grad_sum is None:
+        for seq_idx_in_epoch, data_idx in enumerate(indices):
+            seq = train_data[data_idx]
+            padded, seq_len = pad_sequence(seq, args.max_seq)
+            if seq_len < K_DRAFT + 2:
                 continue
 
-            n_seqs = batch_end - batch_start
-            avg_grads = jax.tree.map(lambda g: g / n_seqs, batch_grad_sum)
-            avg_grads, grad_norm = clip_fn(avg_grads)
+            tokens = jax.device_put(jnp.array(padded, dtype=jnp.int32), rep)
+            fl, fm, fh = prefill_jit(tokens, embed, final_norm, weights,
+                                      zero_kc, zero_vc, cos_s, sin_s, cos_g, sin_g)
+            fl, fm, fh = ensure_sharded(fl), ensure_sharded(fm), ensure_sharded(fh)
+
+            max_start = max(seq_len - K_DRAFT - 1, 1)
+            pos_key = jax.random.PRNGKey(global_step * 1000 + int(data_idx))
+            positions = jax.device_put(
+                jax.random.randint(pos_key, shape=(args.positions_per_seq,),
+                                   minval=0, maxval=max_start), rep)
 
             lr_t = args.lr
             if global_step < args.warmup_steps:
                 lr_t = args.lr * (global_step + 1) / args.warmup_steps
 
-            dw, m, v, opt_step = update_fn(dw, avg_grads, m, v, opt_step, jnp.float32(lr_t))
+            dw, m, v, opt_step, loss, grad_norm = train_step_fn(
+                dw, m, v, opt_step, jax.device_put(jnp.float32(lr_t), rep),
+                tokens, fl, fm, fh, positions)
 
-            avg_loss = batch_loss_sum / n_seqs
-            epoch_loss += avg_loss
+            loss_val = float(loss)
+            epoch_loss += loss_val
             epoch_steps += 1
             global_step += 1
 
             if global_step % 10 == 0:
                 elapsed = time.time() - t_epoch
-                seqs_done = batch_end
+                seqs_done = seq_idx_in_epoch + 1
                 seqs_total = len(train_data)
                 eta = elapsed / max(seqs_done, 1) * (seqs_total - seqs_done)
-                print(f"  epoch {epoch} step {global_step} | loss {avg_loss:.3f} | "
+                print(f"  epoch {epoch} step {global_step} | loss {loss_val:.3f} | "
                       f"grad_norm {float(grad_norm):.3f} | lr {lr_t:.2e} | "
                       f"{seqs_done}/{seqs_total} seqs | eta {eta:.0f}s",
                       file=sys.stderr)
