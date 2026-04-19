@@ -175,6 +175,7 @@ impl Gemma4Bringup {
         use crate::gemma4_layer_exec::*;
         use rvllm_loader::gemma4_arch::Gemma4LayerType;
 
+        let f16_only = false; // bench path always FP8
         let arch = &self.arch;
         let hidden = arch.hidden_size as u32;
         let max_hd = arch.max_head_dim() as u32;
@@ -306,6 +307,7 @@ impl Gemma4Bringup {
                     rms_eps: arch.rms_norm_eps,
                     layer_type: lt,
                     sliding_window: arch.sliding_window_size as u32,
+                    f16_kv: f16_only,
                 };
 
                 let k_out = q_base + (num_seqs as u64) * (q_dim as u64) * 2;
@@ -604,6 +606,7 @@ impl Gemma4Bringup {
                     rms_eps: arch.rms_norm_eps,
                     layer_type: lt,
                     sliding_window: arch.sliding_window_size as u32,
+                    f16_kv: f16_only,
                 };
 
                 let k_out = q_base + (num_seqs as u64) * (q_dim as u64) * 2;
@@ -1014,6 +1017,7 @@ impl Gemma4Bringup {
                     intermediate: inter, block_size, max_blocks_per_seq, num_blocks_total,
                     attn_scale: 1.0, rms_eps: arch.rms_norm_eps,
                     layer_type: lt, sliding_window: arch.sliding_window_size as u32,
+                    f16_kv: self.model.layers[0].down_proj_f16.is_some(),
                 };
                 let k_out = q_base + (q_dim as u64) * 2;
                 let v_out = k_out + (kv_dim as u64) * 2;

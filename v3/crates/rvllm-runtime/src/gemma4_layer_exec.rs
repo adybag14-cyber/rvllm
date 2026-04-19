@@ -55,6 +55,7 @@ pub struct Gemma4LayerDims {
     pub rms_eps: f32,
     pub layer_type: Gemma4LayerType,
     pub sliding_window: u32,
+    pub f16_kv: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -375,7 +376,7 @@ pub unsafe fn gemma4_forward(
     };
 
     #[cfg(feature = "cuda")]
-    if weights.down_f16 != 0 {
+    if dims.f16_kv {
         // F16 KV cache path: RoPE outputs F16 Q and F16 KV cache
         {
             let mut q_in = scratch.q_normed;
@@ -475,8 +476,8 @@ pub unsafe fn gemma4_forward(
     #[cfg(feature = "cuda")]
     probe!("step5_attn_out", scratch.attn_out, q_dim);
 
-    // 6. quantize attn_out -> fp8 per-token (skip in F16 mode)
-    if weights.down_f16 == 0 {
+    // 6. quantize attn_out -> fp8 per-token (skip when F16 KV + F16 O-proj)
+    if !dims.f16_kv || weights.o_f16 == 0 {
         rvllm_fused::QuantizeFp8PerTokenLaunch {
             num_tokens: dims.num_tokens,
             dim: q_dim,
