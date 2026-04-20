@@ -1181,24 +1181,27 @@ impl Gemma4Bringup {
         let inter = arch.intermediate_size as u32;
         let max_blocks_per_seq = num_blocks_total;
 
-        let hidden_fp8 = arena.region("gen_hidden_fp8", hidden as usize, 16)?;
-        let hidden_scale = arena.region("gen_hidden_scale", 4, 16)?;
-        let qkv_out = arena.region("gen_qkv", (max_qkv_rows * 2) as usize, 16)?;
+        let prompt_len = prompt_ids.len() as u32;
+        let max_tokens = prompt_len.max(1);
+
+        let hidden_fp8 = arena.region("gen_hidden_fp8", (max_tokens * hidden) as usize, 16)?;
+        let hidden_scale = arena.region("gen_hidden_scale", (max_tokens * 4) as usize, 16)?;
+        let qkv_out = arena.region("gen_qkv", (max_tokens * max_qkv_rows * 2) as usize, 16)?;
         let q_base = qkv_out.device_ptr();
-        let q_normed = arena.region("gen_q_normed", (max_q_dim * 2) as usize, 16)?;
-        let k_normed = arena.region("gen_k_normed", (max_kv_dim * 2) as usize, 16)?;
-        let q_fp8 = arena.region("gen_q_fp8", max_q_dim as usize, 16)?;
-        let attn_out = arena.region("gen_attn_out", (max_q_dim * 2) as usize, 16)?;
-        let attn_out_fp8 = arena.region("gen_attn_out_fp8", max_q_dim as usize, 16)?;
-        let attn_out_scale = arena.region("gen_attn_out_scale", 4, 16)?;
-        let gate_up_out = arena.region("gen_gate_up", (2 * inter * 2) as usize, 16)?;
-        let gate_up_fp8 = arena.region("gen_gate_up_fp8", (2 * inter) as usize, 16)?;
-        let gate_up_scale = arena.region("gen_gate_up_scale", 4, 16)?;
-        let mlp_out_fp8 = arena.region("gen_mlp_fp8", inter as usize, 16)?;
-        let mlp_out_scale = arena.region("gen_mlp_scale", 4, 16)?;
-        let delta_f16 = arena.region("gen_delta", (hidden * 2) as usize, 16)?;
+        let q_normed = arena.region("gen_q_normed", (max_tokens * max_q_dim * 2) as usize, 16)?;
+        let k_normed = arena.region("gen_k_normed", (max_tokens * max_kv_dim * 2) as usize, 16)?;
+        let q_fp8 = arena.region("gen_q_fp8", (max_tokens * max_q_dim) as usize, 16)?;
+        let attn_out = arena.region("gen_attn_out", (max_tokens * max_q_dim * 2) as usize, 16)?;
+        let attn_out_fp8 = arena.region("gen_attn_out_fp8", (max_tokens * max_q_dim) as usize, 16)?;
+        let attn_out_scale = arena.region("gen_attn_out_scale", (max_tokens * 4) as usize, 16)?;
+        let gate_up_out = arena.region("gen_gate_up", (max_tokens * 2 * inter * 2) as usize, 16)?;
+        let gate_up_fp8 = arena.region("gen_gate_up_fp8", (max_tokens * 2 * inter) as usize, 16)?;
+        let gate_up_scale = arena.region("gen_gate_up_scale", (max_tokens * 4) as usize, 16)?;
+        let mlp_out_fp8 = arena.region("gen_mlp_fp8", (max_tokens * inter) as usize, 16)?;
+        let mlp_out_scale = arena.region("gen_mlp_scale", (max_tokens * 4) as usize, 16)?;
+        let delta_f16 = arena.region("gen_delta", (max_tokens * hidden * 2) as usize, 16)?;
         let gemm_f32_max_n = std::cmp::max(max_qkv_rows, 2 * inter);
-        let gemm_f32_tmp = arena.region("gen_gemm_f32", (gemm_f32_max_n * 4) as usize, 16)?;
+        let gemm_f32_tmp = arena.region("gen_gemm_f32", (max_tokens * gemm_f32_max_n * 4) as usize, 16)?;
 
         let sliding_blocks = ((arch.sliding_window_size as u32 + block_size - 1) / block_size).min(num_blocks_total);
         let use_f16_kv = std::env::var("RVLLM_F16_KV").map_or(true, |v| v != "0");
@@ -1225,22 +1228,23 @@ impl Gemma4Bringup {
             kv_scale_region.copy_from_host(&s.to_le_bytes())?;
         }
 
-        let fa3_ws = arena.region("gen_fa3_ws", 16 * 1024 * 1024, 256)?;
+        let fa3_ws = arena.region("gen_fa3_ws", 128 * 1024 * 1024, 256)?;
         let cutlass_ws_bytes: usize = 16 * 1024 * 1024;
         let cutlass_ws = arena.region("gen_cutlass_ws", cutlass_ws_bytes, 256)?;
 
-        let positions = arena.region("gen_pos", 4, 16)?;
-        let slot_mapping = arena.region("gen_slot", 4, 16)?;
+        let positions = arena.region("gen_pos", (max_tokens * 4) as usize, 16)?;
+        let slot_mapping = arena.region("gen_slot", (max_tokens * 4) as usize, 16)?;
         let context_lens = arena.region("gen_ctx", 4, 16)?;
+        let cu_seqlens_q = arena.region("gen_cu_seqlens", 8, 16)?;
         let block_tables = arena.region("gen_bt", (max_blocks_per_seq * 4) as usize, 16)?;
         {
             let bt: Vec<i32> = (0..max_blocks_per_seq as i32).collect();
             block_tables.copy_from_host(bytemuck_cast_i32(&bt))?;
         }
 
-        let residual = arena.region("gen_residual", (hidden * 2) as usize, 16)?;
+        let residual = arena.region("gen_residual", (max_tokens * hidden * 2) as usize, 16)?;
         let logits_f32 = arena.region("gen_logits_f32", (vocab * 4) as usize, 16)?;
-        let token_ids_region = arena.region("gen_tok_ids", 4, 16)?;
+        let token_ids_region = arena.region("gen_tok_ids", (max_tokens * 4) as usize, 16)?;
         let sampled = arena.region("gen_sampled", 4, 16)?;
         let residual_ptr = residual.device_ptr();
         let kernels = self.layer_kernels();
@@ -1345,12 +1349,116 @@ impl Gemma4Bringup {
 
         let t0 = std::time::Instant::now();
 
-        // Phase 1: Feed prompt tokens one-by-one (populates KV cache)
-        for (i, &tok_id) in prompt_ids.iter().enumerate() {
-            run_one_token(tok_id, i)?;
+        // Phase 1: Batch prefill (all prompt tokens in one forward pass)
+        {
+            let tok_ids: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
+            token_ids_region.copy_from_host(bytemuck_cast_i32(&tok_ids))?;
+            rvllm_fused::EmbeddingGatherLaunch { num_tokens: prompt_len, hidden, vocab }
+                .launch(fn_embed, residual_ptr, self.model.embedding.offset_bytes,
+                    token_ids_region.device_ptr(), stream)?;
+
+            let pos: Vec<i32> = (0..prompt_len as i32).collect();
+            let slot: Vec<i32> = (0..prompt_len as i32).collect();
+            let ctx = [prompt_len as i32];
+            let cu_seq = [0i32, prompt_len as i32];
+            positions.copy_from_host(bytemuck_cast_i32(&pos))?;
+            slot_mapping.copy_from_host(bytemuck_cast_i32(&slot))?;
+            context_lens.copy_from_host(bytemuck_cast_i32(&ctx))?;
+            cu_seqlens_q.copy_from_host(bytemuck_cast_i32(&cu_seq))?;
+
+            let phase = crate::gemma4_layer_exec::Gemma4Phase::Prefill {
+                cu_seqlens_q: cu_seqlens_q.device_ptr(),
+                max_seqlen_q: prompt_len,
+                num_seqs: 1,
+            };
+
+            for (layer_idx, layer) in self.model.layers.iter().enumerate() {
+                if layer_idx >= max_layers { break; }
+                let lt = arch.layer_types[layer_idx];
+                let hd = arch.head_dim_for_layer(layer_idx) as u32;
+                let nkvh = arch.num_kv_heads_for_layer(layer_idx) as u32;
+                let q_dim = (arch.num_attention_heads as u32) * hd;
+                let kv_dim = nkvh * hd;
+                let layer_blocks = if lt == Gemma4LayerType::GlobalAttention { num_blocks_total } else { sliding_blocks };
+                let layer_kv_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
+                let layer_kv_base = kv_cache.device_ptr() + kv_layer_offsets[layer_idx];
+
+                let dims = crate::gemma4_layer_exec::Gemma4LayerDims {
+                    num_tokens: prompt_len, hidden,
+                    num_heads: arch.num_attention_heads as u32, num_kv_heads: nkvh, head_dim: hd,
+                    rotary_dim: arch.rotary_dim_for_layer(layer_idx) as u32,
+                    intermediate: inter, block_size,
+                    max_blocks_per_seq: layer_blocks, num_blocks_total: layer_blocks,
+                    attn_scale: 1.0, rms_eps: arch.rms_norm_eps,
+                    layer_type: lt, sliding_window: arch.sliding_window_size as u32,
+                    f16_kv: false, // prefill uses FP8 KV (no F16 prefill kernel)
+                };
+                let w = crate::gemma4_layer_exec::Gemma4LayerWeightPtrs {
+                    attn_norm_gamma: layer.input_layernorm.offset_bytes,
+                    post_attn_norm_gamma: layer.post_attention_layernorm.offset_bytes,
+                    pre_ff_norm_gamma: layer.pre_feedforward_layernorm.offset_bytes,
+                    post_ff_norm_gamma: layer.post_feedforward_layernorm.offset_bytes,
+                    q_norm_gamma: layer.q_norm.offset_bytes,
+                    k_norm_gamma: layer.k_norm.offset_bytes,
+                    qkv_fp8: layer.qkv.offset_bytes, qkv_scale: layer.qkv.scale_ptr,
+                    o_fp8: layer.o_proj.offset_bytes, o_scale: layer.o_proj.scale_ptr,
+                    gate_up_fp8: layer.gate_up.offset_bytes, gate_up_scale: layer.gate_up.scale_ptr,
+                    down_fp8: layer.down_proj.offset_bytes, down_scale: layer.down_proj.scale_ptr,
+                    layer_scalar_ptr: layer.layer_scalar.offset_bytes,
+                    qkv_f16: layer.qkv_f16.as_ref().map_or(0, |w| w.offset_bytes),
+                    o_f16: layer.o_proj_f16.as_ref().map_or(0, |w| w.offset_bytes),
+                    gate_up_f16: layer.gate_up_f16.as_ref().map_or(0, |w| w.offset_bytes),
+                    down_f16: layer.down_proj_f16.as_ref().map_or(0, |w| w.offset_bytes),
+                    qkv_chscale: layer.qkv.channelscale_ptr.unwrap_or(0),
+                    o_chscale: layer.o_proj.channelscale_ptr.unwrap_or(0),
+                    gate_up_chscale: layer.gate_up.channelscale_ptr.unwrap_or(0),
+                    down_chscale: layer.down_proj.channelscale_ptr.unwrap_or(0),
+                };
+                let k_out = q_base + (prompt_len as u64) * (q_dim as u64) * 2;
+                let v_out = k_out + (prompt_len as u64) * (kv_dim as u64) * 2;
+                let (cos, sin) = match lt {
+                    Gemma4LayerType::SlidingAttention => (self.model.rope_cos_sliding.offset_bytes, self.model.rope_sin_sliding.offset_bytes),
+                    Gemma4LayerType::GlobalAttention => (self.model.rope_cos_global.offset_bytes, self.model.rope_sin_global.offset_bytes),
+                };
+                let scratch = crate::gemma4_layer_exec::Gemma4LayerScratch {
+                    hidden_fp8: hidden_fp8.device_ptr(), hidden_scale: hidden_scale.device_ptr(),
+                    q_out: q_base, k_out, v_out,
+                    q_normed: q_normed.device_ptr(), k_normed: k_normed.device_ptr(),
+                    q_fp8: q_fp8.device_ptr(),
+                    k_cache: layer_kv_base,
+                    v_cache: layer_kv_base + (layer_kv_elems / 2) * kv_bytes_per_elem as u64,
+                    q_scale_ptr: q_scale_region.device_ptr(), kv_scale_ptr: kv_scale_region.device_ptr(),
+                    attn_out: attn_out.device_ptr(), attn_out_fp8: attn_out_fp8.device_ptr(),
+                    attn_out_scale: attn_out_scale.device_ptr(), delta_f16: delta_f16.device_ptr(),
+                    gate_up_out: gate_up_out.device_ptr(), gate_up_fp8: gate_up_fp8.device_ptr(),
+                    gate_up_scale: gate_up_scale.device_ptr(),
+                    mlp_out_fp8: mlp_out_fp8.device_ptr(), mlp_out_scale: mlp_out_scale.device_ptr(),
+                    gemm_f32_tmp: gemm_f32_tmp.device_ptr(),
+                    cutlass_workspace: cutlass_ws.device_ptr(), cutlass_workspace_bytes: cutlass_ws_bytes,
+                    fa3_workspace: fa3_ws.device_ptr(),
+                };
+                let meta = crate::gemma4_layer_exec::Gemma4MetadataPtrs {
+                    positions: positions.device_ptr(), slot_mapping: slot_mapping.device_ptr(),
+                    cos, sin,
+                    block_tables: block_tables.device_ptr(), context_lens: context_lens.device_ptr(),
+                };
+                crate::gemma4_layer_exec::gemma4_forward_phase(
+                    dims, &kernels, &w, &scratch, &meta,
+                    &self.cublaslt, &self.cutlass, &self.sliding_attention, &self.global_attention,
+                    residual_ptr, stream, phase,
+                )?;
+            }
+
+            // Extract last token's residual for decode
+            if prompt_len > 1 {
+                let last_offset = (prompt_len - 1) as u64 * hidden as u64 * 2;
+                cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                    residual_ptr, residual_ptr + last_offset, (hidden * 2) as usize, stream as _,
+                );
+            }
         }
 
-        // LM head on last prompt token to get first generated token
+        // LM head on last prompt token
         rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: 1, hidden, eps: arch.rms_norm_eps,
         }.launch(kernels.fused_rmsnorm, residual_ptr, self.model.final_norm.offset_bytes, stream)?;
@@ -1363,8 +1471,8 @@ impl Gemma4Bringup {
         let mut host_tok = [0i32; 1];
         cudarc::driver::sys::cuMemcpyDtoH_v2(host_tok.as_mut_ptr() as *mut _, sampled.device_ptr(), 4);
         let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        eprintln!("[prefill] {} tokens in {:.1}ms ({:.0} tok/s)",
-            prompt_ids.len(), prefill_ms, prompt_ids.len() as f64 / t0.elapsed().as_secs_f64());
+        eprintln!("[prefill] {} tokens in {:.1}ms (TTFT={:.1}ms)",
+            prompt_ids.len(), prefill_ms, prefill_ms);
 
         let mut output_ids: Vec<u32> = Vec::with_capacity(max_new);
         output_ids.push(host_tok[0] as u32);

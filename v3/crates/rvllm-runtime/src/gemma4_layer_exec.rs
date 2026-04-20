@@ -499,7 +499,10 @@ pub unsafe fn gemma4_forward_phase(
                 scale: dims.attn_scale,
                 window_size_left,
             };
-            let prefill = PagedPrefillFp8Launcher::new(attention);
+            // SM90 decode + SM89 prefill: the SM90 Varlen kernel exceeds H100's 232KB
+            // smem limit at hdim>=256. SM89 prefill works at all head dims.
+            // Prefill runs once per request; decode (SM90, CUDA graphed) is the hot path.
+            let prefill = PagedPrefillFp8Launcher::new(global_attention);
             prefill.launch(
                 prefill_params,
                 scratch.attn_out,

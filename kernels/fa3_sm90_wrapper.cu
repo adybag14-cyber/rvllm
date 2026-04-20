@@ -282,6 +282,8 @@ static int fa3_sm90_paged_decode_impl(
     int ns = num_splits_heuristic(total_mblocks, num_sm, num_n_blocks,
                                   num_m_blocks, size_one_kv_head,
                                   params.is_causal || params.is_local, 128);
+    // Force non-split for prefill with hdim=256 (combine kernel smem near H100 limit)
+    if (cu_seqlens_q_ptr != nullptr && head_dim >= 256) { ns = 1; }
     params.num_splits = ns;
     bool use_split = ns > 1;
 
