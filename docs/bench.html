@@ -146,7 +146,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 <tr><td><strong>PPL</strong></td><td class="r pos"><strong>5.87</strong></td><td class="r">90.21</td><td class="r">24.76</td><td class="r">-</td></tr>
 <tr><td><strong>B=1 tok/s</strong></td><td class="r pos"><strong>78.3</strong></td><td class="r">52.9</td><td class="r">44.2</td><td class="r">66.9</td></tr>
 <tr><td><strong>B=128 tok/s</strong></td><td class="r pos"><strong>6,298</strong></td><td class="r">4,915</td><td class="r">3,853</td><td class="r">3,848</td></tr>
-<tr><td><strong>Cached TTFT</strong></td><td class="r pos"><strong>25.9 ms</strong></td><td class="r">35.3 ms</td><td class="r">73.3 ms</td><td class="r">63 ms*</td></tr>
+<tr><td><strong>Cached TTFT</strong></td><td class="r pos"><strong>25.9 ms</strong></td><td class="r">35.3 ms</td><td class="r">73.3 ms</td><td class="r">-</td></tr>
 <tr><td><strong>Peak tok/s</strong></td><td class="r pos"><strong>16,794</strong></td><td class="r">14,899</td><td class="r">9,600</td><td class="r">3,848</td></tr>
 <tr><td><strong>Peak tok/s/$</strong></td><td class="r pos"><strong>3,230</strong></td><td class="r">2,865</td><td class="r">1,846</td><td class="r">2,004</td></tr>
 </tbody>
@@ -196,7 +196,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 <tr><td>31B vLLM GPU</td><td class="r">-</td><td class="r">69</td><td class="r">-</td><td class="r">3,848</td><td class="r">$1.92</td><td class="r">2,004</td></tr>
 </tbody>
 </table>
-<div class="footnote">PPL measured on 86-token passage. 26B-A4B PPL is high for both rvLLM (90.21) and HF reference (85.42) -- instruct MoE on raw prose. GPU rvLLM PPL 13.53 is best due to FP8-Dynamic per-channel scales preserving more precision than int8 or bf16.</div>
+<div class="footnote">PPL measured on 86-token passage. 26B-A4B PPL is high for both rvLLM (90.21) and HF reference (85.42) -- instruct MoE on raw prose. GPU rvLLM PPL 14.75 is best due to FP8-Dynamic per-channel scales + CUTLASS F32 epilogue preserving more precision than int8 or bf16.</div>
 
 </div>
 
@@ -492,6 +492,8 @@ Hardware: H100 SXM 80 GB on vast.ai ($1.92/hr).<br>
 Model: RedHatAI/gemma-4-31B-it-FP8-Dynamic, max_ctx=2048.<br>
 Engine: vLLM 0.19 with default settings.<br><br>
 
+<strong>vLLM TPU comparison:</strong> planned but not yet completed. vLLM TPU installation requires significant disk space beyond what our current 100 GB boot disk supports (vLLM + PyTorch + dependencies ~15 GB on top of model weights). A 200 GB disk instance is needed. We intend to run this comparison on the same v6e-4 hardware for an apples-to-apples TPU benchmark.<br><br>
+
 <strong>GPU pipeline (v3 codebase, Rust+CUDA):</strong><br>
 Hardware: H100 SXM 80 GB.<br>
 Model: 31B Gemma 4, FP8 E4M3 weights (per-channel scale), F16 KV cache.<br>
@@ -601,12 +603,12 @@ With no framework overhead eating into VRAM and bandwidth-optimal weight streami
 
   // Overview: all 5 configs on one line chart
   const overviewData = [
-    { batch: 1,    e4b: 78,    moe: 53,    tpu31: 44,   gpu31: 52,   vllm: 69 },
-    { batch: 8,    e4b: 542,   moe: 390,   tpu31: 318,  gpu31: 452,  vllm: 516 },
-    { batch: 64,   e4b: 3661,  moe: 2662,  tpu31: 2112, gpu31: 3097, vllm: 3130 },
-    { batch: 128,  e4b: 6298,  moe: 4915,  tpu31: 3853, gpu31: 5114, vllm: 4689 },
-    { batch: 256,  e4b: 10214, moe: 8192,  tpu31: 6246, gpu31: 6897, vllm: 7077 },
-    { batch: 512,  e4b: 13773, moe: 12390, tpu31: 8550, gpu31: 7943, vllm: 8243 },
+    { batch: 1,    e4b: 78,    moe: 53,    tpu31: 44,   gpu31: 53,   vllm: 69 },
+    { batch: 8,    e4b: 542,   moe: 390,   tpu31: 318,  gpu31: 434,  vllm: 515 },
+    { batch: 64,   e4b: 3661,  moe: 2662,  tpu31: 2112, gpu31: 3265, vllm: 3130 },
+    { batch: 128,  e4b: 6298,  moe: 4915,  tpu31: 3853, gpu31: 5802, vllm: 4689 },
+    { batch: 256,  e4b: 10214, moe: 8192,  tpu31: 6246, gpu31: 7808, vllm: 7077 },
+    { batch: 512,  e4b: 13773, moe: 12390, tpu31: 8550, gpu31: 8786, vllm: 8243 },
     { batch: 768,  e4b: 15514, moe: 14899, tpu31: 9600 },
     { batch: 1024, e4b: 16794 }
   ];
@@ -723,12 +725,12 @@ With no framework overhead eating into VRAM and bandwidth-optimal weight streami
 
   // TPU 31B vs vLLM GPU (both at 2048 ctx)
   const comparisonData = [
-    { batch: '1',   tpu: 44,   rvgpu: 52,   gpu: 66.9 },
-    { batch: '8',   tpu: 318,  rvgpu: 452,  gpu: 511.7 },
-    { batch: '64',  tpu: 2112, rvgpu: 3097, gpu: 2794 },
-    { batch: '128', tpu: 3853, rvgpu: 5114, gpu: 3848 },
-    { batch: '256', tpu: 6246, rvgpu: 6897, gpu: 3709 },
-    { batch: '512', tpu: 8550, rvgpu: 7943, gpu: 3788 },
+    { batch: '1',   tpu: 44,   rvgpu: 53,   gpu: 66.9 },
+    { batch: '8',   tpu: 318,  rvgpu: 434,  gpu: 511.7 },
+    { batch: '64',  tpu: 2112, rvgpu: 3265, gpu: 2794 },
+    { batch: '128', tpu: 3853, rvgpu: 5802, gpu: 3848 },
+    { batch: '256', tpu: 6246, rvgpu: 7808, gpu: 3709 },
+    { batch: '512', tpu: 8550, rvgpu: 8786, gpu: 3788 },
     { batch: '768', tpu: 9600, rvgpu: null, gpu: 3671 }
   ];
 
