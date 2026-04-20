@@ -2,175 +2,67 @@
 
 LLM inference engine. Rust+CUDA on GPU, JAX+XLA on TPU.
 
-**31B Gemma 4 on TPU v6e-4: 13,943 tok/s** (B=768, int8, TP=4 SPMD, PPL 19.24). 2,681 tok/s/$. No compromise: 78.2 tok/s at short context, 24.7 tok/s at 128K. Dual-path architecture auto-switches based on context length. 3.6x faster than vLLM on H100 GPU (measured). Zero custom kernels - ~500 lines of JAX, XLA compiles everything.
+Three Gemma 4 models on TPU v6e-4: **E4B** (16,794 tok/s peak, 78.3 tok/s B=1, PPL 5.87), **26B-A4B MoE** (14,899 tok/s peak), **31B** (9,600 tok/s peak, 128K context). GPU: 31B on H100 at **8,786 tok/s** (FP8, CUDA graph, PPL 14.75). Zero custom kernels on TPU -- ~500 lines of JAX. Native Rust binary on GPU -- zero Python in the serving path.
 
-## TPU: 31B Gemma 4 on v6e-4
+**[Full benchmarks](https://docs.solidsf.com/docs/bench.html)**
 
-Pure JAX + XLA. No custom kernels. XLA compiles the entire 60-layer forward pass to TPU machine code from a ~500 line JAX script.
+## At a glance
 
-**Dual-path architecture:** auto-switches based on `--max-ctx`:
-- **<= 32K:** single-scan with bf16 KV cache (fast path). 60-layer scan with `jax.lax.cond` dispatch. 78.2 tok/s at 512 ctx.
-- **> 32K:** split-cache with int8 KV cache (128K path). 10 groups x 6 layers, blockwise global attention. 24.7 tok/s at 128K ctx.
+| | E4B (4B) | 26B-A4B (MoE) | 31B TPU | 31B GPU | vLLM H100 |
+|---|---|---|---|---|---|
+| **B=1 tok/s** | **78.3** | 52.9 | 44.2 | 53 | 66.9 |
+| **Peak tok/s** | **16,794** | 14,899 | 9,600 | 8,786 | 3,848 |
+| **PPL** | **5.87** | 90.21 | 24.76 | 14.75 | - |
+| **Cached TTFT** | **25.9 ms** | 35.3 ms | 73.3 ms | 63 ms | - |
+| **Peak tok/s/$** | **3,230** | 2,865 | 1,846 | 4,576 | 2,004 |
 
-No compromise. Fast short-context AND 128K support from one codebase.
+TPU: v6e-4, $5.20/hr, int8, max-ctx 2048. GPU: H100 SXM, $1.92/hr, FP8. All measured.
 
-### Headline numbers
+## TPU: Gemma 4 on v6e-4
 
-| Metric | B=1 (512 ctx) | B=1 (2048 ctx) | B=1 (128K ctx) | B=768 (peak) |
+Pure JAX + XLA. No custom kernels. XLA compiles the entire forward pass to TPU machine code from a ~500 line JAX script. Three models, one codebase.
+
+### Models supported
+
+| Property | E4B (4B) | 26B-A4B (MoE) | 31B |
+|---|---|---|---|
+| Total / active params | ~4B / 4B | 26B / ~4B | 31B / 31B |
+| Layers | 42 | 30 | 60 |
+| Hidden size | 2,560 | 2,816 | 5,376 |
+| Q / KV heads (sliding) | 8 / 2 | 16 / 8 | 32 / 16 |
+| Q / KV heads (global) | 8 / 2 | 16 / 2 (V=K) | 32 / 4 (V=K) |
+| Head dim (sliding / global) | 256 / 512 | 256 / 512 | 256 / 512 |
+| Sliding window | 512 | 1,024 | 1,024 |
+| MoE | none | 128 experts, top-8 | none |
+| KV-shared layers | 18 (of 42) | 0 | 0 |
+| Per-layer input injection | 256-d gated (5.6 GB embed) | none | none |
+
+### Batch scaling (max-ctx 2048)
+
+| Batch | E4B tok/s | 26B-A4B tok/s | 31B tok/s | vLLM H100 |
 |---|---|---|---|---|
-| **Decode throughput** | **78.2 tok/s** | **~70 tok/s** | **24.7 tok/s** | **13,943 tok/s** |
-| **Per-step latency** | **12.79 ms** | **~14 ms** | **40.56 ms** | **55.1 ms** |
-| **Architecture** | single-scan, bf16 KV | single-scan, bf16 KV | split-cache, int8 KV | single-scan, bf16 KV |
-| **Perplexity** | | | **19.24** | |
-| **Cost efficiency** | **15.0 tok/s/$** | **~13.5 tok/s/$** | **4.8 tok/s/$** | **2,681 tok/s/$** |
+| 1 | 78 | 53 | 44 | 66.9 |
+| 8 | 542 | 390 | 318 | 515 |
+| 64 | 3,661 | 2,662 | 2,112 | 2,794 |
+| 128 | 6,298 | 4,915 | 3,853 | 3,848 |
+| 256 | 10,214 | 8,192 | 6,246 | 3,709 |
+| 512 | 13,773 | 12,390 | 8,550 | 3,788 |
+| **768** | **15,514** | **14,899** | **9,600** | 3,671 |
+| **1024** | **16,794** | - | - | - |
 
-| Fixed | Value |
-|---|---|
-| Model | 31B Gemma 4 (google/gemma-4-31B-it) |
-| Hardware | TPU v6e-4 (4 chips, 128 GB HBM, ~3.3 TB/s) |
-| Quantization | int8 per-channel (weights), bf16 activations |
-| KV cache | bf16 (<= 32K, single-scan) or int8 per-head scales (> 32K, split-cache) |
-| Perplexity | 19.24 (split-cache int8 KV path) |
-| Context | 512 to 128K supported via `--max-ctx` (auto-switches architecture) |
-| Cost | ~$5.20/hr (v6e-4 on-demand) |
-
-### Context scaling
+### 31B context scaling (B=1)
 
 | Context | ms/step | tok/s | Architecture | KV type |
 |---|---|---|---|---|
 | 512 | 12.79 | 78.2 | Single-scan, 60-layer scan + cond | bf16 |
-| 2048 | ~14 | ~70 | Single-scan | bf16 |
+| 2,048 | 22.6 | 44.2 | Single-scan | bf16 |
 | 32K | ~66 | ~15 | Single-scan | bf16 |
 | 64K | ~91 | ~11 | Split-cache, 10 groups x 6 | int8 |
 | 128K | 40.56 | 24.7 | Split-cache + blockwise global | int8 |
 
-The dual-path architecture auto-switches at the 32K boundary. Below 32K, the single-scan path with bf16 KV cache is fastest. Above 32K, the split-cache path with int8 KV cache enables 128K context.
-
-### Dual-path architecture
-
-Gemma 4's 60 layers have two attention types: 50 sliding-window layers (1024-token window) and 10 global layers (full context). The engine auto-selects the best architecture based on `--max-ctx`:
-
-**Single-scan path (<= 32K context):** One `jax.lax.scan` over all 60 layers with `jax.lax.cond` dispatch for sliding vs global. bf16 KV cache. Fastest for short-to-medium context. 78.2 tok/s at 512 ctx.
-
-**Split-cache path (> 32K context):** 50 sliding layers use a 1024-entry circular buffer, 10 global layers use full-context blockwise attention. Processed in 10 groups of 6 (5 sliding + 1 global), eliminating jax.lax.cond overhead. Int8 KV cache with per-head quantization scales, 50% memory reduction. Blockwise global attention with online softmax (BLOCK_K=8192). 24.7 tok/s at 128K ctx.
-
-### Perplexity progression
-
-| Version | PPL | Notes |
-|---|---|---|
-| bf16 KV, single scan | 25.51 | Original baseline |
-| int8 KV, single scan | 22.80 | Per-head scales |
-| int8 KV, split-cache | 19.24 | Circular buffer + blockwise |
-
-### Memory budget at 128K (per chip, TP=4)
-
-| Component | Size |
-|---|---|
-| Weights (int8) | 7.75 GB |
-| Sliding KV (50 layers x 1024 x 1024 bytes) | 50 MB |
-| Global KV (10 layers x 131072 x 512 bytes, after TP shard) | 625 MB |
-| Scale arrays | ~60 MB |
-| **Total** | **~8.5 GB of 32 GB** |
-
-### Batch scaling sweep
-
-| Batch | tok/s | ms/step | Scaling | tok/s/$ |
-|---|---|---|---|---|
-| 1 | 78.2 | 12.79 | 1x | 15.0 |
-| 8 | 584 | 13.7 | 7.3x | 112 |
-| 64 | 4,220 | 15.2 | 52.8x | 812 |
-| 128 | 6,831 | 18.7 | 85.5x | 1,314 |
-| 256 | 10,536 | 24.3 | 131.9x | 2,026 |
-| 512 | 12,932 | 39.6 | 161.9x | 2,487 |
-| **768** | **13,943** | **55.1** | **174.5x** | **2,681** |
-| 1024 | 13,705 | 74.7 | 171.5x | 2,636 |
-
-Near-linear scaling from B=1 to B=512. Peak at B=768 where compute and bandwidth saturate simultaneously.
-
-### TPU vs vLLM GPU comparison (measured)
-
-Head-to-head against vLLM on H100 SXM 80GB (RedHatAI/gemma-4-31B-it-FP8-Dynamic, $1.92/hr on vast.ai). All numbers measured on our hardware.
-
-**Single-user latency (B=1):** rvLLM TPU single-scan 78.2 tok/s vs vLLM GPU 66.9 tok/s. TPU 17% faster.
-
-**Peak throughput:** rvLLM TPU single-scan 13,943 tok/s (B=768) vs vLLM GPU 3,848 tok/s (B=128). TPU 3.6x faster.
-
-**Cost efficiency at peak:** TPU 2,681 tok/s/$ vs GPU 2,004 tok/s/$. TPU 34% better.
-
-**128K context:** only TPU (split-cache architecture) supports it. vLLM GPU tested at max_ctx=2048.
-
-| Batch | vLLM GPU tok/s | vLLM GPU ms/step | rvLLM TPU tok/s | rvLLM TPU ms/step |
-|---|---|---|---|---|
-| 1 | 66.9 | 14.95 | **78.2** | 12.79 |
-| 2 | 131.5 | 15.20 | - | - |
-| 4 | 257.6 | 15.53 | - | - |
-| 8 | 511.7 | 15.63 | **584** | 13.7 |
-| 16 | 926.5 | 17.27 | - | - |
-| 32 | 1,728 | 18.51 | - | - |
-| 48 | 2,258 | 21.26 | - | - |
-| 64 | 2,794 | 22.90 | **4,220** | 15.2 |
-| 96 | 3,083 | 31.14 | - | - |
-| 128 | **3,848** | 33.26 | **6,831** | 18.7 |
-| 256 | 3,709 | 69.03 | **10,536** | 24.3 |
-| 512 | 3,788 | 135.18 | **12,932** | 39.6 |
-| 768 | 3,671 | 209.18 | **13,943** | 55.1 |
-
-| Hardware | Peak tok/s | Batch | Cost/hr | tok/s/$ |
-|---|---|---|---|---|
-| **TPU v6e-4 (rvLLM, single-scan)** | **13,943** | **768** | **$5.20** | **2,681** |
-| H100 SXM (vLLM, FP8, measured) | 3,848 | 128 | $1.92 | 2,004 |
-
-TPU batch scaling numbers are from the single-scan bf16 KV architecture (512 ctx). The dual-path engine auto-switches to split-cache int8 KV for contexts > 32K.
-
-### Optimization progression
-
-| Step | tok/s | ms/step | What changed |
-|---|---|---|---|
-| Nested scan, bf16 | 25.6 | 38.0 | Initial working version |
-| Flat scan, bf16 | 48.2 | 19.4 | +88%: eliminated nested loop overhead |
-| Flat scan, int8 | 68.2 | 13.4 | +42%: halved weight bandwidth |
-| Fused on-chip decode | 78.2 | 12.79 | +15%: zero host overhead via while_loop |
-| B=8 batched | 584 | 13.7 | 7.3x: near-linear batch scaling |
-| B=64 + LIBTPU flags | 4,220 | 15.2 | async collective fusion |
-| **B=768 + LIBTPU flags** | **13,943** | **55.1** | **174.5x from baseline** |
-
-### XProf breakdown (B=1, per decode step)
-
-| Component | Time | % |
-|---|---|---|
-| 60-layer scan (single while loop) | 10.6 ms | 86% |
-| &ensp; incl. jax.lax.cond dispatch (sliding/global) | 1.8 ms | 15% of scan |
-| &ensp; incl. ICI all-reduce (O + down proj, 4 chips) | 0.6 ms | 6% of scan |
-| &ensp; incl. KV cache dynamic_update_slice | 1.3 ms | 12% of scan |
-| Host + dispatch overhead | 1.7 ms | 14% |
-| **Total step** | **12.3 ms** | **100%** |
-| Theoretical BW limit (30 GB / 3.3 TB/s) | 9.1 ms | |
-
-The 1.8 ms cond overhead is structural: Gemma 4's dual attention (50 sliding + 10 global layers) requires runtime dispatch. Flat scan + cond is the optimum for XLA's TPU compiler. (Note: the split-cache architecture eliminates this cond overhead by grouping layers, but shifts time into blockwise global attention at longer contexts.)
-
-### The TPU stack
-
-```
-JAX Python (trace)
-  |
-  v
-StableHLO / MLIR
-  |
-  v
-XLA compiler --> TPU machine code (single fused while loop)
-  |
-  v
-PJRT runtime (4-chip SPMD, TP=4)
-  |-- NamedSharding + PartitionSpec for automatic weight distribution
-  |-- Buffer donation for KV cache reuse
-  `-- jax.lax.while_loop for zero-host-overhead decode
-```
-
-No hand-written kernels. No Pallas. No custom ops. XLA generates everything from pure JAX.
+Dual-path architecture auto-switches at the 32K boundary.
 
 ### TPU deployment
-
-Total setup time: ~5 minutes (create TPU + install JAX + download model).
 
 ```bash
 # Create TPU v6e-4 ($5.20/hr)
@@ -182,178 +74,106 @@ gcloud compute tpus tpu-vm create rvllm-gemma4 \
 pip3 install 'jax[tpu]' huggingface_hub tokenizers \
   -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 
-# Download model (2 minutes on GCP internal network)
-huggingface-cli download google/gemma-4-31B-it --local-dir ~/models/gemma-4-31B-it
+# Download model
+huggingface-cli download google/gemma-4-E4B-it --local-dir ~/models/gemma-4-E4B-it
 
-# Run (first call: ~5s JIT compile, then 78.2 tok/s at 512 ctx)
+# Run E4B (78.3 tok/s B=1)
 python3 tpu/harness/gemma4_tpu_infer.py \
-  --model-dir ~/models/gemma-4-31B-it --fused --max-tokens 200 --max-ctx 512
+  --model-dir ~/models/gemma-4-E4B-it --max-tokens 200 --max-ctx 2048
 
-# 128K context (24.7 tok/s decode)
+# Run 31B batched (9,600 tok/s B=768)
+LIBTPU_INIT_ARGS="--xla_tpu_enable_async_collective_fusion=true \
+  --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true \
+  --xla_tpu_enable_async_collective_fusion_multiple_steps=true \
+  --xla_tpu_overlap_compute_collective_tc=true \
+  --xla_tpu_scoped_vmem_limit_kib=131072" \
+python3 tpu/harness/gemma4_tpu_infer.py \
+  --model-dir ~/models/gemma-4-31B-it --fused --max-tokens 200 --max-ctx 2048 --batch 768
+
+# 128K context (24.7 tok/s)
 python3 tpu/harness/gemma4_tpu_infer.py \
   --model-dir ~/models/gemma-4-31B-it --fused --max-tokens 200 --max-ctx 131072
-
-# Batched (13,943 tok/s)
-LIBTPU_INIT_ARGS="--xla_tpu_enable_async_collective_fusion=true \
-  --xla_tpu_dot_dot_fusion_duplicated=true" \
-python3 tpu/harness/gemma4_tpu_infer.py \
-  --model-dir ~/models/gemma-4-31B-it --fused --max-tokens 200 --max-ctx 512 --batch 768
 
 # API server (OpenAI-compatible)
 python3 tpu/harness/api_server.py --model-dir ~/models/gemma-4-31B-it --port 8080
 
-# Perplexity (19.24, split-cache int8 KV)
+# Perplexity
 python3 tpu/harness/gemma4_tpu_infer.py \
   --model-dir ~/models/gemma-4-31B-it --perplexity --max-ctx 2048
-
-# Cleanup
-gcloud compute tpus tpu-vm delete rvllm-gemma4 --zone=us-east5-b --quiet
 ```
 
 No Docker. No conda. No torch. No vLLM. One pip install, one Python file, one command.
 
-Chat client: native Rust egui app at `chat-client/`, connects via OpenAI API to the TPU server.
-
 
 ## EAGLE-3 Speculative Decoding (TPU, experimental)
 
-EAGLE-3 draft-verify speculation for single-user latency. Trains a lightweight 450M-param draft head that proposes K=5 tokens per cycle; the full 31B target verifies all K+1 in one forward pass.
-
-### Status
+450M-param draft head proposes K=5 tokens per cycle; the full 31B verifies K+1=6 in one forward pass. Lossless for greedy decode.
 
 | Metric | Value |
 |---|---|
-| Baseline (fused while_loop, B=1) | 78.2 tok/s, 12.79 ms/step |
-| EAGLE-3 fused cycle (random draft) | 31.0 ms/cycle |
-| EAGLE-3 fused cycle (trained, 1K examples) | 31.0 ms/cycle, tau=1.01 |
-| Projected (tau=3.5, trained on 50K+) | ~145 tok/s (1.8x) |
-| Projected (tau=3.5 + int8 KV cache) | ~175 tok/s (2.2x) |
-| Hardware ceiling (perfect pipelining) | ~300 tok/s (3.8x) |
+| Baseline (B=1, 512 ctx) | 78.2 tok/s, 12.79 ms/step |
+| EAGLE-3 fused cycle | 31.0 ms/cycle |
+| Projected @ tau=3.5 | ~145 tok/s (1.8x) |
+| Hardware ceiling | ~300 tok/s (3.8x) |
 
-The cycle time (31ms) is physics-bound: 9.5ms weight read + 9.5ms TP=4 all-reduce at T=6 + 11.5ms KV reads + 2ms draft. The lever is tau (acceptance rate), which requires more training data.
-
-### Training the draft head
-
-```bash
-# Prepare training data (JSONL: {"text": "conversation..."})
-# UltraChat, ShareGPT, or self-distilled from target model
-
-# Train (1K examples, ~11 min on v6e-4; 10K examples, ~2 hours)
-python3 tpu/harness/eagle3_train.py \
-  --model-dir ~/models/gemma-4-31B-it \
-  --data-file train.jsonl \
-  --output-dir eagle3-head \
-  --max-seq 512 --epochs 2 --lr 5e-5 --warmup-steps 100
-
-# Training loss progression (1K examples, 2 epochs):
-#   step 10:   loss 20.2  (random)
-#   step 50:   loss 9.1   (-55%)
-#   step 300:  loss 7.9   (-61%)
-#   step 1000: loss 7.8   (epoch 0 end)
-#   step 2000: loss 7.1   (epoch 1 end)
-```
-
-For tau > 2.0, the paper recommends:
-1. **Self-distilled data**: generate responses with the target model, not generic datasets (+0.4-0.6 tau)
-2. **Scale to 50K+ examples**: diminishing returns after 100K (+0.2-0.3 tau)
-3. **Extend TTT depth schedule**: change depth transition from d<2 to d<3 (+0.1-0.3 tau)
-
-### Running inference
-
-```bash
-# With trained draft head (speculative)
-python3 tpu/harness/eagle3_infer.py \
-  --model-dir ~/models/gemma-4-31B-it \
-  --draft-dir eagle3-head \
-  --max-tokens 256 --max-ctx 512 --fused \
-  --prompt "Hello, how are you?"
-
-# Pipeline test with random draft (validates wiring, ~0% acceptance)
-python3 tpu/harness/eagle3_infer.py \
-  --model-dir ~/models/gemma-4-31B-it \
-  --random-draft --max-tokens 64 --fused
-
-# Baseline comparison (no speculation)
-python3 tpu/harness/eagle3_infer.py \
-  --model-dir ~/models/gemma-4-31B-it \
-  --baseline --max-tokens 128
-```
-
-### Architecture
-
-- **Draft head**: 450M params (1.5% of target). FC_fuse(3d->d) + FC_in(2d->d) + 1 transformer layer + shared LM head.
-- **Feature capture**: branchless `lax.cond` at layers 2, 30, 59 inside the 60-layer scan carry. No scan segmentation.
-- **Verify**: T=K+1=6 positions through all 60 layers in one pass. Multi-position causal attention with sliding window.
-- **Acceptance**: greedy argmax matching (lossless for greedy decode). Stochastic rejection for sampled decode (future).
-- **KV rollback**: implicit (next cycle overwrites; causal mask prevents reading garbage).
-- **Fused decode loop**: `jax.lax.while_loop` with draft+verify+accept all on-device. Zero Python dispatch in the hot path.
-
-### Files
-
-| File | Purpose |
-|---|---|
-| `tpu/harness/eagle3_infer.py` | Inference: fused + unfused decode, baseline comparison |
-| `tpu/harness/eagle3_train.py` | Training: online TTT loss, fused train step, safetensors export |
-| `tpu/harness/EAGLE3_SPEC.md` | Architecture spec with confirmed model values |
-| `tpu/harness/cache_push.sh` | Push XLA compilation cache to HF |
-| `tpu/harness/cache_pull.sh` | Pull XLA compilation cache from HF |
-
-### Next steps for higher tau
-
-| Optimization | Expected impact | Effort |
-|---|---|---|
-| Self-distilled training data (target model outputs) | +0.4-0.6 tau | 8-10h data gen |
-| Scale to 50K examples | +0.2-0.3 tau | 2h training |
-| Int8 KV cache quantization | -5.75ms cycle time | 2-4h code |
-| Splash attention (fused Pallas kernel) | -1-2ms cycle time | 1-2h wiring |
-
-Reference: [EAGLE-3 paper](https://arxiv.org/abs/2503.01840), [EAGLE-3 SPEC](tpu/harness/EAGLE3_SPEC.md).
+Requires 50K+ training examples for production tau. Current: 2K examples, loss 7.1, pipeline validated end-to-end. See [`tpu/harness/EAGLE3_SPEC.md`](tpu/harness/EAGLE3_SPEC.md).
 
 
 ## GPU: 31B Gemma 4 on H100
 
-Rust + CUDA on H100 SXM 80GB. FP8 weights with per-channel scales, F16 KV cache, F16 paged attention. All 60 layers captured in a single CUDA graph (~1400 nodes). **7,943 tok/s** peak (B=512), **PPL 13.53**. Per-layer KV cache sizing enables 128K context on a single GPU.
+Rust + CUDA on H100 SXM 80GB. FP8 weights with per-channel scales + CUTLASS channelscale epilogue, F16 KV cache, F16 paged attention (FA3 SM90). All 60 layers captured in a single CUDA graph (~935 nodes). **8,786 tok/s** peak (B=512), **PPL 14.75**, **TTFT 63 ms**.
 
-### Gemma 4 architecture
+### GPU batch scaling
 
-60-layer transformer with dual attention (50 sliding + 10 global layers):
+| Batch | tok/s | ms/step | Scaling |
+|---|---|---|---|
+| 1 | 53 | 18.7 | 1.0x |
+| 8 | 434 | 18.4 | 8.2x |
+| 32 | 1,743 | 18.4 | 32.9x |
+| 64 | 3,265 | 19.6 | 61.6x |
+| 128 | 5,802 | 22.1 | 109.5x |
+| 256 | 7,808 | 32.8 | 147.3x |
+| **512** | **8,786** | 58.3 | **165.8x** |
 
-| Property | Sliding layers (50) | Global layers (10) |
-|---|---|---|
-| Q/K/V heads | 32 / 16 / 16 | 32 / 4 / none (V = K) |
-| Head dimension | 256 | 512 |
-| Attention window | 1024 tokens | full context |
-| RoPE theta | 10,000 | 1,000,000 |
-| RoPE rotation | 100% | 25% (partial) |
+### rvLLM vs vLLM on H100 (measured)
 
-Other Gemma 4 specifics:
-- **QK-norm + v-norm**: per-head RMSNorm on Q/K (with learned scale), parameter-free RMSNorm on V
-- **k_eq_v**: global layers have no v_proj; V = v_norm(raw_K)
-- **Attention scaling = 1.0**: QK-norm handles magnitude, no sqrt(head_dim) division
-- **layer_scalar**: applied once at the end of the full layer (not per-sublayer)
-- **Logit softcapping**: 30 * tanh(logits / 30)
-- **GELU(tanh)** activation (not SiLU)
-- **Tied embeddings**: lm_head = embed_tokens.T
+| Batch | rvLLM tok/s | vLLM tok/s | Delta |
+|---|---|---|---|
+| 1 | 53 | 69 | -23% |
+| 32 | 1,743 | 1,748 | ~0% |
+| 64 | **3,265** | 3,130 | +4% |
+| **128** | **5,802** | 4,689 | **+24%** |
+| 256 | **7,808** | 7,077 | +10% |
+| 512 | **8,786** | 8,243 | +7% |
 
-### Gemma 4 forward pass (17 launches per layer)
+rvLLM overtakes vLLM at B=64 and leads by 24% at B=128.
+
+### GPU perplexity
+
+| Weight path | KV cache | PPL | tok/s (B=1) |
+|---|---|---|---|
+| **FP8-Dynamic + CUTLASS channelscale epilogue** | F16 | **14.75** | 53 |
+| BF16 split QKV per-tensor FP8 | F16 | 17.96 | 37.9 |
+| F16 weights (no FP8) | F16 | 19.79 | 37.9 |
+| HuggingFace BF16 reference | -- | 19.62 | -- |
+
+### Gemma 4 forward pass (14 launches per layer)
 
 ```
 For each layer in 0..60:
   1.  fused_rmsnorm_fp8_quant           input layernorm + FP8 quantize
-  2.  fp8_gemm                          fused Q||K||V projection
-  2b. f32_to_f16_sat                    GEMM F32 output to F16
-  3.  fused_qkv_rmsnorm                 Q/K norm (learned gamma) + V norm (parameter-free)
-  5.  fused_rope_partial_f16kv          partial RoPE + F16 KV cache write
-  6.  paged_decode (FA3)                attention (head_dim=256 sliding, 512 global)
-  7.  quantize_fp8_per_token            attn output to FP8
-  8.  fp8_gemm                          O projection
-  9.  fused_norm_add_residual           channelscale + rmsnorm + residual add
-  10. fused_rmsnorm_fp8_quant           pre-FFN layernorm + FP8 quantize
-  11. fp8_gemm                          fused gate||up projection
-  11b.f32_to_f16_sat                    GEMM F32 output to F16
-  12. fused_gelu_mul_fp8_quant          GELU(tanh)(gate) * up to FP8
-  13. fp8_gemm                          down projection
-  14. fused_norm_add_residual           channelscale + rmsnorm + residual add + layer_scalar
+  2.  cutlass_fp8_gemm_channelscale     fused Q||K||V + channelscale epilogue
+  3.  fused_qkv_rmsnorm                 Q/K norm (learned) + V norm (parameter-free)
+  4.  fused_rope_partial_f16kv          partial RoPE + F16 KV cache write
+  5.  paged_decode (FA3 SM90)           attention (head_dim=256 sliding, 512 global)
+  6.  quantize_fp8_per_token            attn output to FP8
+  7.  fp8_gemm                          O projection
+  8.  fused_norm_add_residual           channelscale + rmsnorm + residual add
+  9.  fused_rmsnorm_fp8_quant           pre-FFN layernorm + FP8 quantize
+  10. cutlass_fp8_gemm_channelscale     fused gate||up + channelscale epilogue
+  11. fused_gelu_mul_fp8_quant          GELU(tanh)(gate) * up to FP8
+  12. fp8_gemm                          down projection
+  13. fused_norm_add_residual           channelscale + rmsnorm + residual + layer_scalar
 
 Sampling tail:
   fused_rmsnorm                       final layernorm
@@ -361,63 +181,6 @@ Sampling tail:
   logit_softcap                       30 * tanh(logits / 30)
   argmax_kernel                       token selection
 ```
-
-17 launches per layer (down from 25 via kernel fusion). All captured into one `cuGraphLaunch` (~1350 nodes).
-
-### GPU perplexity
-
-| Weight path | KV cache | PPL | tok/s (B=1, graph) |
-|---|---|---|---|
-| FP8-Dynamic per-channel + fused channelscale | F16 | **13.53** | 39.6 |
-| BF16 split QKV per-tensor FP8 | F16 | 17.96 | 37.9 |
-| F16 weights (no FP8) | F16 | 19.79 | 37.9 |
-| HuggingFace BF16 reference | -- | 19.62 | -- |
-| TPU int8 reference | int8 | 19.24 | -- |
-
-The FP8-Dynamic checkpoint (RedHatAI/gemma-4-31B-it-FP8-Dynamic) with native per-channel weight scales + F16 KV cache. Channelscale is fused into the post-norm kernel, applying the per-channel rescaling in F32 precision before RMSNorm + residual add.
-
-### GPU batch scaling
-
-| Batch | tok/s | ms/step | Efficiency |
-|---|---|---|---|
-| 1 | 52 | 19.2 | baseline |
-| 4 | 229 | 17.5 | 110% |
-| 8 | 452 | 17.7 | 109% |
-| 16 | 900 | 17.8 | 108% |
-| 32 | 1,723 | 18.6 | 104% |
-| 64 | 3,097 | 20.7 | 93% |
-| 128 | 5,114 | 25.0 | 77% |
-| 256 | 6,897 | 37.1 | 52% |
-| 512 | 7,943 | 64.5 | 30% |
-
-H100 SXM 80GB, FP8 weights, F16 KV cache, CUDA graph. Near-linear scaling through B=32 (memory-bound), saturating at B=256+ as FP8 tensor cores become compute-bound. Per-layer KV cache sizing (sliding layers capped at 32 blocks) enables 128K context on a single 80GB GPU.
-
-### rvLLM 0.3 vs vLLM 0.19 (same H100, same model, measured)
-
-| Batch | rvLLM tok/s | vLLM tok/s | Delta |
-|---|---|---|---|
-| 1 | 52 | 69 | -25% |
-| 4 | 229 | 264 | -13% |
-| 8 | 452 | 515 | -12% |
-| 16 | 900 | 997 | -10% |
-| 32 | 1,723 | 1,748 | -1% |
-| 64 | 3,097 | 3,130 | -1% |
-| **128** | **5,114** | **4,689** | **+9%** |
-| 256 | 6,897 | 7,077 | -3% |
-| 512 | 7,943 | 8,243 | -4% |
-
-rvLLM measures raw CUDA graph decode throughput. vLLM 0.19 includes full server overhead (HTTP, scheduler, tokenizer, prefill). rvLLM leads at B=128 where kernel fusion and graph capture overcome scheduler overhead.
-
-### CUDA graph capture
-
-All 60 layers + lm_head captured into a single `cuGraphLaunch` (~1400 nodes, down from 1776 pre-fusion). Eliminates per-kernel launch overhead.
-
-| Mode | tok/s (B=1) | ms/step |
-|---|---|---|
-| CUDA graph | 52 | 19.2 |
-| Eager (no graph) | 11 | ~91 |
-
-~4.7x speedup from graph capture at batch=1.
 
 ### Kernel fusion summary
 
@@ -431,33 +194,9 @@ Four rounds of fusion + custom CUTLASS epilogue reduced graph nodes from 1776 to
 | vnorm_f16 fused into qk_rmsnorm -> fused_qkv_rmsnorm | 2 -> 1 (x1/layer) | 60 |
 | CUTLASS channelscale epilogue (QKV, gate_up) | 3 -> 1 (x2/layer) | 240+ |
 
-The CUTLASS channelscale kernel (`cutlass_fp8_gemm_channelscale`) uses a custom SM90 EVT epilogue that applies per-token activation scale (ColBroadcast) and per-channel weight scale (RowBroadcast) directly in the GEMM epilogue while the accumulator is still F32, then casts to F16. This eliminates the `fp8_gemm_f32 + scale_cols_f32 + f32_to_f16_sat` chain for QKV and gate_up projections.
+The CUTLASS channelscale kernel uses a custom SM90 EVT epilogue that applies per-token activation scale (ColBroadcast) and per-channel weight scale (RowBroadcast) directly in the GEMM epilogue while the accumulator is still F32, then casts to F16.
 
 **Help wanted:** The current CUTLASS kernel uses a 128x128x128 tile which is suboptimal for low-batch decode (M <= 16). A smaller tile variant (e.g. 64x64x128) would improve B=1-8 throughput. PRs welcome for additional tile shapes with autotune selection.
-
-### Kernels
-
-Every kernel has a known purpose, a pinned variant, and a workspace contract. No dispatch fallback chains.
-
-**CUTLASS SM90 FP8 GEMMs** - 40 non-residual + 10 residual-fused variants, autotuned per shape. Schedule/epilogue pairing enforced at compile time via `static_assert`.
-
-**FlashAttention-3 SM90** - WGMMA + TMA, paged KV layout, GQA. Supports head_dim 128/256/512 for Gemma 4's dual head dimensions.
-
-**Fused kernels** (v3, Gemma 4 specific):
-
-| Kernel | Purpose |
-|---|---|
-| `fused_rmsnorm_fp8_quant` | layernorm + FP8 quantize in one launch |
-| `fused_qk_rmsnorm` | per-head RMSNorm on Q and K |
-| `fused_rope_partial_f16kv` | partial RoPE + F16 KV cache write |
-| `fused_gelu_mul_fp8_quant` | GELU(tanh)(gate) * up to FP8 |
-| `fused_norm_add_residual` | GEMM output -> RMSNorm -> residual add (+ optional layer_scalar) |
-| `fused_norm_add_residual_f16` | same + fused per-channel weight rescaling |
-| `logit_softcap` | 30 * tanh(logits / 30) |
-| `quantize_fp8_per_token` | activation to FP8 with per-token scale |
-| `argmax` | f32 logits to i32 token |
-
-No fallbacks. Missing kernel .so = engine refuses to start.
 
 ### GPU build and run
 
@@ -480,23 +219,41 @@ RVLLM_BATCH=128 RVLLM_ITERS=30 RVLLM_WARMUP=5 \
   ./v3/target/release/rvllm-bench
 ```
 
+### Kernels
+
+Every kernel has a known purpose, a pinned variant, and a workspace contract. No dispatch fallback chains.
+
+| Kernel | Purpose |
+|---|---|
+| `cutlass_fp8_gemm_channelscale` | SM90 FP8 GEMM with EVT channelscale epilogue (QKV, gate_up) |
+| `fused_rmsnorm_fp8_quant` | layernorm + FP8 quantize in one launch |
+| `fused_qkv_rmsnorm` | per-head RMSNorm on Q, K (learned) and V (parameter-free) |
+| `fused_rope_partial_f16kv` | partial RoPE + F16 KV cache write |
+| `fused_gelu_mul_fp8_quant` | GELU(tanh)(gate) * up to FP8 |
+| `fused_norm_add_residual` | channelscale + RMSNorm + residual add (+ optional layer_scalar) |
+| `logit_softcap` | 30 * tanh(logits / 30) |
+| `quantize_fp8_per_token` | activation to FP8 with per-token scale |
+| `argmax` | f32 logits to i32 token |
+
+No fallbacks. Missing kernel .so = engine refuses to start.
+
 ## v3 crate map
 
 ```
 v3/crates/
-├── rvllm-core         typed errors, IDs, dtype, shape, config, env
-├── rvllm-mem          HbmArena, Region, Stream, Event, PinnedBuf, CudaContextHandle
-├── rvllm-kernels      manifest (sha-pinned), PTX loader, kernel catalog
-├── rvllm-fused        8 fused-kernel launchers + pure-Rust f32 references
-├── rvllm-attention    FA3 SM90 paged decode/prefill dlopen
-├── rvllm-cutlass      FP8 variant catalog + schedule pairing trait + cuBLASLt wrapper
-├── rvllm-metadata     frozen-layout metadata per bucket (one upload path)
-├── rvllm-loader       safetensors mmap -> HBM + CPU-path FP8 quant + clamp gate
-├── rvllm-sampling     argmax tail, pinned DtoH
-├── rvllm-graph        captured-graph pool keyed on MetaLayoutHash
-├── rvllm-runtime      Engine, scheduler, layer_exec, bring_up
-├── rvllm-bench        RVLLM_* env-driven bench binary
-└── rvllm-invariants   DAG-dep test, no-megakernel gate
+  rvllm-core         typed errors, IDs, dtype, shape, config, env
+  rvllm-mem          HbmArena, Region, Stream, Event, PinnedBuf, CudaContextHandle
+  rvllm-kernels      manifest (sha-pinned), PTX loader, kernel catalog
+  rvllm-fused        8 fused-kernel launchers + pure-Rust f32 references
+  rvllm-attention    FA3 SM90 paged decode/prefill dlopen
+  rvllm-cutlass      FP8 variant catalog + schedule pairing trait + cuBLASLt wrapper
+  rvllm-metadata     frozen-layout metadata per bucket (one upload path)
+  rvllm-loader       safetensors mmap -> HBM + CPU-path FP8 quant + clamp gate
+  rvllm-sampling     argmax tail, pinned DtoH
+  rvllm-graph        captured-graph pool keyed on MetaLayoutHash
+  rvllm-runtime      Engine, scheduler, layer_exec, bring_up
+  rvllm-bench        RVLLM_* env-driven bench binary
+  rvllm-invariants   DAG-dep test, no-megakernel gate
 ```
 
 ## Correctness discipline
@@ -513,7 +270,8 @@ Apache-2.0.
 
 ## Further reading
 
+- [`docs/bench.html`](https://docs.solidsf.com/docs/bench.html) - interactive benchmark results with charts
 - [`v3/GEMMA4_SPEC.md`](v3/GEMMA4_SPEC.md) - 31B Gemma 4 architecture details and weight shapes
 - [`v3/SPEC.md`](v3/SPEC.md), [`v3/IMPL_PLAN.md`](v3/IMPL_PLAN.md) - v3 rewrite plan, 16 agent specs
-- [`docs/bench.html`](docs/bench.html) - interactive benchmark results
+- [`tpu/harness/EAGLE3_SPEC.md`](tpu/harness/EAGLE3_SPEC.md) - EAGLE-3 speculative decoding spec
 - [`docs/arch.md`](docs/arch.md) - full crate architecture
